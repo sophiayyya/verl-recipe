@@ -23,7 +23,7 @@ rather than ``vllm_server_*``.
 import logging
 import os
 import time
-from typing import Any, Generator, Optional
+from typing import Generator
 
 import ray
 import torch
