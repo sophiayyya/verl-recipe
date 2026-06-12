@@ -1743,6 +1743,28 @@ class DynamoHttpServer:
     async def set_global_steps(self, global_steps: int):
         self.global_steps = global_steps
 
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        Called by CheckpointEngineManager before backends like NCCL or NIXL
+        rebuild process groups. Dynamo's per-node sidecars route this through
+        the standard reset_prefix_cache path; the engine keeps weights
+        resident (sleep_level=1 from DynamoRollout) so the trainer can write
+        through to live tensors.
+        """
+        if not self._control_endpoints:
+            return
+        await self._engine_method_all("reset_prefix_cache")
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync.
+
+        Counterpart to release_kv_cache(). Dynamo never truly releases KV
+        memory (sleep_level=1 keeps weights resident; reset_prefix_cache
+        only drops the cache contents), so there is nothing to resume.
+        """
+        return
+
     async def wait_for_requests_to_drain(self):
         if not self._control_endpoints:
             return
