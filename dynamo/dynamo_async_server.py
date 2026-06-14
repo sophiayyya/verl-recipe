@@ -1814,7 +1814,7 @@ class DynamoHttpServer:
             try:
                 sock.connect(ep)
                 await sock.send(pickle.dumps(req))
-                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=120)
+                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=600)
                 reply = pickle.loads(reply_bytes)
                 if not reply.get("ok"):
                     logger.warning(
@@ -2021,6 +2021,46 @@ class DynamoHttpServer:
 # --------------------------------------------------------------------------- #
 
 
+
+class DynamoCheckpointEngineWorker:
+    """Bypass for ``verl.checkpoint_engine.base.CheckpointEngineWorker``.
+
+    Spawned by ``DynamoReplica._spawn_rollout_checkpoint_engine_workers``
+    with ``num_gpus=0`` so it doesn't claim a slot in the trainer's resource
+    pool, but ``CUDA_VISIBLE_DEVICES`` is injected via ``runtime_env`` to
+    pin the actor to the same GPU as its paired dynamo subprocess worker
+    (CUDA IPC handoff in ``DynamoRollout.update_weights`` requires this).
+
+    The base ``Worker._setup_env_cuda_visible_devices`` reads
+    ``ray.get_runtime_context().get_accelerator_ids()[device_name][0]`` when
+    ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` — that list is empty for
+    a ``num_gpus=0`` actor, so it IndexErrors. We override to use the
+    pre-set LOCAL_RANK env and ``set_device(0)`` (CVD already narrows the
+    visible set to one GPU which appears as device 0).
+    """
+
+    # Constructed lazily inside the spawn helper so verl imports don't bloat
+    # this module's top-level cost; resolved on first call.
+    _factory_class = None
+
+    @classmethod
+    def _factory(cls):
+        if cls._factory_class is not None:
+            return cls._factory_class
+
+        from verl.checkpoint_engine.base import CheckpointEngineWorker as _CEW
+        from verl.utils.device import get_torch_device
+
+        class _DynamoCheckpointEngineWorker(_CEW):
+            def _setup_env_cuda_visible_devices(self):  # type: ignore[override]
+                # CVD was set via runtime_env to the single GPU we share with
+                # the dynamo subprocess worker; torch sees it as device 0.
+                get_torch_device().set_device(0)
+
+        cls._factory_class = _DynamoCheckpointEngineWorker
+        return cls._factory_class
+
+
 class DynamoReplica(RolloutReplica):
     """Manages one logical Dynamo serving replica across N nodes.
 
@@ -2058,8 +2098,28 @@ class DynamoReplica(RolloutReplica):
         return "dynamo_"
 
     async def init_hybrid_worker_pool(self, worker_group):
-        """Initialize Dynamo as worker pool for all rollout GPUs."""
+        """Initialize Dynamo as worker pool for all rollout GPUs.
+
+        The verl CheckpointEngineManager fans weight-sync hooks
+        (update_weights / execute_checkpoint_engine / release_kv_cache /
+        resume_kv_cache) out to per-rollout-rank Ray actors. Dynamo's
+        rollout-side ``engine'' is a subprocess (not a Ray actor) plus a
+        node-level DynamoHttpServer, so we cannot route those hooks through
+        the trainer's borrowed WorkerDict handles — they don't expose the
+        rollout-side methods. We therefore:
+
+        1. Borrow the trainer worker_group only to look up per-GPU placement.
+        2. Spawn dynamo.vllm subprocesses on those GPUs (existing logic).
+        3. Spawn dedicated CheckpointEngineWorker Ray actors (one per
+           rollout rank) colocated on the same GPUs as the subprocess
+           workers via env-injected CUDA_VISIBLE_DEVICES.
+        4. Reassign ``self.workers`` to those CheckpointEngineWorker
+           handles so framework hooks land where the methods actually
+           live.
+        """
         self.rollout_mode = RolloutMode.HYBRID
+        # Hold trainer handles only as a placement lookup; replaced at the
+        # end with dedicated rollout-side actors.
         self.workers = list(worker_group.workers)
 
         assert len(self.workers) % self.world_size == 0, (
@@ -2069,22 +2129,131 @@ class DynamoReplica(RolloutReplica):
         num_logical_replicas = len(self.workers) // self.world_size
         await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
 
+        # Now that dynamo.vllm subprocesses are alive on the GPUs identified
+        # by self._trainer_worker_infos, spawn matching CheckpointEngineWorker
+        # actors and adopt them as our framework-facing workers.
+        self.workers = self._spawn_rollout_checkpoint_engine_workers()
+
+    def _spawn_rollout_checkpoint_engine_workers(self) -> list[ActorHandle]:
+        """Spawn one CheckpointEngineWorker Ray actor per rollout rank.
+
+        Each actor:
+        - ``num_gpus=0`` — Ray does not see it as competing for the trainer's
+          resource pool slots.
+        - ``CUDA_VISIBLE_DEVICES`` env-injected to the same GPU as the
+          corresponding dynamo subprocess worker, so cupy/torch tensor
+          allocations land where the subprocess can receive them via CUDA IPC.
+        - ``RANK / WORLD_SIZE / LOCAL_RANK / LOCAL_WORLD_SIZE`` env match the
+          trainer rank layout so the actor's ``server_adapter``
+          (recipe.dynamo.dynamo_rollout.ServerAdapter) computes a
+          ``zmq_handle`` that pairs 1:1 with the subprocess worker.
+        - ``MASTER_ADDR / MASTER_PORT`` set so the CheckpointEngineWorker
+          actors form their own torch.distributed cpu:gloo group on
+          ``initialize_global_process_group_ray``. Port chosen to not
+          collide with the trainer's existing distributed init.
+        """
+        worker_cls = DynamoCheckpointEngineWorker._factory()
+
+        worker_infos = self._trainer_worker_infos
+        total_ranks = len(worker_infos)
+        local_world_size = self.gpus_per_node
+        master_port = str(int(os.environ.get("VERL_DYNAMO_CE_MASTER_PORT", "29600")))
+
+        actors: list[ActorHandle] = []
+        trainer_pg_ids = getattr(self, "_trainer_worker_pg_ids", None)
+        # Resolve placement-group ids → PlacementGroup objects, deduped per id.
+        trainer_pg_lookup: dict[str, Any] = {}
+        if trainer_pg_ids is not None:
+            for pg_id in trainer_pg_ids:
+                if pg_id and pg_id not in trainer_pg_lookup:
+                    try:
+                        trainer_pg_lookup[pg_id] = ray.util.get_placement_group(pg_id)
+                    except Exception:
+                        # Unknown id (e.g. detached PG cleaned up) — fall back
+                        # to NodeAffinity below.
+                        trainer_pg_lookup[pg_id] = None
+        for rank, (node_id, gpu_id) in enumerate(worker_infos):
+            env_vars = {
+                "CUDA_VISIBLE_DEVICES": str(gpu_id),
+                "RANK": str(rank),
+                "WORLD_SIZE": str(total_ranks),
+                "LOCAL_RANK": str(rank % local_world_size),
+                "LOCAL_WORLD_SIZE": str(local_world_size),
+                "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
+                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_PORT": master_port,
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            }
+
+            # Schedule CE worker into the same trainer placement-group bundle
+            # so it lands on the same physical GPU as the paired
+            # ``dynamo.vllm`` subprocess. The bundle's GPU=1 slot is already
+            # claimed by the trainer's WorkerDict (num_gpus=1), so the CE
+            # actor uses num_gpus=0 + the explicit bundle index to colocate
+            # without competing for that GPU resource.
+            trainer_pg = None
+            bundle_idx = 0
+            if trainer_pg_ids is not None:
+                pg_id = trainer_pg_ids[rank]
+                trainer_pg = trainer_pg_lookup.get(pg_id)
+                # Within a single PG, bundles are 1:1 with local ranks.
+                bundle_idx = rank % local_world_size
+            if trainer_pg is not None:
+                scheduling_strategy = (
+                    ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=trainer_pg,
+                        placement_group_bundle_index=bundle_idx,
+                        placement_group_capture_child_tasks=False,
+                    )
+                )
+            else:
+                scheduling_strategy = (
+                    ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id, soft=False,
+                    )
+                )
+
+            actor = (
+                ray.remote(num_gpus=0, num_cpus=1)(worker_cls)
+                .options(
+                    scheduling_strategy=scheduling_strategy,
+                    runtime_env={"env_vars": env_vars},
+                    name=f"dynamo_ce_worker_{self.replica_rank}_{rank}{self.name_suffix}",
+                )
+                .remote(
+                    rollout_config=self.config,
+                    model_config=self.model_config,
+                    replica_rank=rank // self.world_size,
+                )
+            )
+            actors.append(actor)
+        return actors
+
     async def _launch_shared_worker_pool(self, num_logical_replicas: int):
         """Launch a single frontend backed by all logical replica workers."""
         from verl.utils.device import get_resource_name
 
         tp = self.config.tensor_model_parallel_size
-        worker_infos = await asyncio.gather(
+        worker_infos_raw = await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
                     lambda self: (
                         ray.get_runtime_context().get_node_id(),
                         ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0],
+                        ray.get_runtime_context().get_placement_group_id(),
                     )
                 )
                 for worker in self.workers
             ]
         )
+        # Strip pg_id from the tuple stored as worker_infos (so existing
+        # downstream consumers see the original 2-tuple shape), and resolve
+        # the per-rank placement_group id to a PlacementGroup object so the
+        # CE worker spawn can colocate into the trainer's bundle.
+        worker_infos = [(node_id, gpu_id) for node_id, gpu_id, _ in worker_infos_raw]
+        pg_ids = [pg_id for _, _, pg_id in worker_infos_raw]
+        self._trainer_worker_infos = worker_infos
+        self._trainer_worker_pg_ids = pg_ids
 
         node_order: list[str] = []
         node_to_workers: dict[str, list[ActorHandle]] = {}

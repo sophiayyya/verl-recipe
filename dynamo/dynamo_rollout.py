@@ -110,6 +110,16 @@ class ServerAdapter(_VllmServerAdapter):
         """
         start_time = time.time()
 
+        # The naive path resumes vLLM inside ``WorkerDict.update_weights``;
+        # the NCCL/NIXL path returns early before that resume runs, so we
+        # wake the engine here (weights + kv_cache) before pushing weights
+        # via CUDA IPC. Without this the IPC handshake finds no GPU buffers
+        # and the next generation request after refit fails on missing KV.
+        if self.config.free_cache_engine and self._is_node_control_rank():
+            if self.server_handle is None:
+                self.server_handle = ray.get_actor(self._get_control_actor_name())
+            await self.server_handle.wake_up.remote(tags=["weights", "kv_cache"])
+
         future = await self._execute_method(
             "update_weights_from_ipc",
             non_block=True,
