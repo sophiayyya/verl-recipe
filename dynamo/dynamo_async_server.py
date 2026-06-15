@@ -41,7 +41,9 @@ import ray
 import requests
 from ray.actor import ActorHandle
 
+from verl.checkpoint_engine.base import CheckpointEngineWorker
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_torch_device
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica
@@ -2022,43 +2024,20 @@ class DynamoHttpServer:
 
 
 
-class DynamoCheckpointEngineWorker:
-    """Bypass for ``verl.checkpoint_engine.base.CheckpointEngineWorker``.
-
-    Spawned by ``DynamoReplica._spawn_rollout_checkpoint_engine_workers``
-    with ``num_gpus=0`` so it doesn't claim a slot in the trainer's resource
-    pool, but ``CUDA_VISIBLE_DEVICES`` is injected via ``runtime_env`` to
-    pin the actor to the same GPU as its paired dynamo subprocess worker
-    (CUDA IPC handoff in ``DynamoRollout.update_weights`` requires this).
+class _DynamoCheckpointEngineWorker(CheckpointEngineWorker):
+    """CheckpointEngineWorker variant spawned with ``num_gpus=0``.
 
     The base ``Worker._setup_env_cuda_visible_devices`` reads
     ``ray.get_runtime_context().get_accelerator_ids()[device_name][0]`` when
-    ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` — that list is empty for
-    a ``num_gpus=0`` actor, so it IndexErrors. We override to use the
-    pre-set LOCAL_RANK env and ``set_device(0)`` (CVD already narrows the
-    visible set to one GPU which appears as device 0).
+    ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` — that list is empty
+    for a ``num_gpus=0`` actor, so it IndexErrors. Our spawn helper injects
+    ``CUDA_VISIBLE_DEVICES`` via ``runtime_env`` to pin the actor to the
+    GPU shared with its paired ``dynamo.vllm`` subprocess (CUDA IPC needs
+    same-GPU pairing), so torch sees that single GPU as device 0.
     """
 
-    # Constructed lazily inside the spawn helper so verl imports don't bloat
-    # this module's top-level cost; resolved on first call.
-    _factory_class = None
-
-    @classmethod
-    def _factory(cls):
-        if cls._factory_class is not None:
-            return cls._factory_class
-
-        from verl.checkpoint_engine.base import CheckpointEngineWorker as _CEW
-        from verl.utils.device import get_torch_device
-
-        class _DynamoCheckpointEngineWorker(_CEW):
-            def _setup_env_cuda_visible_devices(self):  # type: ignore[override]
-                # CVD was set via runtime_env to the single GPU we share with
-                # the dynamo subprocess worker; torch sees it as device 0.
-                get_torch_device().set_device(0)
-
-        cls._factory_class = _DynamoCheckpointEngineWorker
-        return cls._factory_class
+    def _setup_env_cuda_visible_devices(self):  # type: ignore[override]
+        get_torch_device().set_device(0)
 
 
 class DynamoReplica(RolloutReplica):
@@ -2152,16 +2131,13 @@ class DynamoReplica(RolloutReplica):
           ``initialize_global_process_group_ray``. Port chosen to not
           collide with the trainer's existing distributed init.
         """
-        worker_cls = DynamoCheckpointEngineWorker._factory()
-
         worker_infos = self._trainer_worker_infos
         total_ranks = len(worker_infos)
         local_world_size = self.gpus_per_node
         master_port = str(int(os.environ.get("VERL_DYNAMO_CE_MASTER_PORT", "29600")))
-        # CE worker rank 0 lands on the head node; for multi-node setups all
-        # other ranks need head's reachable IP, not 127.0.0.1.  Resolve via
-        # ``ray.nodes()`` using the first worker's node_id so we don't depend
-        # on the SLURM-set HEAD_IP env making it through.
+        # CE worker rank 0 lands on the head node; on multi-node setups every
+        # other rank needs head's reachable IP, not 127.0.0.1. Resolve via
+        # ``ray.nodes()`` using the first worker's node_id.
         master_addr = "127.0.0.1"
         if worker_infos:
             head_node_id = worker_infos[0][0]
@@ -2170,19 +2146,21 @@ class DynamoReplica(RolloutReplica):
                     master_addr = node.get("NodeManagerAddress") or master_addr
                     break
 
-        actors: list[ActorHandle] = []
-        trainer_pg_ids = getattr(self, "_trainer_worker_pg_ids", None)
-        # Resolve placement-group ids → PlacementGroup objects, deduped per id.
+        # Resolve placement-group ids → PlacementGroup objects (deduped) so
+        # each CE actor can colocate into the same bundle as its paired
+        # trainer worker. ``get_placement_group`` raises if the id is unknown
+        # (e.g. PG cleaned up); falling back to NodeAffinity keeps the actor
+        # on the same node even if PG capture fails.
+        trainer_pg_ids = self._trainer_worker_pg_ids
         trainer_pg_lookup: dict[str, Any] = {}
-        if trainer_pg_ids is not None:
-            for pg_id in trainer_pg_ids:
-                if pg_id and pg_id not in trainer_pg_lookup:
-                    try:
-                        trainer_pg_lookup[pg_id] = ray.util.get_placement_group(pg_id)
-                    except Exception:
-                        # Unknown id (e.g. detached PG cleaned up) — fall back
-                        # to NodeAffinity below.
-                        trainer_pg_lookup[pg_id] = None
+        for pg_id in trainer_pg_ids:
+            if pg_id and pg_id not in trainer_pg_lookup:
+                try:
+                    trainer_pg_lookup[pg_id] = ray.util.get_placement_group(pg_id)
+                except Exception:
+                    trainer_pg_lookup[pg_id] = None
+
+        actors: list[ActorHandle] = []
         for rank, (node_id, gpu_id) in enumerate(worker_infos):
             env_vars = {
                 "CUDA_VISIBLE_DEVICES": str(gpu_id),
@@ -2196,24 +2174,12 @@ class DynamoReplica(RolloutReplica):
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             }
 
-            # Schedule CE worker into the same trainer placement-group bundle
-            # so it lands on the same physical GPU as the paired
-            # ``dynamo.vllm`` subprocess. The bundle's GPU=1 slot is already
-            # claimed by the trainer's WorkerDict (num_gpus=1), so the CE
-            # actor uses num_gpus=0 + the explicit bundle index to colocate
-            # without competing for that GPU resource.
-            trainer_pg = None
-            bundle_idx = 0
-            if trainer_pg_ids is not None:
-                pg_id = trainer_pg_ids[rank]
-                trainer_pg = trainer_pg_lookup.get(pg_id)
-                # Within a single PG, bundles are 1:1 with local ranks.
-                bundle_idx = rank % local_world_size
+            trainer_pg = trainer_pg_lookup.get(trainer_pg_ids[rank])
             if trainer_pg is not None:
                 scheduling_strategy = (
                     ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
                         placement_group=trainer_pg,
-                        placement_group_bundle_index=bundle_idx,
+                        placement_group_bundle_index=rank % local_world_size,
                         placement_group_capture_child_tasks=False,
                     )
                 )
@@ -2225,7 +2191,7 @@ class DynamoReplica(RolloutReplica):
                 )
 
             actor = (
-                ray.remote(num_gpus=0, num_cpus=1)(worker_cls)
+                ray.remote(num_gpus=0, num_cpus=1)(_DynamoCheckpointEngineWorker)
                 .options(
                     scheduling_strategy=scheduling_strategy,
                     runtime_env={"env_vars": env_vars},
