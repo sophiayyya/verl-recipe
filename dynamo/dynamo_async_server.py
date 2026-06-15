@@ -2158,6 +2158,17 @@ class DynamoReplica(RolloutReplica):
         total_ranks = len(worker_infos)
         local_world_size = self.gpus_per_node
         master_port = str(int(os.environ.get("VERL_DYNAMO_CE_MASTER_PORT", "29600")))
+        # CE worker rank 0 lands on the head node; for multi-node setups all
+        # other ranks need head's reachable IP, not 127.0.0.1.  Resolve via
+        # ``ray.nodes()`` using the first worker's node_id so we don't depend
+        # on the SLURM-set HEAD_IP env making it through.
+        master_addr = "127.0.0.1"
+        if worker_infos:
+            head_node_id = worker_infos[0][0]
+            for node in ray.nodes():
+                if node.get("NodeID") == head_node_id:
+                    master_addr = node.get("NodeManagerAddress") or master_addr
+                    break
 
         actors: list[ActorHandle] = []
         trainer_pg_ids = getattr(self, "_trainer_worker_pg_ids", None)
@@ -2180,7 +2191,7 @@ class DynamoReplica(RolloutReplica):
                 "LOCAL_RANK": str(rank % local_world_size),
                 "LOCAL_WORLD_SIZE": str(local_world_size),
                 "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
-                "MASTER_ADDR": "127.0.0.1",
+                "MASTER_ADDR": master_addr,
                 "MASTER_PORT": master_port,
                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             }
