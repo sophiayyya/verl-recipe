@@ -19,7 +19,7 @@ import datasets
 from recipe.retool.retool_dataset_utils import map_fn, map_fn2
 
 from verl.tools.base_tool import OpenAIFunctionToolSchema
-from verl.tools.sandbox_fusion_tools import SandboxFusionTool
+from recipe.retool.sandbox_fusion_tools import SandboxFusionTool
 from verl.utils.dataset import RLHFDataset
 from verl.utils.reward_score import math_dapo
 from verl.utils.rollout_trace import rollout_trace_op

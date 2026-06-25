@@ -41,7 +41,9 @@ import ray
 import requests
 from ray.actor import ActorHandle
 
+from verl.checkpoint_engine.base import CheckpointEngineWorker
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.device import get_torch_device
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica
@@ -203,7 +205,7 @@ class DynamoHttpServer:
         self._http_session_lock = asyncio.Lock()
 
         # Per-subprocess control sidecar endpoints (filled in
-        # _start_vllm_workers); used by collective_rpc bridge in v2.
+        # _start_vllm_workers); used by collective_rpc bridge.
         self._control_endpoints: list[str] = []
 
         # Filled in by _start_vllm_workers; consumed by generate() to build
@@ -364,7 +366,7 @@ class DynamoHttpServer:
         self._server_port = self._frontend_port
         if start_healthcheck:
             await self.wait_frontend_ready()
-            # v2: verify control-sidecar reachability so refit failures surface
+            # Verify control-sidecar reachability so refit failures surface
             # at startup instead of silently dropping weight updates mid-training.
             # Soft-fail by default; set VERL_DYNAMO_REFIT_STRICT=1 for fail-fast.
             # IMPORTANT: must run AFTER wait_frontend_ready so dynamo.vllm
@@ -1647,36 +1649,29 @@ class DynamoHttpServer:
         AsyncLLM, so the verl WorkerExtension methods (update_weights_from_ipc,
         wake_up, sleep, ...) execute inside vLLM workers.
 
-        v1: control sidecar isn't started yet, so we fail fast.
+        Fails fast when no control sidecars are registered.
         """
         if not self._control_endpoints:
             raise NotImplementedError(
                 "DynamoHttpServer.collective_rpc requires control sidecars "
                 "(set rollout.engine_kwargs.dynamo.enable_control_sidecar=True "
-                "to enable). v1 generation-only smoke does not need this."
+                "to enable). Generation-only mode without refit does not need this."
             )
 
         # Control sidecar protocol: REQ side sends pickled dict, RECVs reply.
-        # Sequential for simplicity (one sidecar per shard, response time
-        # similar across shards). If this becomes a bottleneck switch to
-        # asyncio.gather over per-endpoint REQ sockets.
         import pickle
 
         import zmq
         import zmq.asyncio
 
-        # v4a-6 (Iter 7.5): Iter 7.4 revealed sequential endpoint iteration
-        # deadlocks `update_weights_from_ipc`. That RPC blocks until the
-        # receiver's IPC loop returns, but the loop returns only after
-        # sender finishes; sender depends on cupy NCCL broadcast which
-        # requires ALL replicas' rollout actors to join the group. With
-        # sequential iter, only ep[0]'s workers are ever woken — the
-        # other 3 replicas' receivers never set up, cupy broadcast hangs,
-        # everything deadlocks.
-        #
-        # Fix: dispatch all sidecars CONCURRENTLY via asyncio.gather so
-        # all 4 replicas' workers fire update_weights_from_ipc together,
-        # all REP sockets bind, cupy broadcast progresses, sender unblocks.
+        # Dispatch to all sidecars concurrently via asyncio.gather.
+        # Sequential iteration deadlocks update_weights_from_ipc: that
+        # RPC blocks until the receiver IPC loop returns, but the loop
+        # returns only after sender finishes, and sender depends on a
+        # cupy NCCL broadcast that needs every replica's rollout actor
+        # to join the group. With sequential iter only ep[0]'s workers
+        # wake up; the others never bind their REP sockets and the
+        # cupy broadcast hangs forever.
         method_name = method if isinstance(method, str) else method.__name__
         req = {
             "method": method_name,
@@ -1712,7 +1707,7 @@ class DynamoHttpServer:
         return results
 
     # ------------------------------------------------------------------ #
-    # verl interface — lifecycle no-ops (v1) / passthroughs (v2)
+    # verl interface — lifecycle hooks dispatched to node-local sidecars
     # ------------------------------------------------------------------ #
 
     async def wake_up(self, **kwargs):
@@ -1737,7 +1732,7 @@ class DynamoHttpServer:
         if not self._control_endpoints:
             logger.info("[DynamoHttpServer] sleep: no control sidecar, skipping")
             return
-        # v1 can't refit weights, so use sleep level 1 (offload weights to CPU +
+        # No-refit mode keeps sleep level 1 (offload weights to CPU +
         # drop KV); wake_up restores weights from CPU — no refit needed.
         kwargs.setdefault("level", 1)
         await self._engine_method_all("sleep", kwargs=kwargs)
@@ -1750,13 +1745,35 @@ class DynamoHttpServer:
     async def set_global_steps(self, global_steps: int):
         self.global_steps = global_steps
 
+    async def release_kv_cache(self):
+        """Release only kv_cache GPU memory, keeping model weights intact.
+
+        Called by CheckpointEngineManager before backends like NCCL or NIXL
+        rebuild process groups. Dynamo's per-node sidecars route this through
+        the standard reset_prefix_cache path; the engine keeps weights
+        resident (sleep_level=1 from DynamoRollout) so the trainer can write
+        through to live tensors.
+        """
+        if not self._control_endpoints:
+            return
+        await self._engine_method_all("reset_prefix_cache")
+
+    async def resume_kv_cache(self):
+        """Restore kv_cache GPU memory after a weight sync.
+
+        Counterpart to release_kv_cache(). Dynamo never truly releases KV
+        memory (sleep_level=1 keeps weights resident; reset_prefix_cache
+        only drops the cache contents), so there is nothing to resume.
+        """
+        return
+
     async def wait_for_requests_to_drain(self):
         if not self._control_endpoints:
             return
         await self._engine_method_all("wait_for_requests_to_drain")
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
-        # dynamo doesn't expose a global abort; v1 returns no-op result so
+        # dynamo doesn't expose a global abort; return no-op result so
         # RolloutReplica.abort_all_requests's gather doesn't blow up.
         return {"aborted_count": 0, "request_ids": []}
 
@@ -1774,9 +1791,9 @@ class DynamoHttpServer:
         (wake_up / sleep / reset_prefix_cache / wait_for_requests_to_drain),
         not a worker-extension RPC. Distinguished by message kind.
 
-        v4a-6 (Iter 7.5): same parallel-dispatch fix as collective_rpc.
-        Sequential iter deadlocked update_weights_from_ipc and now also
-        deadlocks reset_prefix_cache post-refit."""
+        Uses the same concurrent dispatch as collective_rpc; sequential
+        iteration deadlocks reset_prefix_cache post-refit for the same
+        reason (sidecar RPC blocks until the receive loop drains)."""
         if not self._control_endpoints:
             return None
 
@@ -1799,7 +1816,7 @@ class DynamoHttpServer:
             try:
                 sock.connect(ep)
                 await sock.send(pickle.dumps(req))
-                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=120)
+                reply_bytes = await asyncio.wait_for(sock.recv(), timeout=600)
                 reply = pickle.loads(reply_bytes)
                 if not reply.get("ok"):
                     logger.warning(
@@ -1826,19 +1843,19 @@ class DynamoHttpServer:
         return len(self._control_endpoints) * tp
 
     # ------------------------------------------------------------------ #
-    # refit path self-test (v2 — verifies control sidecar reachability)
+    # refit path self-test (verifies control sidecar reachability)
     # ------------------------------------------------------------------ #
 
     async def _self_test_refit_path(self):
         """Verify the control-sidecar ⇄ AsyncLLM round-trip is alive.
 
-        Refit (DynamoRollout.update_weights, v2) routes weight bytes through
+        Refit (DynamoRollout.update_weights) routes weight bytes through
         ``collective_rpc("update_weights_from_ipc", ...)`` which depends on
         a working REQ-REP loop to each ``_dynamo_vllm_with_control``
         subprocess. A silent failure here (sidecar didn't start, control
         endpoint port collision, etc.) would let ``update_weights`` appear
         to succeed while actually losing all updates — that's the exact
-        bug B v4 had pre-fix.
+        the pre-self-test recipe occasionally hit.
 
         This self-test sends one ``collective_rpc`` request with a
         deliberately invalid method name. A reachable sidecar will reply
@@ -1847,7 +1864,7 @@ class DynamoHttpServer:
 
         Skipped when no control endpoints are registered (slave node / pre-launch).
         Soft-fail by default; set env ``VERL_DYNAMO_REFIT_STRICT=1`` to
-        raise on failure (recommended once v2 is the default).
+        raise on failure (recommended once refit is the only path).
         """
         if not self._control_endpoints:
             return
@@ -1883,7 +1900,7 @@ class DynamoHttpServer:
             # AttributeError on workers got cached/queued and corrupted the
             # NEXT real engine.collective_rpc call (sleep) — sleep silently
             # failed, vLLM held its full 128 GiB, and the next trainer
-            # all-gather OOM'd. (Observed in B v5 smoke iter 2, job 2463154.)
+            # all-gather OOM'd.
             req = {
                 "kind": "__refit_self_test_probe__",
                 "method": None,
@@ -2006,6 +2023,23 @@ class DynamoHttpServer:
 # --------------------------------------------------------------------------- #
 
 
+
+class _DynamoCheckpointEngineWorker(CheckpointEngineWorker):
+    """CheckpointEngineWorker variant spawned with ``num_gpus=0``.
+
+    The base ``Worker._setup_env_cuda_visible_devices`` reads
+    ``ray.get_runtime_context().get_accelerator_ids()[device_name][0]`` when
+    ``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` — that list is empty
+    for a ``num_gpus=0`` actor, so it IndexErrors. Our spawn helper injects
+    ``CUDA_VISIBLE_DEVICES`` via ``runtime_env`` to pin the actor to the
+    GPU shared with its paired ``dynamo.vllm`` subprocess (CUDA IPC needs
+    same-GPU pairing), so torch sees that single GPU as device 0.
+    """
+
+    def _setup_env_cuda_visible_devices(self):  # type: ignore[override]
+        get_torch_device().set_device(0)
+
+
 class DynamoReplica(RolloutReplica):
     """Manages one logical Dynamo serving replica across N nodes.
 
@@ -2043,8 +2077,28 @@ class DynamoReplica(RolloutReplica):
         return "dynamo_"
 
     async def init_hybrid_worker_pool(self, worker_group):
-        """Initialize Dynamo as worker pool for all rollout GPUs."""
+        """Initialize Dynamo as worker pool for all rollout GPUs.
+
+        The verl CheckpointEngineManager fans weight-sync hooks
+        (update_weights / execute_checkpoint_engine / release_kv_cache /
+        resume_kv_cache) out to per-rollout-rank Ray actors. Dynamo's
+        rollout-side ``engine'' is a subprocess (not a Ray actor) plus a
+        node-level DynamoHttpServer, so we cannot route those hooks through
+        the trainer's borrowed WorkerDict handles — they don't expose the
+        rollout-side methods. We therefore:
+
+        1. Borrow the trainer worker_group only to look up per-GPU placement.
+        2. Spawn dynamo.vllm subprocesses on those GPUs (existing logic).
+        3. Spawn dedicated CheckpointEngineWorker Ray actors (one per
+           rollout rank) colocated on the same GPUs as the subprocess
+           workers via env-injected CUDA_VISIBLE_DEVICES.
+        4. Reassign ``self.workers`` to those CheckpointEngineWorker
+           handles so framework hooks land where the methods actually
+           live.
+        """
         self.rollout_mode = RolloutMode.HYBRID
+        # Hold trainer handles only as a placement lookup; replaced at the
+        # end with dedicated rollout-side actors.
         self.workers = list(worker_group.workers)
 
         assert len(self.workers) % self.world_size == 0, (
@@ -2054,22 +2108,129 @@ class DynamoReplica(RolloutReplica):
         num_logical_replicas = len(self.workers) // self.world_size
         await self._launch_shared_worker_pool(num_logical_replicas=num_logical_replicas)
 
+        # Now that dynamo.vllm subprocesses are alive on the GPUs identified
+        # by self._trainer_worker_infos, spawn matching CheckpointEngineWorker
+        # actors and adopt them as our framework-facing workers.
+        self.workers = self._spawn_rollout_checkpoint_engine_workers()
+
+    def _spawn_rollout_checkpoint_engine_workers(self) -> list[ActorHandle]:
+        """Spawn one CheckpointEngineWorker Ray actor per rollout rank.
+
+        Each actor:
+        - ``num_gpus=0`` — Ray does not see it as competing for the trainer's
+          resource pool slots.
+        - ``CUDA_VISIBLE_DEVICES`` env-injected to the same GPU as the
+          corresponding dynamo subprocess worker, so cupy/torch tensor
+          allocations land where the subprocess can receive them via CUDA IPC.
+        - ``RANK / WORLD_SIZE / LOCAL_RANK / LOCAL_WORLD_SIZE`` env match the
+          trainer rank layout so the actor's ``server_adapter``
+          (recipe.dynamo.dynamo_rollout.ServerAdapter) computes a
+          ``zmq_handle`` that pairs 1:1 with the subprocess worker.
+        - ``MASTER_ADDR / MASTER_PORT`` set so the CheckpointEngineWorker
+          actors form their own torch.distributed cpu:gloo group on
+          ``initialize_global_process_group_ray``. Port chosen to not
+          collide with the trainer's existing distributed init.
+        """
+        worker_infos = self._trainer_worker_infos
+        total_ranks = len(worker_infos)
+        local_world_size = self.gpus_per_node
+        master_port = str(int(os.environ.get("VERL_DYNAMO_CE_MASTER_PORT", "29600")))
+        # CE worker rank 0 lands on the head node; on multi-node setups every
+        # other rank needs head's reachable IP, not 127.0.0.1. Resolve via
+        # ``ray.nodes()`` using the first worker's node_id.
+        master_addr = "127.0.0.1"
+        if worker_infos:
+            head_node_id = worker_infos[0][0]
+            for node in ray.nodes():
+                if node.get("NodeID") == head_node_id:
+                    master_addr = node.get("NodeManagerAddress") or master_addr
+                    break
+
+        # Resolve placement-group ids → PlacementGroup objects (deduped) so
+        # each CE actor can colocate into the same bundle as its paired
+        # trainer worker. ``get_placement_group`` raises if the id is unknown
+        # (e.g. PG cleaned up); falling back to NodeAffinity keeps the actor
+        # on the same node even if PG capture fails.
+        trainer_pg_ids = self._trainer_worker_pg_ids
+        trainer_pg_lookup: dict[str, Any] = {}
+        for pg_id in trainer_pg_ids:
+            if pg_id and pg_id not in trainer_pg_lookup:
+                try:
+                    trainer_pg_lookup[pg_id] = ray.util.get_placement_group(pg_id)
+                except Exception:
+                    trainer_pg_lookup[pg_id] = None
+
+        actors: list[ActorHandle] = []
+        for rank, (node_id, gpu_id) in enumerate(worker_infos):
+            env_vars = {
+                "CUDA_VISIBLE_DEVICES": str(gpu_id),
+                "RANK": str(rank),
+                "WORLD_SIZE": str(total_ranks),
+                "LOCAL_RANK": str(rank % local_world_size),
+                "LOCAL_WORLD_SIZE": str(local_world_size),
+                "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
+                "MASTER_ADDR": master_addr,
+                "MASTER_PORT": master_port,
+                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+            }
+
+            trainer_pg = trainer_pg_lookup.get(trainer_pg_ids[rank])
+            if trainer_pg is not None:
+                scheduling_strategy = (
+                    ray.util.scheduling_strategies.PlacementGroupSchedulingStrategy(
+                        placement_group=trainer_pg,
+                        placement_group_bundle_index=rank % local_world_size,
+                        placement_group_capture_child_tasks=False,
+                    )
+                )
+            else:
+                scheduling_strategy = (
+                    ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                        node_id=node_id, soft=False,
+                    )
+                )
+
+            actor = (
+                ray.remote(num_gpus=0, num_cpus=1)(_DynamoCheckpointEngineWorker)
+                .options(
+                    scheduling_strategy=scheduling_strategy,
+                    runtime_env={"env_vars": env_vars},
+                    name=f"dynamo_ce_worker_{self.replica_rank}_{rank}{self.name_suffix}",
+                )
+                .remote(
+                    rollout_config=self.config,
+                    model_config=self.model_config,
+                    replica_rank=rank // self.world_size,
+                )
+            )
+            actors.append(actor)
+        return actors
+
     async def _launch_shared_worker_pool(self, num_logical_replicas: int):
         """Launch a single frontend backed by all logical replica workers."""
         from verl.utils.device import get_resource_name
 
         tp = self.config.tensor_model_parallel_size
-        worker_infos = await asyncio.gather(
+        worker_infos_raw = await asyncio.gather(
             *[
                 worker.__ray_call__.remote(
                     lambda self: (
                         ray.get_runtime_context().get_node_id(),
                         ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0],
+                        ray.get_runtime_context().get_placement_group_id(),
                     )
                 )
                 for worker in self.workers
             ]
         )
+        # Strip pg_id from the tuple stored as worker_infos (so existing
+        # downstream consumers see the original 2-tuple shape), and resolve
+        # the per-rank placement_group id to a PlacementGroup object so the
+        # CE worker spawn can colocate into the trainer's bundle.
+        worker_infos = [(node_id, gpu_id) for node_id, gpu_id, _ in worker_infos_raw]
+        pg_ids = [pg_id for _, _, pg_id in worker_infos_raw]
+        self._trainer_worker_infos = worker_infos
+        self._trainer_worker_pg_ids = pg_ids
 
         node_order: list[str] = []
         node_to_workers: dict[str, list[ActorHandle]] = {}
@@ -2185,7 +2346,7 @@ class DynamoReplica(RolloutReplica):
             )
 
         await master.wait_frontend_ready.remote(expected_workers=expected_workers)
-        # v2: refit-path self-test, run here (not inside _launch_master) because
+        # refit-path self-test, run here (not inside _launch_master) because
         # the shared-pool path uses start_healthcheck=False above so the
         # inline self-test is skipped. Must come AFTER wait_frontend_ready
         # so all dynamo.vllm subprocesses have captured their AsyncLLM and
