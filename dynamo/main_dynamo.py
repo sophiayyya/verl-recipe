@@ -17,7 +17,6 @@ import hydra
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import run_ppo
-from verl.trainer.main_ppo_v0 import TaskRunner
 from verl.utils.device import auto_set_device
 
 
@@ -25,7 +24,7 @@ from verl.utils.device import auto_set_device
 def main(config):
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
-    run_ppo(config, task_runner_class=TaskRunner)
+    run_ppo(config)
 
 
 if __name__ == "__main__":
