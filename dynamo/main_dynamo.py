@@ -17,15 +17,27 @@ import hydra
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import run_ppo
-from verl.trainer.main_ppo_v0 import TaskRunner
 from verl.utils.device import auto_set_device
+
+try:
+    # Current verl keeps the legacy PPO runner in a dedicated module.
+    from verl.trainer.main_ppo_v0 import TaskRunner
+except ModuleNotFoundError as exc:
+    if exc.name != "verl.trainer.main_ppo_v0":
+        raise
+    # The ThunderAgent-pinned verl revision still selects its TaskRunner when
+    # run_ppo is called without an explicit runner.
+    TaskRunner = None
 
 
 @hydra.main(config_path="config", config_name="dynamo_trainer", version_base=None)
 def main(config):
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
-    run_ppo(config, task_runner_class=TaskRunner)
+    if TaskRunner is None:
+        run_ppo(config)
+    else:
+        run_ppo(config, task_runner_class=TaskRunner)
 
 
 if __name__ == "__main__":

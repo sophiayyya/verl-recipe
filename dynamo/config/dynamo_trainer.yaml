@@ -23,8 +23,13 @@ actor_rollout_ref:
   rollout:
     name: dynamo
     mode: async
+    agent:
+      agent_loop_manager_class: recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
     engine_kwargs:
       dynamo:
+        thunderagent:
+          enabled: true
+          router_block_size: 16
         # All keys optional; sane defaults applied in DynamoHttpServer.
         # namespace: verl_dynamo
         # router_mode: kv               # round-robin | kv | random | least-loaded
