@@ -9,9 +9,9 @@ from verl.workers.rollout.replica import RolloutReplicaRegistry
 
 
 def _load_dynamo():
-    from recipe.dynamo.dynamo_async_server import DynamoReplica
+    from recipe.dynamo.dynamo_thunderagent import DynamoThunderAgentReplica
 
-    return DynamoReplica
+    return DynamoThunderAgentReplica
 
 
 RolloutReplicaRegistry.register("dynamo", _load_dynamo)

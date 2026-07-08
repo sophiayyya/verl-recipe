@@ -21,6 +21,7 @@ replaces the generic server manager with a direct Dynamo server manager.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -32,6 +33,9 @@ from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.utils import update_prometheus_config
 
+from .thunderagent import current_program
+from .thunderagent import program_scope as bind_program
+
 
 class DynamoServerManager:
     """Direct manager for the shared Dynamo frontend actor.
@@ -41,10 +45,28 @@ class DynamoServerManager:
     frontend, so verl should only call the single shared Dynamo actor.
     """
 
-    def __init__(self, servers: list[tuple[str, ray.actor.ActorHandle]]):
+    def __init__(
+        self,
+        servers: list[tuple[str, ray.actor.ActorHandle]],
+        *,
+        thunderagent_enabled: bool = False,
+    ):
         if len(servers) != 1:
             raise ValueError(f"DynamoServerManager expects exactly one shared server, got {len(servers)}")
         self.server_address, self.server = servers[0]
+        self.thunderagent_enabled = thunderagent_enabled
+
+    @asynccontextmanager
+    async def program_scope(self):
+        """Bind all turns in one agent-loop run to one Dynamo program."""
+        if not self.thunderagent_enabled:
+            yield
+            return
+        async with bind_program(uuid4().hex, self._finalize_program):
+            yield
+
+    async def _finalize_program(self, session_id: str) -> None:
+        await self.server.finalize_program.remote(session_id=session_id)
 
     async def generate(
         self,
@@ -54,9 +76,14 @@ class DynamoServerManager:
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
+        audio_data: Optional[list[Any]] = None,
+        mm_processor_kwargs: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> TokenOutput:
-        return await self.server.generate.remote(
+        if audio_data is not None or mm_processor_kwargs:
+            raise RuntimeError("Dynamo frontend generate does not support audio inputs or processor options")
+
+        generate_kwargs = dict(
             request_id=request_id or uuid4().hex,
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
@@ -64,6 +91,17 @@ class DynamoServerManager:
             video_data=video_data,
             **kwargs,
         )
+        if not self.thunderagent_enabled:
+            return await self.server.generate.remote(**generate_kwargs)
+
+        scope = current_program()
+        if scope is None:
+            raise RuntimeError("Dynamo generation requires an active ThunderAgent program")
+        async with scope.request():
+            return await self.server.generate.remote(
+                **generate_kwargs,
+                thunderagent_session_id=scope.session_id,
+            )
 
 
 class DynamoLLMServerManager(LLMServerManager):
@@ -73,9 +111,9 @@ class DynamoLLMServerManager(LLMServerManager):
         if self.worker_group is None:
             raise ValueError("Dynamo rollout requires hybrid mode with an actor rollout worker group")
 
-        from recipe.dynamo.dynamo_async_server import DynamoReplica
+        from recipe.dynamo.dynamo_thunderagent import DynamoThunderAgentReplica
 
-        replica = DynamoReplica(
+        replica = DynamoThunderAgentReplica(
             replica_rank=start_rank,
             config=self.rollout_config,
             model_config=self.model_config,
@@ -93,9 +131,25 @@ class DynamoLLMServerManager(LLMServerManager):
                 raise ValueError("PROMETHEUS needs disable_log_stats==False, but it is currently True.")
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
+    async def _init_global_load_balancer(self) -> None:
+        """Dynamo owns routing behind its single shared frontend."""
+
+    def get_client(self, client_cls=None, **kwargs) -> DynamoServerManager:
+        dynamo_config = (self.rollout_config.engine_kwargs or {}).get("dynamo", {}) or {}
+        thunderagent_config = dynamo_config.get("thunderagent", {}) or {}
+        servers = list(zip(self.server_addresses, self.server_handles, strict=True))
+        return DynamoServerManager(
+            servers,
+            thunderagent_enabled=bool(thunderagent_config.get("enabled", False)),
+        )
+
 
 class DynamoAgentLoopWorker(AgentLoopWorker):
-    """Compatibility wrapper for Dynamo agent loop workers."""
+    """Bind each trajectory to one ThunderAgent program."""
+
+    async def _run_agent_loop(self, *args, **kwargs):
+        async with self.llm_client.program_scope():
+            return await super()._run_agent_loop(*args, **kwargs)
 
 
 class DynamoAgentLoopManager(AgentLoopManager):

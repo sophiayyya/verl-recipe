@@ -67,6 +67,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | collabllm | [`recipe/collabllm/REQUIRED_VERL.txt`](collabllm/REQUIRED_VERL.txt) |
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
 | deepeyes | [`recipe/deepeyes/REQUIRED_VERL.txt`](deepeyes/REQUIRED_VERL.txt) |
+| dynamo | [`recipe/dynamo/REQUIRED_VERL.txt`](dynamo/REQUIRED_VERL.txt) |
 | entropy | [`recipe/entropy/REQUIRED_VERL.txt`](entropy/REQUIRED_VERL.txt) |
 | fapo | [`recipe/fapo/REQUIRED_VERL.txt`](fapo/REQUIRED_VERL.txt) |
 | fault_recover | [`recipe/fault_recover/REQUIRED_VERL.txt`](fault_recover/REQUIRED_VERL.txt) |
