@@ -36,6 +36,7 @@ _REQUEST_PROGRAM: ContextVar[tuple[str, bool] | None] = ContextVar(
     "dynamo_thunderagent_request_program",
     default=None,
 )
+_THUNDERAGENT_BACKEND_MODEL_SUFFIX = "--verl-thunderagent-backend"
 
 
 class DynamoThunderAgentHttpServer(DynamoHttpServer):
@@ -96,8 +97,14 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         tp: int,
         kv_events_config_json: str,
     ) -> list[str]:
-        command = super()._build_vllm_cmd(served_model_name, tp, kv_events_config_json)
-        if not self._thunderagent_enabled():
+        thunderagent_enabled = self._thunderagent_enabled()
+        worker_model_name = (
+            f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}"
+            if thunderagent_enabled
+            else served_model_name
+        )
+        command = super()._build_vllm_cmd(worker_model_name, tp, kv_events_config_json)
+        if not thunderagent_enabled:
             return command
 
         block_size = str(self._thunderagent_router_block_size())
