@@ -296,6 +296,22 @@ def test_vllm_and_thunderagent_share_block_size(monkeypatch) -> None:
     assert command[-2:] == ["--block-size", "32"]
 
 
+def test_thunderagent_backend_workers_use_internal_model_name(monkeypatch) -> None:
+    server = _make_http_server()
+    captured = {}
+
+    def build_vllm(_self, model, _tp, _kv_events_config_json):
+        captured["model"] = model
+        return ["python", "-m", "dynamo.vllm"]
+
+    monkeypatch.setattr(DynamoHttpServer, "_build_vllm_cmd", build_vllm)
+
+    server._build_vllm_cmd("test-model", 1, "{}")
+
+    assert captured["model"] == "test-model--verl-thunderagent-backend"
+    assert server._served_model_name == "test-model"
+
+
 def test_thunderagent_payload_supplies_worker_dp_rank(monkeypatch) -> None:
     server = _make_http_server()
     monkeypatch.setattr(
@@ -318,6 +334,26 @@ def test_frontend_start_starts_thunderagent_first(monkeypatch) -> None:
     server._start_frontend()
 
     assert events == ["thunderagent", "frontend"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("enabled", "expected_workers"), [(True, 5), (False, 4)])
+async def test_frontend_health_waits_for_router_and_workers(monkeypatch, enabled, expected_workers) -> None:
+    server = _make_http_server({"enabled": enabled})
+    observed = []
+
+    async def healthcheck(_self, workers):
+        observed.append(workers)
+
+    async def finalize(_session_id):
+        pass
+
+    monkeypatch.setattr(DynamoHttpServer, "_healthcheck_frontend", healthcheck)
+    monkeypatch.setattr(server, "finalize_program", finalize)
+
+    await server._healthcheck_frontend(4)
+
+    assert observed == [expected_workers]
 
 
 @pytest.mark.asyncio
@@ -491,7 +527,7 @@ def test_recipe_pins_tested_verl_and_dynamo_revisions() -> None:
 
     assert "MODE=pinned_commit" in required_verl
     assert "COMMIT=d82d2777b5dc3e96a8a45168d02660312707ab98" in required_verl
-    assert "48632da9c77c5a7647b50cf1ba2a729dcdca7aea" in readme
+    assert "59d614641837e593f0567b79d75394aae5f864e0" in readme
     assert "dynamo/REQUIRED_VERL.txt" in repository_readme
 
 

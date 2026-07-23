@@ -272,7 +272,8 @@ modify core `verl` or Dynamo.
 ### Required versions
 
 - Core `verl`: see [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt).
-- Dynamo: source commit `48632da9c77c5a7647b50cf1ba2a729dcdca7aea`.
+- Dynamo: source commit `59d614641837e593f0567b79d75394aae5f864e0`, including
+  [PR #11185](https://github.com/ai-dynamo/dynamo/pull/11185).
 
 ThunderAgent is experimental and is not included in a released Dynamo Python
 package. Build or install Dynamo from the commit above; `etcd`, `nats-server`,

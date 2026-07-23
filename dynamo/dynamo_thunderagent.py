@@ -99,9 +99,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
     ) -> list[str]:
         thunderagent_enabled = self._thunderagent_enabled()
         worker_model_name = (
-            f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}"
-            if thunderagent_enabled
-            else served_model_name
+            f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}" if thunderagent_enabled else served_model_name
         )
         command = super()._build_vllm_cmd(worker_model_name, tp, kv_events_config_json)
         if not thunderagent_enabled:
@@ -263,7 +261,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             _REQUEST_PROGRAM.reset(token)
 
     async def _healthcheck_frontend(self, expected_workers: int) -> None:
-        await super()._healthcheck_frontend(expected_workers)
+        await super()._healthcheck_frontend(expected_workers + int(self._thunderagent_enabled()))
         if self._thunderagent_enabled():
             await self.finalize_program(f"thunderagent-health-{time.time_ns()}")
 
