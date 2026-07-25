@@ -271,31 +271,12 @@ modify core `verl` or Dynamo.
 
 ### Required versions
 
-- Core `verl`: see [`REQUIRED_VERL.txt`](REQUIRED_VERL.txt).
 - Dynamo: source commit `59d614641837e593f0567b79d75394aae5f864e0`, including
   [PR #11185](https://github.com/ai-dynamo/dynamo/pull/11185).
 
-ThunderAgent is experimental and is not included in a released Dynamo Python
-package. Build or install Dynamo from the commit above; `etcd`, `nats-server`,
-`dynamo.vllm`, `dynamo.thunderagent_router`, and `dynamo.frontend` must be
-available in the runtime image.
-
-### Request lifecycle
-
-Each `AgentLoopBase.run()` is one ThunderAgent program:
-
-1. The recipe creates one random session ID when a trajectory starts.
-2. Every LLM turn sends the same `X-Dynamo-Session-ID`.
-3. Concurrent trajectories use task-local, isolated session IDs.
-4. On success, error, or cancellation, admitted requests drain before one
-   `X-Dynamo-Session-Final: true` request releases the program.
-
-The final request must return no model choices. A non-empty completion is
-treated as a routing bypass and fails closed.
-
 ### Topology
 
-With ThunderAgent enabled, PR #110 launches processes in this order:
+With ThunderAgent enabled, verl launches processes in this order:
 
 ```text
 etcd -> NATS -> Dynamo vLLM workers -> ThunderAgent router -> frontend
@@ -351,19 +332,3 @@ python -m recipe.dynamo.main_dynamo \
 
 Supply the remaining dataset, trainer, and resource overrides required by the
 standard verl PPO configuration.
-
-### Tests
-
-```bash
-pytest -q recipe/dynamo/tests
-ruff check recipe/dynamo/thunderagent.py recipe/dynamo/dynamo_thunderagent.py \
-  recipe/dynamo/dynamo_agent_loop.py recipe/dynamo/main_dynamo.py \
-  recipe/dynamo/register.py recipe/dynamo/tests
-ruff format --check recipe/dynamo/thunderagent.py recipe/dynamo/dynamo_thunderagent.py \
-  recipe/dynamo/dynamo_agent_loop.py recipe/dynamo/main_dynamo.py \
-  recipe/dynamo/register.py recipe/dynamo/tests
-```
-
-GPU validation should run the same model, prompts, concurrency, warmup, and
-measurement window twice, changing only `thunderagent.enabled`. Record
-throughput, latency, KV-cache hit rate, errors, and router pause/resume logs.

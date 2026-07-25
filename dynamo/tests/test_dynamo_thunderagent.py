@@ -298,17 +298,20 @@ def test_vllm_and_thunderagent_share_block_size(monkeypatch) -> None:
 
 def test_thunderagent_backend_workers_use_internal_model_name(monkeypatch) -> None:
     server = _make_http_server()
-    captured = {}
+    base_calls = []
 
-    def build_vllm(_self, model, _tp, _kv_events_config_json):
-        captured["model"] = model
-        return ["python", "-m", "dynamo.vllm"]
+    def build_base_command(_self, served_model_name, _tp, _kv_events_config_json):
+        base_calls.append(served_model_name)
+        return ["python", "-m", "dynamo.vllm", "--served-model-name", served_model_name]
 
-    monkeypatch.setattr(DynamoHttpServer, "_build_vllm_cmd", build_vllm)
+    monkeypatch.setattr(DynamoHttpServer, "_build_vllm_cmd", build_base_command)
 
-    server._build_vllm_cmd("test-model", 1, "{}")
+    command = server._build_vllm_cmd("test-model", 1, "{}")
+    thunderagent_command = server._build_thunderagent_cmd()
 
-    assert captured["model"] == "test-model--verl-thunderagent-backend"
+    assert base_calls == ["test-model--verl-thunderagent-backend"]
+    assert command[command.index("--served-model-name") + 1] == "test-model--verl-thunderagent-backend"
+    assert thunderagent_command[thunderagent_command.index("--model-name") + 1] == "test-model"
     assert server._served_model_name == "test-model"
 
 
@@ -317,11 +320,15 @@ def test_thunderagent_payload_supplies_worker_dp_rank(monkeypatch) -> None:
     monkeypatch.setattr(
         DynamoHttpServer,
         "_build_frontend_completion_payload",
-        lambda _self, _prompt, _sampling, _request_id: {"nvext": {"extra_fields": ["engine_data"]}},
+        lambda _self, _prompt, _sampling, _request_id: {
+            "model": _self._served_model_name,
+            "nvext": {"extra_fields": ["engine_data"]},
+        },
     )
 
     payload = server._build_frontend_completion_payload([1], {}, "request-a")
 
+    assert payload["model"] == "test-model"
     assert payload["nvext"] == {"extra_fields": ["engine_data"], "dp_rank": 0}
 
 
