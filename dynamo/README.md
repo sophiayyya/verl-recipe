@@ -332,3 +332,31 @@ python -m recipe.dynamo.main_dynamo \
 
 Supply the remaining dataset, trainer, and resource overrides required by the
 standard verl PPO configuration.
+
+### UniAgent variants
+
+[`run_uniagent_variant.sh`](run_uniagent_variant.sh) is a concise UniAgent
+training example. Select one rollout path with `VARIANT`:
+
+- `ta` (default): Dynamo with ThunderAgent enabled.
+- `dynamo`: the native Dynamo KV-router baseline with ThunderAgent disabled.
+- `global`: the native verl vLLM rollout baseline, bypassing Dynamo. The
+  historical name does not mean that this script explicitly configures a
+  GlobalLoadBalancer.
+
+Run it from the verl root:
+
+```bash
+VARIANT=ta RAY_DATA_HOME=/path/to/verl-data \
+bash recipe/dynamo/run_uniagent_variant.sh
+
+VARIANT=dynamo RAY_DATA_HOME=/path/to/verl-data \
+bash recipe/dynamo/run_uniagent_variant.sh
+
+VARIANT=global RAY_DATA_HOME=/path/to/verl-data \
+bash recipe/dynamo/run_uniagent_variant.sh
+```
+
+When `VARIANT` is omitted, the script uses `ta`. Override `MODEL_PATH`,
+`TRAIN_FILE`, `TEST_FILE`, `AGENT_CONFIG`, or `UNIAGENT_ROOT` when the files do
+not follow the default layout under `RAY_DATA_HOME`.
