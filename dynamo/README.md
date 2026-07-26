@@ -315,10 +315,6 @@ VARIANT=global RAY_DATA_HOME=/path/to/verl-data \
 bash recipe/dynamo/run_uniagent_variant.sh
 ```
 
-When `VARIANT` is omitted, the script uses `ta`. Override `MODEL_PATH`,
-`TRAIN_FILE`, `TEST_FILE`, `AGENT_CONFIG`, or `UNIAGENT_ROOT` when the files do
-not follow the default layout under `RAY_DATA_HOME`.
-
 ### End-to-end ThunderAgent result
 
 The ThunderAgent comparison used the following matched setup:

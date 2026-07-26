@@ -2,7 +2,7 @@
 set -xeuo pipefail
 
 project_name=${PROJECT_NAME:-retool-30b-dynamo}
-exp_name=${EXP_NAME:-dynamo-kv-i100-metrics}
+exp_name=${EXP_NAME:-dynamo-kv-metrics}
 
 max_prompt_length=${MAX_PROMPT_LENGTH:-2048}
 max_response_length=${MAX_RESPONSE_LENGTH:-16384}
