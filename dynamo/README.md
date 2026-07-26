@@ -343,7 +343,3 @@ concurrency 384, ThunderAgent reaches **1.94× rollout-phase speedup** and
 **2.40×** and **1.60×**, respectively.
 
 <img src="assets/thunderagent_speedup.png" alt="ThunderAgent speedup over Global LB" width="800">
-
-The primary completion SLO for this comparison was at least 95% of trajectories
-finishing within 3,600 seconds; 1,800 seconds was also tracked as a stricter
-reference.
