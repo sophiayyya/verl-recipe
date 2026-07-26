@@ -117,6 +117,21 @@ variants) live in the top-level scripts:
 sbatch recipe/dynamo/train_30b_rl_dynamo_kv_i100_metrics.sh     # KV router + metrics
 ```
 
+## KV-aware routing result
+
+The matched comparison below keeps only Dynamo KV routing with
+`stream-interval=100` and the native vLLM baseline. Lower `ms/token` is better;
+the similar response lengths and rewards are sanity checks that generation
+behavior stayed comparable.
+
+| Backend | ms/token | Mean response length | Mean reward | KV-cache hits / queries | KV-cache hit rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dynamo KV (`stream-interval=100`) | 1.5956 | 876.1 | -0.8807 | 2,248,368 / 2,520,362 | 89.21% |
+| vLLM baseline | 1.7220 | 872.3 | -0.8867 | 1,860,816 / 2,432,064 | 76.51% |
+
+Dynamo KV is approximately **7.3% faster per generated token** in this
+comparison and improves the KV-cache hit rate by **12.70 percentage points**.
+
 ## Running a full agent-loop RL run
 
 The quick-start examples above are single-turn smoke tests. A real RL run drives
