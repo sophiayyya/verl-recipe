@@ -333,16 +333,16 @@ rollout phase; the RL algorithm remains synchronous and does not use a
 by rollout wall time. Full-step throughput also includes reward/advantage,
 old-log-probability, actor-update, and weight-synchronization time.
 
-![ThunderAgent and Global LB complete synchronous RL-step throughput](assets/thunderagent_full_step_throughput.png)
+<img src="assets/thunderagent_full_step_throughput.png" alt="ThunderAgent and Global LB complete synchronous RL-step throughput" width="800">
 
-![ThunderAgent and Global LB rollout-phase generated-token throughput](assets/thunderagent_rollout_throughput.png)
+<img src="assets/thunderagent_rollout_throughput.png" alt="ThunderAgent and Global LB rollout-phase generated-token throughput" width="800">
 
 At concurrency 64–256, ThunderAgent and Global LB are near parity. At
 concurrency 384, ThunderAgent reaches **1.94× rollout-phase speedup** and
 **1.39× observed full-step speedup**; at concurrency 512, the speedups reach
 **2.40×** and **1.60×**, respectively.
 
-![ThunderAgent speedup over Global LB](assets/thunderagent_speedup.png)
+<img src="assets/thunderagent_speedup.png" alt="ThunderAgent speedup over Global LB" width="800">
 
 The primary completion SLO for this comparison was at least 95% of trajectories
 finishing within 3,600 seconds; 1,800 seconds was also tracked as a stricter
