@@ -121,13 +121,13 @@ sbatch recipe/dynamo/train_30b_rl_dynamo_kv_i100_metrics.sh     # KV router + me
 
 The matched comparison below keeps only Dynamo KV routing with
 `stream-interval=100` and the native vLLM baseline. Lower `ms/token` is better;
-the similar response lengths and rewards are sanity checks that generation
-behavior stayed comparable.
+the similar response lengths are a sanity check that generation behavior stayed
+comparable.
 
-| Backend | ms/token | Mean response length | Mean reward | KV-cache hits / queries | KV-cache hit rate |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dynamo KV (`stream-interval=100`) | 1.5956 | 876.1 | -0.8807 | 2,248,368 / 2,520,362 | 89.21% |
-| vLLM baseline | 1.7220 | 872.3 | -0.8867 | 1,860,816 / 2,432,064 | 76.51% |
+| Backend | ms/token | Mean response length | KV-cache hits / queries | KV-cache hit rate |
+| --- | ---: | ---: | ---: | ---: |
+| Dynamo KV (`stream-interval=100`) | 1.5956 | 876.1 | 2,248,368 / 2,520,362 | 89.21% |
+| vLLM baseline | 1.7220 | 872.3 | 1,860,816 / 2,432,064 | 76.51% |
 
 ![Per-step timing per token from the KV-aware router comparison](assets/kv_aware_router_interval100.png)
 
