@@ -129,6 +129,8 @@ behavior stayed comparable.
 | Dynamo KV (`stream-interval=100`) | 1.5956 | 876.1 | -0.8807 | 2,248,368 / 2,520,362 | 89.21% |
 | vLLM baseline | 1.7220 | 872.3 | -0.8867 | 1,860,816 / 2,432,064 | 76.51% |
 
+![Per-step timing per token from the KV-aware router comparison](assets/kv_aware_router_interval100.png)
+
 Dynamo KV is approximately **7.3% faster per generated token** in this
 comparison and improves the KV-cache hit rate by **12.70 percentage points**.
 
