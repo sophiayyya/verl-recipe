@@ -377,3 +377,34 @@ bash recipe/dynamo/run_uniagent_variant.sh
 When `VARIANT` is omitted, the script uses `ta`. Override `MODEL_PATH`,
 `TRAIN_FILE`, `TEST_FILE`, `AGENT_CONFIG`, or `UNIAGENT_ROOT` when the files do
 not follow the default layout under `RAY_DATA_HOME`.
+
+### End-to-end ThunderAgent result
+
+The ThunderAgent comparison used the following matched setup:
+
+- Uni-Agent × verl synchronous end-to-end GRPO, including rollout,
+  reward/advantage, old log-probability, actor update, and weight
+  synchronization.
+- Training and inference colocated and time-multiplexed on 8 × NVIDIA H20-3e
+  GPUs (140.4 GiB/GPU), with two TP4 replicas.
+- Qwen3-Coder-30B-A3B-Instruct.
+- The only backend change was verl Global LB versus Dynamo ThunderAgent.
+
+Here, `rollout.mode=async` only enables concurrent agent requests within the
+rollout phase; the RL algorithm remains synchronous and does not use a
+`staleness_threshold`. Rollout throughput is generated response tokens divided
+by rollout wall time. Full-step throughput also includes reward/advantage,
+old-log-probability, actor-update, and weight-synchronization time.
+
+![ThunderAgent and Global LB rollout and complete-step throughput](assets/thunderagent_e2e_throughput.png)
+
+At concurrency 64–256, ThunderAgent and Global LB are near parity. At
+concurrency 384, ThunderAgent reaches **1.94× rollout-phase speedup** and
+**1.39× observed full-step speedup**; at concurrency 512, the speedups reach
+**2.40×** and **1.60×**, respectively.
+
+![ThunderAgent speedup over Global LB](assets/thunderagent_speedup.png)
+
+The primary completion SLO for this comparison was at least 95% of trajectories
+finishing within 3,600 seconds; 1,800 seconds was also tracked as a stricter
+reference.
