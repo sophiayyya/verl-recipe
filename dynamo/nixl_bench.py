@@ -11,7 +11,6 @@ import sys
 import time
 
 import torch
-
 from nixl._api import nixl_agent, nixl_agent_config
 
 SIZE = 1 << 30  # 1 GiB
