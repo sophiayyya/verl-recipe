@@ -133,6 +133,65 @@ sbatch recipe/dynamo/train_30b_rl_dynamo_kv_metrics.sh     # KV router + metrics
 
 
 
+## NIXL weight sync (checkpoint engine)
+
+By default the trainer pushes weights to the Dynamo workers through verl's
+naive CUDA-IPC path. Setting
+
+```bash
+actor_rollout_ref.rollout.checkpoint_engine.backend=nixl \
+actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
+```
+
+routes refit through verl's `CheckpointEngineManager` instead: the recipe
+spawns one `CheckpointEngineWorker` Ray actor per rollout rank (colocated on
+the paired GPU — CUDA IPC requires same-GPU pairing) and NIXL moves the
+buckets down a trainer → CE₁ → … → CEₙ chain, which crosses nodes at most
+twice regardless of world size.
+
+### Support matrix
+
+| backend | single-node | multi-node |
+|---|---|---|
+| naive | ✅ | ✅ |
+| NIXL  | ✅ | ✅ (2×8 GPU validated) |
+
+### Transport selection (read this before multi-node)
+
+NIXL's default backend is UCX, and UCX picks its transport from `UCX_TLS`.
+The right setting depends on the RDMA fabric:
+
+| fabric | recommendation |
+|---|---|
+| RDMA with native RDMA-read (e.g. InfiniBand / RoCE) | `UCX_TLS=cuda_ipc,cuda_copy,rc,tcp` — `rc` gives native RDMA read at line rate. |
+| RDMA without native RDMA-read (send/recv-only protocols) | UCX can only emulate one-sided reads over send/recv — we measured 0.23 GB/s. Use NIXL's **LIBFABRIC** backend instead: `+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nixl.backends=[LIBFABRIC]`, with your fabric's libfabric provider (≥1.18) on `LD_LIBRARY_PATH`. Same 1 GiB cross-node read: **48.5 GB/s**. |
+
+Cross-node measured on 2 nodes × 8×H100 (RDMA fabric), 3-step GRPO,
+step-3 `update_weights`:
+
+| model | naive | NIXL UCX (tcp / one-sided read emulated over send/recv) | NIXL LIBFABRIC |
+|---|---|---|---|
+| Qwen2.5-0.5B | 3.08 s | 12.2 s / 11.6 s | 3.09 s |
+| Qwen3-8B | 29.7 s | — | **27.1 s** |
+
+At 0.5B the LIBFABRIC path is at parity with naive (the shared per-rank
+engine-consume dominates); at 8B it is ~9% faster. The UCX column shows
+the send/recv emulation ceiling — protocol-level, not tunable.
+
+Two helpers ship with the recipe: `run_nixl_smoke.sh` (a 3-step GRPO
+training smoke parameterised over `NNODES` / `CE_BACKEND`) and
+`nixl_bench.py` (a standalone cross-node bandwidth probe for checking
+what a fabric actually delivers before debugging the training path).
+When running in containers/Kubernetes, give worker pods the fabric's
+RDMA device resource (e.g. `rdma/ib`) and the `IPC_LOCK` capability —
+NIXL needs it to pin memory for RDMA registration, and transfers hang
+without it.
+
+> `engine_kwargs.nixl.backends` requires a small verl-side change (a
+> `backends` kwarg on `NIXLCheckpointEngine`, pending as a separate verl
+> PR); on IB/RoCE
+> fabrics the stock UCX backend needs no verl change.
+
 ## KV-aware routing result
 
 The matched comparison below keeps only Dynamo KV routing with
