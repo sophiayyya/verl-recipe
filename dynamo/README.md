@@ -405,7 +405,7 @@ concurrency 384, ThunderAgent reaches **1.94× rollout-phase speedup** and
 
 <img src="assets/thunderagent_speedup.png" alt="ThunderAgent speedup over Global LB" width="800">
 
-## SGLang engine (`rollout.name=dynamo_sglang`)
+## SGLang engine (`engine_kwargs.dynamo.engine=sglang`)
 
 The Dynamo backend can front **either** `dynamo.vllm` (default, everything above) or
 `dynamo.sglang`. Full design and rollout plan: [DESIGN_sglang_backend.md](DESIGN_sglang_backend.md).
@@ -450,11 +450,13 @@ bash recipe/dynamo/smoke_dynamo_sglang.sh
 STAGE=train bash recipe/dynamo/smoke_dynamo_sglang.sh
 ```
 
-Both flags must move together — `rollout.name` picks the trainer-side adapter,
-`engine.dynamo.engine` picks the subprocess. `SGLangServerAdapter` asserts they agree:
+Engine selection is a single switch — `rollout.name=dynamo` stays fixed for both
+engines, and `recipe.dynamo.dynamo_rollout.ServerAdapter` dispatches on
+`engine_kwargs.dynamo.engine` (an earlier revision used a separate
+`rollout.name=dynamo_sglang`; that name is no longer registered):
 
 ```bash
-actor_rollout_ref.rollout.name=dynamo_sglang \
+actor_rollout_ref.rollout.name=dynamo \
 ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
 ```
 
@@ -471,19 +473,20 @@ actor_rollout_ref.rollout.name=dynamo_sglang \
 
 ### Not wired yet
 
-- **ThunderAgent** — only validated against vLLM; left off in `dynamo_sglang_trainer.yaml`.
+- **ThunderAgent** — only validated against vLLM; not enabled for the sglang engine.
 - **`checkpoint_engine.backend=delta_sharded`** — verl gates it on `rollout.name == "sglang"`
-  (`verl/checkpoint_engine/base.py`), which `dynamo_sglang` does not satisfy.
+  (`verl/checkpoint_engine/base.py`), which the `dynamo` rollout name does not satisfy.
 - **LoRA adapter sync** — needs `load_lora_adapter_from_tensors` as an engine route.
 - **SGLang-native streaming `/generate`** (token-in/token-out) — needs a dynamo build with
   [#11640](https://github.com/ai-dynamo/dynamo/pull/11640); generation currently goes through
-  the same frontend `/v1/completions` path as vLLM.
+  the same frontend `/v1/completions` path as vLLM. (Our `patches/` backport covers only the
+  log-prob portion of #11640, not the `/generate` endpoint itself.)
 
 ### Engine log-prob fidelity: incremental-vs-cumulative fix (required patch)
 
 **Status: fixed and verified end-to-end (2026-09-01).** Requires the dynamo-side patch below.
 
-**Symptom.** With `rollout.name=dynamo_sglang`, the outlier-sensitive rollout-vs-actor
+**Symptom.** With the sglang engine (`engine_kwargs.dynamo.engine=sglang`), the outlier-sensitive rollout-vs-actor
 diagnostics are destroyed, while k1 KL is silently biased but still lands in a
 plausible range — which is exactly why the bug hides:
 
