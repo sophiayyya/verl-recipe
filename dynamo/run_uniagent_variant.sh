@@ -29,15 +29,18 @@ case "${VARIANT}" in
     global)
         target_module=verl.trainer.main_ppo
         backend_args=(
+            trainer.use_v1=False
             actor_rollout_ref.rollout.name=vllm
         )
         ;;
     dynamo | ta)
-        target_module=recipe.dynamo.main_dynamo
+        target_module=verl.trainer.main_ppo
         export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
         thunderagent_enabled=false
         [[ "${VARIANT}" == "ta" ]] && thunderagent_enabled=true
         backend_args=(
+            --config-path ../../recipe/dynamo/config --config-name dynamo_trainer
+            trainer.use_v1=False
             actor_rollout_ref.rollout.name=dynamo
             "++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=${thunderagent_enabled}"
             ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.router_block_size=16

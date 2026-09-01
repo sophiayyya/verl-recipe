@@ -213,7 +213,9 @@ fi
 read -r -d '' DRIVER <<DRV || true
 ${ARM_ARGS[0]}
 export ARM=$ARM
-python3 -m recipe.dynamo.main_dynamo \\
+python3 -m verl.trainer.main_ppo \\
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \\
+    trainer.use_v1=False \\
     algorithm.adv_estimator=grpo \\
     algorithm.use_kl_in_reward=False \\
     algorithm.kl_ctrl.kl_coef=0.0 \\
@@ -227,8 +229,8 @@ python3 -m recipe.dynamo.main_dynamo \\
     data.truncation=error \\
     data.custom_cls.path=recipe/retool/retool.py \\
     data.custom_cls.name=CustomRLHFDataset \\
-    custom_reward_function.path=recipe/retool/retool.py \\
-    custom_reward_function.name=compute_score \\
+    reward.custom_reward_function.path=recipe/retool/retool.py \\
+    reward.custom_reward_function.name=compute_score \\
     actor_rollout_ref.model.path=$MODEL \\
     actor_rollout_ref.model.use_remove_padding=True \\
     actor_rollout_ref.model.enable_gradient_checkpointing=True \\

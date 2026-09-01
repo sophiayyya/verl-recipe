@@ -21,7 +21,9 @@ export HYDRA_FULL_ERROR=1
 
 cd /workspace/verl
 
-python3 -m recipe.dynamo.main_dynamo \
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \

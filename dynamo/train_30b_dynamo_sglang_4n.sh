@@ -44,10 +44,11 @@
 #
 #   3. VERL_SRC_IN_CONTAINER -> /workspace/verl_dynamo/verl.
 #      recipe/dynamo/dynamo_sglang_{engine,rollout}.py only exist in that
-#      checkout. Entry point is recipe.dynamo.main_dynamo rather than
-#      verl.trainer.main_ppo because that checkout (6cbca9ce) routes main_ppo to
-#      TaskRunnerV1, which hands a TensorDict to agent_loop.generate_sequences
-#      and dies with AttributeError; main_dynamo forces the v0 TaskRunner.
+#      checkout. Entry point is verl.trainer.main_ppo with trainer.use_v1=False:
+#      the V1 TaskRunner on this checkout (6cbca9ce) hands a TensorDict to
+#      agent_loop.generate_sequences and dies with AttributeError, so we pin the
+#      v0 TaskRunner. --config-path loads the recipe's dynamo_trainer config
+#      (resolved relative to verl/trainer/, i.e. CWD-independent).
 #
 #   4. Dynamo wheels installed --no-deps from the prebuilt wheelhouse instead of
 #      being compiled in-container. The wheels are portable (py3-none-any and
@@ -492,7 +493,9 @@ else
 fi
 echo "SGLANG_EXTRA_JSON: ${SGLANG_EXTRA_JSON}"
 
-python3 -m recipe.dynamo.main_dynamo \
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
@@ -506,8 +509,8 @@ python3 -m recipe.dynamo.main_dynamo \
     data.truncation=error \
     data.custom_cls.path=recipe/retool/retool.py \
     data.custom_cls.name=CustomRLHFDataset \
-    custom_reward_function.path=recipe/retool/retool.py \
-    custom_reward_function.name=compute_score \
+    reward.custom_reward_function.path=recipe/retool/retool.py \
+    reward.custom_reward_function.name=compute_score \
     actor_rollout_ref.model.path=/workspace/hf_models/Qwen3-30B-A3B-Base \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \

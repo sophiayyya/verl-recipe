@@ -17,7 +17,9 @@ TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 
-python3 -m recipe.dynamo.main_dynamo \
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \
     data.val_files="${TEST_FILE}" \
@@ -30,6 +32,7 @@ python3 -m recipe.dynamo.main_dynamo \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.ppo_mini_batch_size=1 \
     actor_rollout_ref.rollout.name=dynamo \
+    actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \

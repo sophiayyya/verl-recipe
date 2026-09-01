@@ -42,6 +42,9 @@ TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 # packages (tilelang, tokenspeed-mla). `import vllm` still succeeds, so the damage
 # only surfaces at runtime. Install it per-job, only for sglang runs.
 DYNAMO_WHEEL_DIR=${DYNAMO_WHEEL_DIR:-"/lustre/fsw/portfolios/coreai/users/sopyang/dynamo_wheels_1.3.0_94accc7389d4"}
+# blake3: ai_dynamo runtime dep skipped by --no-deps installs; `import dynamo.sglang`
+# alone cannot detect it (lazy handler imports) -- the worker dies at startup instead.
+python3 -c "import blake3" 2>/dev/null || pip install blake3 2>&1 | tail -1
 python3 -c "import dynamo.sglang" 2>/dev/null || {
     cat >&2 <<MSG
 FAIL: 'import dynamo.sglang' failed. Install it for THIS JOB ONLY with:
@@ -121,11 +124,16 @@ COMMON_ARGS=(
     # recipe yaml underneath it.
     ++actor_rollout_ref.rollout.agent.agent_loop_manager_class=recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_engine_data=true
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_completion_token_ids=true
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=round-robin
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=false
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.enable_worker_system_metrics=true
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_timeout_s=1800
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.sglang.enable_rl=true
+    # piecewise cuda-graph compile CUBLAS-fails on this stack even with
+    # --disable-cuda-graph (separate switch); the 30B launcher disables it too.
+    '++actor_rollout_ref.rollout.engine_kwargs.dynamo.sglang.extra_args=["--disable-piecewise-cuda-graph"]'
     trainer.logger='["console"]'
     trainer.project_name="${project_name}"
     trainer.experiment_name="${exp_name}"
@@ -135,7 +143,9 @@ COMMON_ARGS=(
 )
 
 if [[ "${STAGE}" == "gen" ]]; then
-    python3 -m recipe.dynamo.main_dynamo \
+    python3 -m verl.trainer.main_ppo \
+        --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+        trainer.use_v1=False \
         "${COMMON_ARGS[@]}" \
         trainer.val_before_train=True \
         trainer.val_only=True \
@@ -145,7 +155,9 @@ if [[ "${STAGE}" == "gen" ]]; then
 else
     # free_cache_engine drives release/resume_memory_occupation, which is the
     # only part of the sleep/wake path that a generation-only run never touches.
-    python3 -m recipe.dynamo.main_dynamo \
+    python3 -m verl.trainer.main_ppo \
+        --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+        trainer.use_v1=False \
         "${COMMON_ARGS[@]}" \
         actor_rollout_ref.rollout.free_cache_engine=True \
         ++actor_rollout_ref.rollout.engine_kwargs.dynamo.free_engine_on_train=true \
