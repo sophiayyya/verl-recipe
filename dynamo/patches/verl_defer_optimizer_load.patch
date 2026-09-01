@@ -1,0 +1,139 @@
+diff --git a/verl/workers/engine/base.py b/verl/workers/engine/base.py
+index 161faed0..b1b6e388 100644
+--- a/verl/workers/engine/base.py
++++ b/verl/workers/engine/base.py
+@@ -124,7 +124,38 @@ class BaseEngine:
+         maybe_fix_3d_position_ids(data)
+ 
+         self.optimizer_zero_grad()
+-        outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
++        # VERL_MEM_DEBUG: attribute the actor-update peak. Reasoning from config alone
++        # could not explain ~58 GB of the 72 GB seen on Qwen3-30B-A3B/16xH100, so record
++        # allocation stacks and dump them when the OOM actually fires. The snapshot is
++        # readable with torch.cuda._memory_viz; the summary goes straight to the log.
++        _mem_debug = os.environ.get("VERL_MEM_DEBUG", "0") == "1"
++        if _mem_debug:
++            import torch
++
++            torch.cuda.memory._record_memory_history(max_entries=200000)
++        try:
++            outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
++        except Exception:
++            if _mem_debug:
++                import traceback
++
++                import torch
++
++                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
++                out_dir = os.environ.get("VERL_MEM_DEBUG_DIR", "/tmp")
++                try:
++                    os.makedirs(out_dir, exist_ok=True)
++                    torch.cuda.memory._dump_snapshot(f"{out_dir}/oom_rank{rank}.pickle")
++                except Exception:
++                    traceback.print_exc()
++                print(f"[VERL_MEM_DEBUG rank={rank}] snapshot -> {out_dir}/oom_rank{rank}.pickle", flush=True)
++                print(torch.cuda.memory_summary(abbreviated=False), flush=True)
++            raise
++        finally:
++            if _mem_debug:
++                import torch
++
++                torch.cuda.memory._record_memory_history(enabled=None)
+         grad_norm = self.optimizer_step()
+         if self.is_mp_src_rank_with_outputs():
+             assert "grad_norm" not in outputs["metrics"]
+diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
+index d31c53a7..516e9027 100644
+--- a/verl/workers/engine/fsdp/transformer_impl.py
++++ b/verl/workers/engine/fsdp/transformer_impl.py
+@@ -770,6 +770,15 @@ class FSDPEngine(BaseEngine):
+         """
+         assert self.optimizer_config.clip_grad is not None
+ 
++        # Adam state is only needed here, once forward_backward_batch has freed every
++        # activation. Under VERL_DEFER_OPTIMIZER_LOAD the train-mode context left it on
++        # CPU, so bring it in for the step and send it straight back.
++        _deferred_opt = _defer_optimizer_load() and self._is_offload_optimizer and self.optimizer is not None
++        if _deferred_opt:
++            log_gpu_memory_usage("Before deferred load_fsdp_optimizer", logger=None)
++            load_fsdp_optimizer(self.optimizer, get_device_id())
++            log_gpu_memory_usage("After deferred load_fsdp_optimizer", logger=None)
++
+         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__.
+         scaler = getattr(self, "scaler", None)
+ 
+@@ -802,6 +811,10 @@ class FSDPEngine(BaseEngine):
+             else:
+                 self.optimizer.step()
+ 
++        if _deferred_opt:
++            offload_fsdp_optimizer(self.optimizer)
++            log_gpu_memory_usage("After deferred offload_fsdp_optimizer", logger=None)
++
+         if self._qat_enabled:
+             from verl.utils.qat.core import invalidate_all_scales
+ 
+@@ -1072,6 +1085,15 @@ class FSDPEngine(BaseEngine):
+         return self.module.disable_adapter()
+ 
+ 
++def _defer_optimizer_load() -> bool:
++    """Opt-in: hold Adam state on CPU during forward/backward.
++
++    Off by default so this only changes runs that ask for it via
++    ``VERL_DEFER_OPTIMIZER_LOAD=1``. See EngineTrainModeCtx._context_switch.
++    """
++    return os.environ.get("VERL_DEFER_OPTIMIZER_LOAD", "0") == "1"
++
++
+ class EngineEvalModeCtx(BaseEngineCtx):
+     def __init__(self, engine: FSDPEngine, **kwargs):
+         super().__init__(engine=engine, mode="eval", **kwargs)
+@@ -1102,6 +1124,34 @@ class EngineTrainModeCtx(BaseEngineCtx):
+     def __init__(self, engine: FSDPEngine, **kwargs):
+         super().__init__(engine=engine, mode="train", **kwargs)
+ 
++    def _context_switch(self, device):
++        """Keep Adam state off the GPU until optimizer_step().
++
++        The default loads params *and* optimizer state on train-mode entry and holds
++        both for all of ``train_batch``. But train_batch is
++        zero_grad -> forward_backward_batch -> optimizer_step, and only the last of
++        those touches the optimizer -- by which point the activations are gone. On
++        Qwen3-30B-A3B / 16xH100 step 1 already peaks at ~72GB of the card's 79GB with
++        no optimizer state allocated yet (Adam allocates lazily on the first .step()),
++        so step 2 -- the first step where fp32 exp_avg/exp_avg_sq exist -- OOMs inside
++        backward(). The two peaks never need to overlap; this stops them doing so.
++
++        Exit (device == "cpu") still goes through the base implementation, which
++        offloads both, and offload_fsdp_optimizer is a no-op on empty/already-CPU state.
++        """
++        if device == "cpu" or not _defer_optimizer_load():
++            return super()._context_switch(device)
++        if self.disable_auto_offload:
++            return
++        if not self.engine.is_param_offload_enabled and not self.engine.is_optimizer_offload_enabled:
++            return
++        self.engine.to(
++            device=device,
++            model=self.engine.is_param_offload_enabled,
++            optimizer=False,
++            grad=self.engine.is_param_offload_enabled,
++        )
++
+     def __enter__(self):
+         assert isinstance(self.engine, FSDPEngine)
+         super().__enter__()
+diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+index e679b2b3..6680e735 100644
+--- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
++++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
+@@ -87,7 +87,7 @@ class BucketedWeightSender:
+     def __init__(
+         self,
+         zmq_handle: str,
+-        bucket_size_mb: int = 512,
++        bucket_size_mb: int = 4096,
+         use_shm: bool = False,
+     ):
+         self.zmq_handle = zmq_handle
