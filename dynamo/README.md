@@ -64,7 +64,7 @@ Request routing happens inside Dynamo's KV router, **not** in verl's
 | File | Role |
 | --- | --- |
 | [`register.py`](register.py) | Registers `dynamo` in verl's rollout registries; loaded via `VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register`. |
-| [`main_dynamo.py`](main_dynamo.py) | Training entry point — `main_ppo` with the `dynamo_trainer` config (forces the v0 `TaskRunner`; see the launcher headers for why). |
+| [`main_dynamo.py`](main_dynamo.py) | Compatibility shim only — the launchers now call `verl.trainer.main_ppo` directly; see the entry-point note under [Quick start](#quick-start). |
 | [`config/dynamo_trainer.yaml`](config/dynamo_trainer.yaml) | Hydra config: inherits `ppo_trainer`, sets `rollout.name=dynamo`, `rollout.mode=async`. |
 | [`dynamo_async_server.py`](dynamo_async_server.py) | `DynamoReplica` / `DynamoHttpServer` — spawns and watchdogs etcd, nats-server, engine workers, and `dynamo.frontend`, for both engines. |
 | [`dynamo_rollout.py`](dynamo_rollout.py) | `ServerAdapter` — engine-agnostic facade; dispatches on `engine_kwargs.dynamo.engine` and lazily imports the chosen adapter (no module-scope engine imports), so it loads on an image that ships only one engine. |
@@ -109,6 +109,26 @@ defaults are applied in `DynamoHttpServer`.
 
 ## Quick start
 
+All examples use verl's standard entry point. Three things make it work with this
+recipe on the pinned checkout (`6cbca9ce`):
+
+- `--config-path ../../recipe/dynamo/config --config-name dynamo_trainer` loads the
+  recipe's Hydra config. Hydra resolves the relative path against `verl/trainer/`
+  (the module declaring `@hydra.main`), so it is CWD-independent as long as this
+  repository sits at `recipe/` inside the verl checkout.
+- **`trainer.use_v1=False` is required.** The V1 trainer on this checkout hands a
+  `TensorDict` to the async agent loop and dies with an `AttributeError`; the flag
+  pins the v0 `TaskRunner`.
+- Custom rewards must use the canonical `reward.custom_reward_function.*` namespace,
+  not the legacy top-level `custom_reward_function.*`: the v0 runner reads
+  `config.reward.*` and `main_ppo` never runs the legacy-key migration, so legacy
+  keys are **silently ignored** (the run proceeds with the default reward).
+
+[`main_dynamo.py`](main_dynamo.py) remains as a shim that applies the same pinning
+programmatically. Both engines are verified on this entry: sglang 4-node retool GRPO
+(job 17581380, pearson 0.9994) and the vLLM KV-metrics validation (job 17581381,
+`rc=0`).
+
 ### 1. Generation-only smoke
 
 Verifies the full Dynamo stack (etcd + nats + workers + frontend) can serve a
@@ -122,7 +142,9 @@ bash recipe/dynamo/smoke_dynamo_v1.sh          # Qwen2.5-0.5B-Instruct, 1 GPU
 
 ```bash
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
-python3 recipe/dynamo/main_dynamo.py \
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files=.../gsm8k/train.parquet \
     data.val_files=.../gsm8k/test.parquet \
@@ -232,8 +254,9 @@ and agent loop.
 
 ### Trainer: currently no fully_async
 
-Dynamo has no `fully_async` trainer. Run it through `verl.trainer.main_ppo`
-(or this recipe's `main_dynamo.py`) with `actor_rollout_ref.hybrid_engine=True`.
+Dynamo has no `fully_async` trainer. Run it through `verl.trainer.main_ppo` with
+`trainer.use_v1=False` (see [Quick start](#quick-start)) and
+`actor_rollout_ref.hybrid_engine=True`.
 `DynamoLLMServerManager` is colocated — it forwards the trainer's
 `CUDA_VISIBLE_DEVICES` into the engine shards — so `hybrid_engine=True` is
 required, not optional.
@@ -359,7 +382,9 @@ From a verl checkout containing this repository at `recipe/`:
 
 ```bash
 VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register \
-python -m recipe.dynamo.main_dynamo \
+python -m verl.trainer.main_ppo \
+  --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+  trainer.use_v1=False \
   actor_rollout_ref.model.path=/path/to/model \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1
 ```
