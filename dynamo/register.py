@@ -17,6 +17,14 @@ def _load_dynamo():
 RolloutReplicaRegistry.register("dynamo", _load_dynamo)
 _ROLLOUT_REGISTRY[("dynamo", "async")] = "recipe.dynamo.dynamo_rollout.ServerAdapter"
 
+# One rollout name for both engines. recipe.dynamo.dynamo_rollout.ServerAdapter
+# dispatches on engine_kwargs.dynamo.engine, so selecting SGLang is
+#   actor_rollout_ref.rollout.name=dynamo
+#   ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
+# and nothing else moves. (An earlier revision registered a separate
+# "dynamo_sglang" name with its own trainer yaml and entry point; that spread the
+# engine choice across three files that all had to agree.)
+
 
 def _patch_dynamo_llm_server_manager():
     partial = sys.modules.get("recipe.dynamo.dynamo_agent_loop")

@@ -90,6 +90,16 @@ _KV_EVENT_PORT_BASE = int(os.getenv("VERL_DYNAMO_KV_EVENT_PORT_BASE", "42000"))
 # rollout.engine_kwargs.dynamo.enable_worker_system_metrics=true.
 _SYSTEM_METRICS_PORT_BASE = int(os.getenv("VERL_DYNAMO_SYSTEM_METRICS_PORT_BASE", "11000"))
 
+# Inference engine behind Dynamo. "vllm" keeps the historical path (thin
+# _dynamo_vllm_with_control wrapper + ZMQ control sidecar + worker_extension_cls);
+# "sglang" launches bare `python -m dynamo.sglang` and drives it entirely through
+# the /engine/control/* HTTP routes dynamo.sglang registers natively, so it needs
+# no sidecar and no worker extension. Selected via
+# rollout.engine_kwargs.dynamo.engine.
+ENGINE_VLLM = "vllm"
+ENGINE_SGLANG = "sglang"
+_SUPPORTED_ENGINES = (ENGINE_VLLM, ENGINE_SGLANG)
+
 
 @dataclass(frozen=True)
 class _DynamoWorkerSpec:
@@ -212,6 +222,25 @@ class DynamoHttpServer:
         # enable_worker_system_metrics is on. These expose engine-level
         # vllm:prefix_cache_* that the frontend endpoint does not.
         self._worker_metrics_endpoints: list[str] = []
+        # sglang only: per-shard http://host:DYN_SYSTEM_PORT base URLs. This is the
+        # whole control plane for that engine (weight refit, memory occupation,
+        # cache flush), so unlike the vLLM path it is not optional.
+        self._engine_control_endpoints: list[str] = []
+        self._sglang_clients: Optional[list] = None
+        # Which memory tags this node's sglang shards currently have released.
+        # SINGLE OWNER of that state: both DynamoHttpServer.sleep/wake_up and the
+        # per-rank SGLangServerAdapter.release/resume route through
+        # sglang_release/sglang_resume below. Tracking it per-adapter instead let the
+        # actor release (which UNREGISTERS the worker from discovery) while the
+        # adapter believed nothing was released, skipped the resume, and left the
+        # frontend answering 503 "Model is not ready to serve requests yet".
+        self._sglang_released_tags: set[str] = set()
+        # Guards the check-then-act in sglang_release/sglang_resume. Ray async
+        # actors run methods concurrently on one event loop, and every shard's
+        # adapter on this node calls in parallel (4 shards at TP=2 on 8 GPUs), so
+        # without this all of them read the tag set, all decide they must act, and
+        # all reach the engine. Created lazily: __init__ may run outside a loop.
+        self._sglang_tag_lock: asyncio.Lock | None = None
 
         # Filled in by _start_vllm_workers; consumed by generate() to build
         # the OpenAI completions payload.
@@ -237,6 +266,135 @@ class DynamoHttpServer:
     def _dynamo_cfg(self) -> dict:
         """Return ``rollout.engine_kwargs.dynamo`` dict (or empty)."""
         return (self.config.engine_kwargs or {}).get("dynamo", {}) or {}
+
+    def _engine_kind(self) -> str:
+        """Which inference engine Dynamo fronts: ``vllm`` (default) or ``sglang``."""
+        engine = str(self._dynamo_cfg().get("engine", ENGINE_VLLM)).lower()
+        if engine not in _SUPPORTED_ENGINES:
+            raise ValueError(
+                f"rollout.engine_kwargs.dynamo.engine must be one of {_SUPPORTED_ENGINES}, got {engine!r}"
+            )
+        return engine
+
+    def _is_sglang(self) -> bool:
+        return self._engine_kind() == ENGINE_SGLANG
+
+    def _sglang_cfg(self) -> dict:
+        """Return ``rollout.engine_kwargs.dynamo.sglang`` dict (or empty)."""
+        return self._dynamo_cfg().get("sglang", {}) or {}
+
+    def get_engine_control_endpoints(self) -> list[str]:
+        """Base URLs of this node's per-shard ``/engine/*`` control planes.
+
+        Ordered by shard index, so a trainer rank can index with
+        ``local_rank // tensor_model_parallel_size`` and reach the engine that owns
+        its GPUs. sglang only — the vLLM path uses ``_control_endpoints`` (ZMQ).
+        """
+        return list(self._engine_control_endpoints)
+
+    def _sglang_control_clients(self) -> list:
+        """Lazily build one control client per local sglang shard."""
+        if self._sglang_clients is None:
+            from recipe.dynamo.dynamo_sglang_engine import DynamoSGLangControlClient
+
+            timeout_s = float(self._dynamo_cfg().get("request_timeout_s", 600))
+            self._sglang_clients = [
+                DynamoSGLangControlClient(url, timeout_s=timeout_s)
+                for url in self._engine_control_endpoints
+            ]
+        return self._sglang_clients
+
+    def _tag_lock(self) -> asyncio.Lock:
+        if self._sglang_tag_lock is None:
+            self._sglang_tag_lock = asyncio.Lock()
+        return self._sglang_tag_lock
+
+    async def sglang_release(self, tags: list[str]):
+        """Release only tags not already released; double-release corrupts the pool.
+
+        Symmetric to the filter in ``sglang_resume`` — and load-bearing for the same
+        reason, just with a nastier failure mode. verl releases before every weight
+        sync but resumes ``weights`` and ``kv_cache`` at different points, so a second
+        release arrives while ``kv_cache`` is still released. Calling
+        ``release_memory_occupation(["kv_cache"])`` twice makes torch_memory_saver
+        unbind a region it has already unbound
+        (``tms_torch_free: only support interesting region``); the pool survives as a
+        Python object but its storage is no longer GPU-backed, so the next prefill
+        dies inside a Triton kernel with the very indirect
+
+            ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
+
+        which surfaces to the trainer only as HTTP 500 "Failed to fold completions
+        stream" from the frontend (job 16283764: 257 of them). Nothing in that chain
+        names memory release, so the guard has to be here.
+        """
+        async with self._tag_lock():
+            wanted = [t for t in tags if t not in self._sglang_released_tags]
+            if not wanted:
+                logger.info("[DynamoHttpServer] sglang release%s skipped, already released (released=%s)",
+                            list(tags), sorted(self._sglang_released_tags))
+                return
+            await self._sglang_control_all("release_memory_occupation", tags=wanted)
+            self._sglang_released_tags.update(wanted)
+            logger.info("[DynamoHttpServer] sglang released %s (now released=%s)", wanted,
+                        sorted(self._sglang_released_tags))
+
+    async def sglang_resume(self, tags: list[str]):
+        """Resume only tags actually released; resuming others kills the scheduler.
+
+        SGLang raises ``KeyError`` inside ``weight_updater.resume_memory_occupation``
+        for a tag it never released, and that takes the whole scheduler process down
+        (seen from the trainer as ``aiohttp.ServerDisconnectedError``). verl resumes
+        weights unconditionally before every weight sync — including the first, when
+        nothing has been released — so this filter is load-bearing, not defensive.
+        """
+        async with self._tag_lock():
+            if not self._sglang_released_tags:
+                logger.info("[DynamoHttpServer] sglang resume%s skipped (released=%s)", list(tags),
+                            sorted(self._sglang_released_tags))
+                return
+            # Resume EVERY released tag, not just the requested one. Dynamo's sglang
+            # handler re-registers the worker into discovery on the first resume, so a
+            # partial resume makes the shard routable while part of its memory is still
+            # released. verl asks for "weights" first (it wants live tensors to write
+            # the weight sync into) and "kv_cache" only after the sync, which left a
+            # ~9 s window where the frontend happily routed prefills at a shard whose
+            # req_to_token_pool had no GPU backing:
+            #   16:42:53.311 resumed ['weights'] -> worker added back to routing pool
+            #   16:43:01.841 Scheduler hit an exception:
+            #     ValueError: Pointer argument (at 0) cannot be accessed from Triton
+            #                 (cpu tensor?)   [write_req_to_token_pool_triton]
+            # which reached the trainer only as 257x HTTP 500 "Failed to fold
+            # completions stream" (job 16441143). Resuming kv_cache early is safe: its
+            # contents are stale, and the weight sync's flush_cache drops them.
+            wanted = sorted(self._sglang_released_tags)
+            if set(wanted) != set(tags):
+                logger.info("[DynamoHttpServer] sglang resume%s widened to %s so the shard "
+                            "does not rejoin discovery half-restored", list(tags), wanted)
+            await self._sglang_control_all("resume_memory_occupation", tags=wanted)
+            self._sglang_released_tags.difference_update(wanted)
+            logger.info("[DynamoHttpServer] sglang resumed %s (now released=%s)", wanted,
+                        sorted(self._sglang_released_tags))
+
+    async def _sglang_control_all(self, method: str, *args, **kwargs):
+        """Fan a control call out to every local sglang shard, concurrently.
+
+        Same rationale as ``_engine_method_all``'s parallel dispatch: several of
+        these (weight refit, memory release) are synchronization points inside the
+        engine, and serialising them across shards deadlocks when the trainer side
+        is waiting on all shards to arrive together.
+        """
+        clients = self._sglang_control_clients()
+        if not clients:
+            return []
+        results = await asyncio.gather(
+            *[getattr(c, method)(*args, **kwargs) for c in clients],
+            return_exceptions=True,
+        )
+        errors = [(c.base_url, r) for c, r in zip(clients, results, strict=True) if isinstance(r, Exception)]
+        if errors:
+            raise RuntimeError(f"dynamo.sglang control call {method!r} failed on {errors}")
+        return results
 
     def _dynamo_cfg_bool(self, key: str, default: bool) -> bool:
         value = self._dynamo_cfg().get(key, default)
@@ -571,15 +729,24 @@ class DynamoHttpServer:
                 for shard_idx_local in range(n_local_shards)
             ]
 
+        is_sglang = self._is_sglang()
+
         for spec_idx, spec in enumerate(worker_specs):
             worker_cvd = spec.cuda_visible_devices
-            control_port = self._allocate_tcp_port(bind_wildcard=False)
-            control_endpoint = f"tcp://{self._server_address}:{control_port}"
-            self._control_endpoints.append(control_endpoint)
+            # sglang needs no verl-private ZMQ sidecar: dynamo.sglang registers
+            # control/* engine routes itself, reached over DYN_SYSTEM_PORT below.
+            control_endpoint = None
+            if not is_sglang:
+                control_port = self._allocate_tcp_port(bind_wildcard=False)
+                control_endpoint = f"tcp://{self._server_address}:{control_port}"
+                self._control_endpoints.append(control_endpoint)
 
-            kv_event_port = self._allocate_kv_event_port(spec_idx)
-            kv_events_config_json = self._build_kv_events_config_json(kv_event_port)
-            vllm_port = self._allocate_vllm_tcpstore_port(spec_idx)
+            # sglang publishes KV events through dynamo's own DynamoSglangPublisher
+            # (components/src/dynamo/sglang/publisher.py) rather than a vLLM-style
+            # --kv-events-config, so neither the port nor the JSON is needed.
+            kv_event_port = None if is_sglang else self._allocate_kv_event_port(spec_idx)
+            kv_events_config_json = None if is_sglang else self._build_kv_events_config_json(kv_event_port)
+            vllm_port = None if is_sglang else self._allocate_vllm_tcpstore_port(spec_idx)
             # Allocate a registered (<32768, i16-safe) system-status port so this
             # dynamo.vllm worker exposes /metrics (incl. pass-through
             # vllm:prefix_cache_hits_total/queries_total) and the /engine/* routes.
@@ -587,7 +754,36 @@ class DynamoHttpServer:
             # we use a fixed low port via _allocate_stable_node_port for the same
             # reason). Set enable_worker_system_metrics=false to restore the legacy
             # no-DYN_SYSTEM_PORT behaviour.
+            # For sglang this port is NOT optional: /engine/control/* is the only
+            # control plane there (weight refit, memory occupation, cache flush),
+            # so refuse to honour enable_worker_system_metrics=false.
             enable_worker_metrics = self._dynamo_cfg_bool("enable_worker_system_metrics", True)
+            if is_sglang and not enable_worker_metrics:
+                raise ValueError(
+                    "engine=sglang requires enable_worker_system_metrics=true: the "
+                    "dynamo.sglang control plane (/engine/control/*) is served on "
+                    "DYN_SYSTEM_PORT, so disabling it leaves no way to sync weights."
+                )
+            # Fail fast on the default token-id config for sglang (2026-08-31).
+            # request_completion_token_ids defaults to False, and the other nvext
+            # channel that is on by default -- engine_data -- is populated only by
+            # dynamo.vllm. So an engine=sglang run that does not set this flag gets no
+            # token ids and falls back to re-encoding the response text, i.e. the
+            # trainer scores tokens the engine never sampled. Nothing downstream can
+            # reveal that: response_length, grad_norm and the reward all keep normal
+            # values. A launch-time refusal is the only place it can be caught, which
+            # is why an explicit `false` is still honoured (opt out knowingly) while
+            # the *unset* default is rejected.
+            if is_sglang and self._dynamo_cfg().get("request_completion_token_ids") is None:
+                raise ValueError(
+                    "engine=sglang requires request_completion_token_ids to be set "
+                    "explicitly. Add\n"
+                    "  ++actor_rollout_ref.rollout.engine_kwargs.dynamo."
+                    "request_completion_token_ids=true\n"
+                    "(the default False yields no token ids on sglang: engine_data is "
+                    "a vLLM-only channel, so generation silently trains on re-encoded "
+                    "text). Set it to false explicitly if you really intend that."
+                )
             system_metrics_port = (
                 self._allocate_stable_node_port(_SYSTEM_METRICS_PORT_BASE, spec_idx, window=8)
                 if enable_worker_metrics
@@ -603,13 +799,14 @@ class DynamoHttpServer:
             # BucketedWeightSender and vLLM-side BucketedWeightReceiver include
             # the Ray job id in their shared /tmp IPC socket name.
             env["VERL_RAY_JOB_ID"] = ray.get_runtime_context().get_job_id()
-            # vLLM's multiproc executor uses VLLM_PORT for its local TCPStore.
-            # A node can host many TP=1 Dynamo shards, so leaving this random can
-            # collide under concurrent startup.
-            env["VLLM_PORT"] = str(vllm_port)
-            env["VLLM_HOST_IP"] = self._server_address
-            env["MASTER_ADDR"] = self._server_address
-            env["MASTER_PORT"] = str(vllm_port)
+            if not is_sglang:
+                # vLLM's multiproc executor uses VLLM_PORT for its local TCPStore.
+                # A node can host many TP=1 Dynamo shards, so leaving this random can
+                # collide under concurrent startup.
+                env["VLLM_PORT"] = str(vllm_port)
+                env["VLLM_HOST_IP"] = self._server_address
+                env["MASTER_ADDR"] = self._server_address
+                env["MASTER_PORT"] = str(vllm_port)
 
             # Ensure subprocess can ``import recipe.dynamo._dynamo_vllm_with_control``
             # even when ray runtime_env doesn't propagate the driver's PYTHONPATH.
@@ -622,7 +819,8 @@ class DynamoHttpServer:
             # NB: don't set DYN_SYSTEM_PORT — dynamo's Rust runtime parses it
             # as i16 and rejects ephemeral ports >= 32768. We use our own
             # control sidecar (VERL_DYNAMO_CONTROL_ZMQ) instead.
-            env[_CONTROL_ZMQ_ENV] = control_endpoint
+            if control_endpoint is not None:
+                env[_CONTROL_ZMQ_ENV] = control_endpoint
             # Defensively unset any DYN_SYSTEM_* leaking from caller env.
             for k in list(env.keys()):
                 if k.startswith("DYN_SYSTEM_"):
@@ -635,21 +833,32 @@ class DynamoHttpServer:
                 worker_metrics_endpoint = f"{self._server_address}:{system_metrics_port}"
                 self._worker_metrics_endpoints.append(worker_metrics_endpoint)
                 self._record_worker_metrics_endpoint(worker_metrics_endpoint)
-            # Mirrors nemo_rl/dynamo_worker.py:308-310.
-            env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-            env["VLLM_SKIP_P2P_CHECK"] = "1"
-            env["VLLM_NO_USAGE_STATS"] = "1"
+                if is_sglang:
+                    host = (
+                        f"[{self._server_address}]"
+                        if is_valid_ipv6_address(self._server_address)
+                        else self._server_address
+                    )
+                    self._engine_control_endpoints.append(f"http://{host}:{system_metrics_port}")
+            if not is_sglang:
+                # Mirrors nemo_rl/dynamo_worker.py:308-310.
+                env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+                env["VLLM_SKIP_P2P_CHECK"] = "1"
+                env["VLLM_NO_USAGE_STATS"] = "1"
             # Deterministic block hashes across workers: without a fixed seed,
             # Python's randomized hashing can leak into block-hash derivation so
             # the same prefix hashes differently per worker → the router logs
             # "block_hash mismatch" and prefix-cache hits collapse.
             env.setdefault("PYTHONHASHSEED", "0")
 
-            cmd = self._build_vllm_cmd(
-                served_model_name,
-                tp,
-                kv_events_config_json=kv_events_config_json,
-            )
+            if is_sglang:
+                cmd = self._build_sglang_cmd(served_model_name, tp, nccl_port=self._allocate_tcp_port())
+            else:
+                cmd = self._build_vllm_cmd(
+                    served_model_name,
+                    tp,
+                    kv_events_config_json=kv_events_config_json,
+                )
 
             stdout_path = os.path.join(log_dir, f"{spec.label}.log")
             stdout_fp = open(stdout_path, "w")
@@ -857,6 +1066,89 @@ class DynamoHttpServer:
         cmd += ["--kv-events-config", kv_events_config_json]
         # Pass through extra args from rollout.engine_kwargs.dynamo.extra_args.
         extra = self._dynamo_cfg().get("extra_args") or []
+        if isinstance(extra, list):
+            cmd += [str(x) for x in extra]
+        return cmd
+
+    def _build_sglang_cmd(self, served_model_name: str, tp: int, nccl_port: Optional[int] = None) -> list[str]:
+        """Construct the ``dynamo.sglang`` CLI for one DP shard.
+
+        Unlike the vLLM path this launches the stock entrypoint — no verl wrapper —
+        because the control plane we need is already registered by
+        ``handler_base.register_engine_routes`` and reachable over DYN_SYSTEM_PORT.
+
+        ``dynamo.sglang.args`` forwards the full ``ServerArgs.add_cli_args`` surface,
+        so anything not mapped below can still be passed through
+        ``engine_kwargs.dynamo.extra_args``.
+        """
+        cmd = [
+            sys.executable,
+            "-m",
+            "dynamo.sglang",
+            "--model-path",
+            self.model_config.local_path,
+            "--served-model-name",
+            served_model_name,
+            "--tp-size",
+            str(tp),
+            "--mem-fraction-static",
+            str(self.config.gpu_memory_utilization),
+        ]
+        # Pin the torch.distributed rendezvous port (2026-08-31). Left unset,
+        # ServerArgs.nccl_port is None and SGLang picks its own; the four shards on a
+        # node choose concurrently and collide, which surfaces as
+        #   DistNetworkError: server socket failed to listen. port: 31981, EADDRINUSE
+        # inside the scheduler, then SIGQUIT, and the watchdog reports the useless
+        # "exited rc=-9" (job 3671). _allocate_tcp_port keeps a per-actor reservation
+        # set, and all shards on a node share one actor, so ports are distinct by
+        # construction rather than by luck.
+        if nccl_port is not None:
+            cmd += ["--nccl-port", str(nccl_port)]
+        if self.config.max_model_len:
+            cmd += ["--context-length", str(self.config.max_model_len)]
+        if self.config.max_num_batched_tokens:
+            cmd += ["--chunked-prefill-size", str(self.config.max_num_batched_tokens)]
+        if self.config.max_num_seqs:
+            cmd += ["--max-running-requests", str(self.config.max_num_seqs)]
+        if self.config.dtype:
+            cmd += ["--dtype", self.config.dtype]
+        if self.model_config.trust_remote_code:
+            cmd += ["--trust-remote-code"]
+        if self.config.enforce_eager:
+            # SGLang's inverse of vLLM's --enforce-eager.
+            cmd += ["--disable-cuda-graph"]
+        if not self.config.enable_prefix_caching:
+            # SGLang's radix cache is on by default; vLLM's prefix cache is not.
+            cmd += ["--disable-radix-cache"]
+        if self.config.enable_sleep_mode:
+            # Without this SGLang's torch_memory_saver never arms, and
+            # release_memory_occupation silently frees nothing.
+            cmd += ["--enable-memory-saver"]
+
+        # --enable-rl unlocks call_tokenizer_manager, which is the ONLY way to
+        # flush the radix cache after a weight update (there is no
+        # control/flush_cache engine route). A stale prefix cache serves tokens
+        # from the previous policy, so this defaults on and is not silently
+        # skippable.
+        if self._sglang_cfg().get("enable_rl", True):
+            cmd += ["--enable-rl"]
+
+        # KV-router page size. ThunderAgent's router_block_size must match, same
+        # as it must match vLLM's --block-size on the other path.
+        page_size = self._sglang_cfg().get("page_size")
+        if page_size is None:
+            ta_cfg = self._dynamo_cfg().get("thunderagent", {}) or {}
+            page_size = ta_cfg.get("router_block_size")
+        if page_size is not None:
+            cmd += ["--page-size", str(page_size)]
+
+        # Token-in/token-out: skip detokenization so the trainer scores exactly the
+        # ids the engine produced. NB dynamo's llm_engine.py force-disables this
+        # when its metrics hook needs a tokenizer, so treat it as a request.
+        if self._sglang_cfg().get("skip_tokenizer_init", False):
+            cmd += ["--skip-tokenizer-init"]
+
+        extra = self._sglang_cfg().get("extra_args") or self._dynamo_cfg().get("extra_args") or []
         if isinstance(extra, list):
             cmd += [str(x) for x in extra]
         return cmd
@@ -1490,7 +1782,30 @@ class DynamoHttpServer:
         )
 
     def _fallback_token_ids(self) -> list[int]:
-        """Return one harmless token so Dynamo never emits an empty response."""
+        """Return one harmless token so Dynamo never emits an empty response.
+
+        WARNING: this is a correctness cliff, not a nicety. The engine's text is
+        fine; only the token ids are missing, so the trainer scores a single EOS
+        against a full response. Every metric stays plausible —
+        response_length==1 for every sample, grad_norm==0, reward at its floor —
+        and the run reports success. A 2-node 30B retool run was lost to exactly
+        this (job 16270139) before the log line below existed.
+
+        It fires when the frontend returned no token ids, i.e. when
+        ``request_engine_data`` / ``request_completion_token_ids`` are off, or when
+        the engine's handler does not implement the ``nvext`` fields.
+        """
+        self._fallback_token_id_hits = getattr(self, "_fallback_token_id_hits", 0) + 1
+        if self._fallback_token_id_hits <= 3 or self._fallback_token_id_hits % 100 == 0:
+            logger.error(
+                "[DynamoHttpServer] NO TOKEN IDS in the frontend response (hit #%s) — "
+                "substituting a single EOS token. Training will see 1-token responses and "
+                "learn nothing while every metric still looks valid. Set "
+                "engine_kwargs.dynamo.request_engine_data=true and "
+                "request_completion_token_ids=true, and verify the engine's handler "
+                "supports them.",
+                self._fallback_token_id_hits,
+            )
         tokenizer = getattr(self.model_config, "tokenizer", None)
         for attr in ("eos_token_id", "pad_token_id"):
             token_id = getattr(tokenizer, attr, None) if tokenizer is not None else None
@@ -1668,15 +1983,79 @@ class DynamoHttpServer:
             return None
         return DynamoHttpServer._normalize_log_probs(values, token_count)
 
+    # Count of responses whose logprobs had to be padded. Class-level because
+    # _normalize_log_probs is a staticmethod shared by every replica in the process.
+    _logprob_padding_events: int = 0
+
     @staticmethod
-    def _normalize_log_probs(values: list[Any], token_count: int) -> list[float]:
-        """Pad/truncate selected-token logprobs to match token ids."""
-        result: list[float] = []
-        for value in values[:token_count]:
-            result.append(0.0 if value is None else float(value))
-        if len(result) < token_count:
-            result.extend([0.0] * (token_count - len(result)))
+    def _logprob_fill_value(observed: list[float]) -> Optional[float]:
+        """Least-harmful stand-in for a logprob the engine did not return.
+
+        NOT 0.0 (2026-09-01). verl turns a logprob into a probability with exp(), so
+        0.0 means "the engine was 100% certain" -- the maximum possible claim. Against
+        an actor probability of ~1e-6 that is a log-ratio of ~14, and the K3 KL
+        estimator in rollout_corr_helper (exp(r) - r - 1, *unclamped*) turns one such
+        token into ~1.2e6, which a mean over ~900 tokens still leaves at ~1400.
+        Measured: rollout_corr/k3_kl = 1635 on the dynamo path vs 0.0024 on native --
+        a 680000x gap produced by 0.1% of tokens. The linear estimator (k1) stayed at
+        0.0037 and hid it completely.
+
+        The sequence mean is a fabrication too, but a *typical* one: it keeps the
+        padded position in the same range as its neighbours, so exp() cannot explode.
+        Returns None when nothing was observed -- then the caller must report "no
+        logprobs" rather than invent a whole sequence.
+        """
+        if not observed:
+            return None
+        return sum(observed) / len(observed)
+
+    @staticmethod
+    def _normalize_log_probs(values: list[Any], token_count: int) -> Optional[list[float]]:
+        """Pad/truncate selected-token logprobs to match token ids.
+
+        Padding is LOUD and non-catastrophic. See _logprob_fill_value for why the pad
+        value is the sequence mean and not 0.0. The padding itself is a symptom: the
+        engine returns one fewer logprob than token ids (HANDOFF 21.4), and the real
+        fix belongs on the dynamo side.
+        """
+        raw = list(values[:token_count])
+        observed = [float(v) for v in raw if v is not None]
+        fill = DynamoHttpServer._logprob_fill_value(observed)
+
+        n_none = sum(1 for v in raw if v is None)
+        n_pad = max(0, token_count - len(raw))
+
+        if fill is None:
+            # Zero usable values: say so instead of fabricating token_count entries.
+            if n_none or n_pad:
+                DynamoHttpServer._report_logprob_padding(0, token_count, n_none, n_pad, None)
+            return None
+
+        result = [fill if v is None else float(v) for v in raw]
+        result.extend([fill] * n_pad)
+
+        if n_none or n_pad:
+            DynamoHttpServer._report_logprob_padding(
+                token_count - n_none - n_pad, token_count, n_none, n_pad, fill
+            )
         return result
+
+    @staticmethod
+    def _report_logprob_padding(
+        usable: int, total: int, n_none: int, n_pad: int, fill: Optional[float]
+    ) -> None:
+        cls = DynamoHttpServer
+        cls._logprob_padding_events += 1
+        n = cls._logprob_padding_events
+        if n <= 3 or n % 100 == 0:
+            logger.error(
+                "[logprobs] engine returned %d/%d usable logprobs (None=%d, missing=%d); "
+                "filling with %s. rollout_probs_diff_* / rollout_actor_probs_pearson_corr / "
+                "rollout_corr/k3_kl are NOT trustworthy for these samples. occurrence=%d",
+                usable, total, n_none, n_pad,
+                "sequence mean %.4f" % fill if fill is not None else "nothing (returning None)",
+                n,
+            )
 
     async def collective_rpc(
         self,
@@ -1761,6 +2140,9 @@ class DynamoHttpServer:
         if not self._free_engine_on_train():
             logger.info("[DynamoHttpServer] wake_up: free_engine_on_train disabled, leaving Dynamo workers loaded")
             return
+        if self._is_sglang():
+            await self.sglang_resume(kwargs.get("tags") or ["kv_cache", "weights"])
+            return
         if not self._control_endpoints:
             logger.info("[DynamoHttpServer] wake_up: no control sidecar, skipping")
             return
@@ -1774,6 +2156,23 @@ class DynamoHttpServer:
         if not self._free_engine_on_train():
             logger.info("[DynamoHttpServer] sleep: free_engine_on_train disabled, leaving Dynamo workers loaded")
             return
+        if self._is_sglang():
+            # SGLang releases by tag; vLLM by numeric level. Map them by what they
+            # do to GPU memory, NOT by "lower level == fewer tags":
+            #   vLLM sleep(level=1)  = offload weights to CPU + drop KV -> GPU freed
+            #   sglang tags=["kv_cache"]          = drop KV, weights STAY on GPU
+            #   sglang tags=["kv_cache","weights"] = both freed, restorable
+            # So vLLM level 1 corresponds to BOTH sglang tags. An earlier revision
+            # mapped level 1 -> kv_cache only and left ~31 GB of TP=2 Qwen3-30B
+            # weights resident through the training step; the trainer's FSDP forward
+            # then OOM'd with 92 MiB free (48.0 GiB trainer + 30.9 GiB engine on an
+            # 80 GiB H100, job 16280143). Releasing weights is safe because a weight
+            # sync always follows wake_up, so the restored region is overwritten
+            # before it is read.
+            level = int(kwargs.get("level", 1))
+            del level  # both levels free weights; kept for interface parity
+            await self.sglang_release(["kv_cache", "weights"])
+            return
         if not self._control_endpoints:
             logger.info("[DynamoHttpServer] sleep: no control sidecar, skipping")
             return
@@ -1783,6 +2182,9 @@ class DynamoHttpServer:
         await self._engine_method_all("sleep", kwargs=kwargs)
 
     async def clear_kv_cache(self):
+        if self._is_sglang():
+            await self._sglang_control_all("flush_cache")
+            return
         if not self._control_endpoints:
             return
         await self._engine_method_all("reset_prefix_cache")
@@ -1798,7 +2200,14 @@ class DynamoHttpServer:
         the standard reset_prefix_cache path; the engine keeps weights
         resident (sleep_level=1 from DynamoRollout) so the trainer can write
         through to live tensors.
+
+        SGLang is the exception: it releases KV memory *for real* via
+        release_memory_occupation(tags=["kv_cache"]), so resume_kv_cache() below
+        has actual work to do on that path.
         """
+        if self._is_sglang():
+            await self.sglang_release(["kv_cache"])
+            return
         if not self._control_endpoints:
             return
         await self._engine_method_all("reset_prefix_cache")
@@ -1806,10 +2215,14 @@ class DynamoHttpServer:
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync.
 
-        Counterpart to release_kv_cache(). Dynamo never truly releases KV
-        memory (sleep_level=1 keeps weights resident; reset_prefix_cache
-        only drops the cache contents), so there is nothing to resume.
+        Counterpart to release_kv_cache(). On the vLLM path Dynamo never truly
+        releases KV memory (sleep_level=1 keeps weights resident; reset_prefix_cache
+        only drops the cache contents), so there is nothing to resume. SGLang does
+        really release it, and also unregisters the worker from discovery, so the
+        resume is what puts the shard back into the routing pool.
         """
+        if self._is_sglang():
+            await self.sglang_resume(["kv_cache"])
         return
 
     async def wait_for_requests_to_drain(self):
@@ -1817,18 +2230,60 @@ class DynamoHttpServer:
             return
         await self._engine_method_all("wait_for_requests_to_drain")
 
+    async def _self_test_sglang_control_plane(self):
+        """Prove every local sglang shard answers on /engine/* before training starts.
+
+        Also verifies ``--enable-rl`` actually took: without it
+        ``call_tokenizer_manager`` is unregistered, which would only surface later
+        as a failed cache flush after the first weight update — i.e. as silently
+        stale rollouts rather than as an error.
+        """
+        clients = self._sglang_control_clients()
+        if not clients:
+            raise RuntimeError(
+                "engine=sglang but no /engine control endpoints were recorded; "
+                "check that DYN_SYSTEM_PORT was set for each dynamo.sglang shard."
+            )
+        await asyncio.gather(*[c.wait_ready(timeout_s=_FRONTEND_READY_TIMEOUT_S) for c in clients])
+
+        if self._sglang_cfg().get("enable_rl", True):
+            probe = await asyncio.gather(
+                *[c.call_tokenizer_manager("flush_cache") for c in clients],
+                return_exceptions=True,
+            )
+            bad = [(c.base_url, r) for c, r in zip(clients, probe, strict=True) if isinstance(r, Exception)]
+            if bad:
+                raise RuntimeError(
+                    "dynamo.sglang call_tokenizer_manager is not reachable on "
+                    f"{bad}. That route only exists with --enable-rl; without it the "
+                    "prefix cache cannot be flushed after a weight update and rollouts "
+                    "will silently use stale weights."
+                )
+        logger.info("[DynamoHttpServer] sglang control plane OK on %s shard(s)", len(clients))
+
     async def abort_all_requests(self, reset_prefix_cache: bool = True):
         # dynamo doesn't expose a global abort; v1 returns no-op result so
         # RolloutReplica.abort_all_requests's gather doesn't blow up.
+        # sglang does: tokenizer_manager.abort_request(abort_all=True), which is
+        # what partial rollout needs before a non-naive weight sync.
+        if self._is_sglang():
+            await self._sglang_control_all("abort_request", rid="", abort_all=True)
+            if reset_prefix_cache:
+                await self._sglang_control_all("flush_cache")
+            return {"aborted_count": -1, "request_ids": []}
         return {"aborted_count": 0, "request_ids": []}
 
     async def resume_generation(self):
         return None
 
     async def start_profile(self, **kwargs):
+        if self._is_sglang():
+            await self._sglang_control_all("start_profile", **kwargs)
         return None
 
     async def stop_profile(self):
+        if self._is_sglang():
+            await self._sglang_control_all("stop_profile")
         return None
 
     async def _engine_method_all(self, method: str, kwargs: Optional[dict] = None):
@@ -1884,7 +2339,8 @@ class DynamoHttpServer:
         on this node. Used by DynamoRollout.update_weights to compute the
         NCCL group world_size = 1 (broadcaster) + N (engine workers)."""
         tp = int(self.config.tensor_model_parallel_size)
-        return len(self._control_endpoints) * tp
+        n_shards = len(self._engine_control_endpoints) if self._is_sglang() else len(self._control_endpoints)
+        return n_shards * tp
 
     # ------------------------------------------------------------------ #
     # refit path self-test (v2 — verifies control sidecar reachability)
@@ -1909,7 +2365,16 @@ class DynamoHttpServer:
         Skipped when no control endpoints are registered (slave node / pre-launch).
         Soft-fail by default; set env ``VERL_DYNAMO_REFIT_STRICT=1`` to
         raise on failure (recommended once v2 is the default).
+
+        For engine=sglang the equivalent probe is an HTTP round-trip to each
+        shard's /engine/* plane, and it is **always strict**: unlike the vLLM
+        sidecar (which is verl-private and can degrade), a missing sglang control
+        plane means weight sync cannot work at all, so failing at launch is
+        strictly better than failing at the first refit.
         """
+        if self._is_sglang():
+            await self._self_test_sglang_control_plane()
+            return
         if not self._control_endpoints:
             return
 
@@ -2055,6 +2520,8 @@ class DynamoHttpServer:
         state["_frontend_log_fp"] = None
         state["_vllm_log_fps"] = []
         state["_vllm_log_paths"] = []
+        # aiohttp sessions are bound to a live event loop; rebuilt lazily.
+        state["_sglang_clients"] = None
         return state
 
     def __setstate__(self, state):
