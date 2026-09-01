@@ -25,6 +25,11 @@ for f in sorted(set(files)):
         if cur.endswith("\\\\"):
             continue
         nxt = lines[i + 1].lstrip()
+        if nxt == "":
+            bad += 1
+            print(f"{f}:{i + 2}: BLANK line inside continuation chain (command ends here; args below are dropped)")
+            print(f"    {i + 1}| {cur[:110]}")
+            continue
         if nxt.startswith("#"):
             bad += 1
             print(f"{f}:{i + 2}: continuation swallowed by comment")
