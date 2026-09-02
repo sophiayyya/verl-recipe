@@ -1,4 +1,6 @@
 #!/bin/bash
+# NOTE: retool_ab.sbatch (the original A/B driver) was removed, but this
+# bootstrap stays: validate_vllm_kv_metrics.sbatch cats it into its per-node scripts.
 # Per-node, in-container bootstrap for the retool A/B (runs on BOTH nodes).
 #
 # Techniques lifted from the proven vLLM run
