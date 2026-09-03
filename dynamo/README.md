@@ -2,15 +2,10 @@
 
 This recipe plugs [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) into verl
 as a first-class **async rollout backend**, alongside the built-in `vllm`,
-`sglang`, and `trtllm` backends. Turning it on is a one-line config change
+`sglang` backends. Turning it on is a one-line config change
 (`actor_rollout_ref.rollout.name=dynamo`); everything Dynamo-specific
-(KV-aware routing, disaggregated frontend/worker topology)
-is driven from `rollout.engine_kwargs.dynamo.*`.
-
-The backend can front **either inference engine**: `dynamo.vllm` (the default)
-or `dynamo.sglang` (`engine_kwargs.dynamo.engine=sglang`). Both are validated
-end-to-end on multi-node 30B GRPO — see [Quick start](#quick-start) and the
-[SGLang engine](#sglang-engine-engine_kwargsdynamoenginesglang) section.
+is driven from `rollout.engine_kwargs.dynamo.*`. The backend can front **either inference engine**: `dynamo.vllm` (the default)
+or `dynamo.sglang` (`engine_kwargs.dynamo.engine=sglang`). 
 
 Dynamo owns request routing behind a single logical frontend, so its
 **KV-cache-aware router** can raise the prefix-cache hit rate across a rollout
@@ -76,8 +71,8 @@ Request routing happens inside Dynamo's KV router, **not** in verl's
 | [`dynamo_worker_extension.py`](dynamo_worker_extension.py) | vLLM `worker_extension_cls` that maps each DP shard to a node-global rank so trainer and engine agree on the CUDA-IPC socket path. |
 | [`_dynamo_vllm_with_control.py`](_dynamo_vllm_with_control.py) | Private ZMQ control sidecar that bridges verl's `collective_rpc` into the `dynamo.vllm` subprocess (vLLM only; sglang has native control routes). |
 | [`metrics_sidecar.py`](metrics_sidecar.py) | Optional per-worker system-status / metrics scraper. |
-| [`test_dynamo_sglang.py`](test_dynamo_sglang.py) | CPU unit tests for the sglang path (adapter invariants, payload shapes, fail-fast rules). |
-| [`check_continuations.py`](check_continuations.py) | Guard script: rejects launcher scripts where a comment interrupts a `\` line-continuation chain (which silently drops every following CLI arg). |
+
+
 
 Enable the backend by pointing verl at the recipe's registration module:
 
@@ -121,9 +116,11 @@ recipe on the pinned checkout (`6cbca9ce`):
   `config.reward.*` and `main_ppo` never runs the legacy-key migration, so legacy
   keys are **silently ignored** (the run proceeds with the default reward).
 
-[`main_dynamo.py`](main_dynamo.py) remains as a shim that applies the same pinning
-programmatically. Both engines are verified on this entry: sglang 4-node retool GRPO
-(pearson 0.9994) and the vLLM KV-metrics validation (`rc=0`).
+[`main_dynamo.py`](main_dynamo.py) is the convenience entry point: it pins the v0
+`TaskRunner` and runs verl's legacy-reward-key migration itself, so neither
+`trainer.use_v1=False` nor the `reward.custom_reward_function.*` namespace is
+required when you launch through it. The launchers call `verl.trainer.main_ppo`
+directly and therefore set both explicitly.
 
 ### 1. Generation-only smoke
 
@@ -163,7 +160,6 @@ conditional install, never a baked image.
 | Script | Engine | What it runs |
 | --- | --- | --- |
 | [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below). |
-| [`validate_vllm_kv_metrics.sbatch`](validate_vllm_kv_metrics.sbatch) | vLLM | 3-step validation with KV metrics; the acceptance gate used for the vLLM path. |
 | [`train_qwen3_30b_sglang.sh`](train_qwen3_30b_sglang.sh) | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
 | [`baseline_qwen3_30b_sglang_native.sh`](baseline_qwen3_30b_sglang_native.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
 
@@ -191,14 +187,6 @@ twice regardless of world size.
 | NIXL | ✅ | ✅ (2×8 GPU validated) |
 
 ### Transport selection (read this before multi-node)
-
-NIXL's default backend is UCX, and UCX picks its transport from `UCX_TLS`.
-The right setting depends on the RDMA fabric:
-
-| fabric | recommendation |
-| --- | --- |
-| RDMA with native RDMA-read (e.g. InfiniBand / RoCE) | `UCX_TLS=cuda_ipc,cuda_copy,rc,tcp` — `rc` gives native RDMA read at line rate. |
-| RDMA without native RDMA-read (send/recv-only protocols) | UCX can only emulate one-sided reads over send/recv — we measured 0.23 GB/s. Use NIXL's **LIBFABRIC** backend instead: `+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nixl.backends=[LIBFABRIC]`, with your fabric's libfabric provider (≥1.18) on `LD_LIBRARY_PATH`. Same 1 GiB cross-node read: **48.5 GB/s**. |
 
 Cross-node measured on 2 nodes × 8×H100 (RDMA fabric), 3-step GRPO,
 step-3 `update_weights`:
