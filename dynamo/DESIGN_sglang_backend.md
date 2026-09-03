@@ -1,3 +1,5 @@
+> **文件改名对照（2026-09-03）**：`smoke_dynamo_v1.sh`→`smoke_vllm_generate.sh`，`train_30b_dynamo_sglang_4n.sh`→`train_qwen3_30b_sglang.sh`，`train_30b_sglang_native_i100.sh`→`baseline_qwen3_30b_sglang_native.sh`，`retool_ab_bootstrap.sh`→`container_bootstrap.sh`。下文沿用旧名。
+
 # 设计：把 SGLang 加进 verl × Dynamo rollout backend
 
 > **历史设计文档（2026-08-21）。** 实现过程中若干细节已变：不再有 `dynamo_sglang` 这个 rollout name 和

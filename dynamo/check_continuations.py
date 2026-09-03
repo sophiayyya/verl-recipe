@@ -4,7 +4,7 @@ import sys
 
 # A line ending in "\" splices the NEXT line onto it. If that next line is a
 # comment, bash swallows the rest of the command: every argument below is
-# silently dropped. Same class of bug found in train_30b_dynamo_sglang_4n.sh.
+# silently dropped. Same class of bug found in train_qwen3_30b_sglang.sh.
 pats = sys.argv[1:] or ["*.sh", "*.sbatch"]
 files = []
 for p in pats:

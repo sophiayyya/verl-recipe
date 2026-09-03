@@ -1,6 +1,6 @@
 #!/bin/bash
 # Qwen3-30B retool RL through Dynamo + SGLang on 4 nodes -- the A/B partner of
-# train_30b_sglang_native_i100.sh.
+# baseline_qwen3_30b_sglang_native.sh.
 #
 # Generated FROM that script by reverting only the rollout path (rollout.name, the
 # engine_kwargs.dynamo.* block, the dynamo agent-loop manager, and
@@ -29,7 +29,7 @@
 #   VERL_DEFER_OPTIMIZER_LOAD=0  1 = Adam on CPU through fwd/bwd (needed on 2x8, not on 4x8)
 #   USE_FUSED_KERNELS=0 FUSED_KERNELS_BACKEND=torch EAGER_EXPERTS=0 PPO_MAX_TOKEN_LEN=18432
 #   ULYSSES_SP / ROLLOUT_TP / RESUME_MODE / RESET_CHECKPOINT / CONTAINER / WANDB_KEY_FILE
-#   e.g. sbatch --export=ALL,TOTAL_STEPS=3 train_30b_dynamo_sglang_4n.sh
+#   e.g. sbatch --export=ALL,TOTAL_STEPS=3 train_qwen3_30b_sglang.sh
 #
 # Derived from the proven Dynamo+vLLM run (now train_30b_rl_dynamo_kv_metrics.sh). Everything that is not engine-specific is kept byte-identical to that
 # script: SBATCH block, Ray bring-up, sandbox-fusion, datasets, and every

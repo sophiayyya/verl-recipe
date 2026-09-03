@@ -53,12 +53,12 @@ export NNODES=4
 export EXP_NAME=kvval_vllm_$SLURM_JOB_ID
 export VERL_DEFER_OPTIMIZER_LOAD=1"
 
-{ echo "export ARM=$ARM"; cat "$V/recipe/dynamo/retool_ab_bootstrap.sh"
+{ echo "export ARM=$ARM"; cat "$V/recipe/dynamo/container_bootstrap.sh"
   echo "cd $V"
   echo "$COMMON"
   echo "ray start --address=$ip_head --block"; } > "$RUN_DIR/worker.sh"
 
-{ echo "export ARM=$ARM"; cat "$V/recipe/dynamo/retool_ab_bootstrap.sh"
+{ echo "export ARM=$ARM"; cat "$V/recipe/dynamo/container_bootstrap.sh"
   echo "cd $V"
   echo "$COMMON"
   echo "ray start --head --node-ip-address=$node_1 --port=$port"

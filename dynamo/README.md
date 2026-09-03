@@ -133,7 +133,7 @@ Verifies the full Dynamo stack (etcd + nats + workers + frontend) can serve a
 completion, no training loop. Passes when the log prints `PASS:`.
 
 ```bash
-bash recipe/dynamo/smoke_dynamo_v1.sh          # Qwen2.5-0.5B-Instruct, 1 GPU
+bash recipe/dynamo/smoke_vllm_generate.sh          # Qwen2.5-0.5B-Instruct, 1 GPU
 ```
 
 ### 2. One-node training smoke
@@ -166,8 +166,8 @@ conditional install, never a baked image.
 | --- | --- | --- |
 | [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below). |
 | [`validate_vllm_kv_metrics.sbatch`](validate_vllm_kv_metrics.sbatch) | vLLM | 3-step validation with KV metrics; the acceptance gate used for the vLLM path. |
-| [`train_30b_dynamo_sglang_4n.sh`](train_30b_dynamo_sglang_4n.sh) | sglang | The verified 100-step retool GRPO run (job 17562481). Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
-| [`train_30b_sglang_native_i100.sh`](train_30b_sglang_native_i100.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
+| [`train_qwen3_30b_sglang.sh`](train_qwen3_30b_sglang.sh) | sglang | The verified 100-step retool GRPO run (job 17562481). Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
+| [`baseline_qwen3_30b_sglang_native.sh`](baseline_qwen3_30b_sglang_native.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
 
 ## NIXL weight sync (checkpoint engine)
 
@@ -516,8 +516,8 @@ bash recipe/dynamo/smoke_dynamo_sglang.sh
 STAGE=train bash recipe/dynamo/smoke_dynamo_sglang.sh
 
 # the verified 4-node 30B run (100 steps; defaults = job 17562481)
-sbatch recipe/dynamo/train_30b_dynamo_sglang_4n.sh
-# shorter: sbatch --export=ALL,TOTAL_STEPS=3 recipe/dynamo/train_30b_dynamo_sglang_4n.sh
+sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
+# shorter: sbatch --export=ALL,TOTAL_STEPS=3 recipe/dynamo/train_qwen3_30b_sglang.sh
 ```
 
 ### `engine_kwargs.dynamo.sglang.*`
@@ -669,7 +669,7 @@ a separate verl PR — see the NIXL section.)
 | `dynamo_sglang_incremental_logprobs_11640_backport.patch` | ai-dynamo/dynamo @ `94accc7389` | sglang log-prob fix above (backport of #11640). |
 | `verl_defer_optimizer_load.patch` | verl @ `6cbca9ce` | Opt-in `VERL_DEFER_OPTIMIZER_LOAD=1`: keep Adam state on CPU through fwd/bwd, load it only around `optimizer.step()`; measured 7.11 GB/GPU freed at the actor-update peak (32-GPU FSDP sharding). Needed to fit 30B on 2×8 H100; the verified 4×8 run had it off. |
 | `verl_mem_debug_snapshot.patch` | verl @ `6cbca9ce` | Opt-in `VERL_MEM_DEBUG=1`: CUDA allocation-history snapshot dumped on OOM during the actor update. Diagnostic only. |
-| `verl_vllm_bucket_size_4096.patch` | verl @ `6cbca9ce` | **Raises the default vLLM weight-transfer `bucket_size_mb` from 512 to 4096, unconditionally.** Faster refit for the 30B runs, but known to break other paths (DeepSeek-V4 fp8 requantize fails with `CUDA driver error: invalid argument`). Review before applying; `train_30b_dynamo_sglang_4n.sh` applies the same bump with `sed` at runtime. |
+| `verl_vllm_bucket_size_4096.patch` | verl @ `6cbca9ce` | **Raises the default vLLM weight-transfer `bucket_size_mb` from 512 to 4096, unconditionally.** Faster refit for the 30B runs, but known to break other paths (DeepSeek-V4 fp8 requantize fails with `CUDA driver error: invalid argument`). Review before applying; `train_qwen3_30b_sglang.sh` applies the same bump with `sed` at runtime. |
 
 Known-good base versions:
 

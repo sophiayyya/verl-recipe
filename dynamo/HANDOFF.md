@@ -1,3 +1,5 @@
+> **文件改名对照（2026-09-03）**：`smoke_dynamo_v1.sh`→`smoke_vllm_generate.sh`，`train_30b_dynamo_sglang_4n.sh`→`train_qwen3_30b_sglang.sh`，`train_30b_sglang_native_i100.sh`→`baseline_qwen3_30b_sglang_native.sh`，`retool_ab_bootstrap.sh`→`container_bootstrap.sh`。下文沿用旧名。
+
 # 交接：verl × Dynamo × SGLang（retool 30B RL）
 
 最后更新：2026-08-24。上一轮会话的全部上下文压缩在此。

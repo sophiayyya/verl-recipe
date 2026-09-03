@@ -5,7 +5,7 @@ Raise BucketedWeightSender's default bucket_size_mb from 512 to 4096 (vLLM CUDA-
 
 UNCONDITIONAL, no env gate. Faster refit for the 30B runs, but a 4096 MB bucket has been seen to break
 other paths (DeepSeek-V4 fp8 requantize: 'CUDA driver error: invalid argument'). Review before applying;
-train_30b_dynamo_sglang_4n.sh applies the same bump with sed at runtime.
+train_qwen3_30b_sglang.sh applies the same bump with sed at runtime.
 diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
 index e679b2b3..6680e735 100644
 --- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
