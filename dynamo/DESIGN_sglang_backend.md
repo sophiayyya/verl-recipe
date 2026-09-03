@@ -1,5 +1,9 @@
 # 设计：把 SGLang 加进 verl × Dynamo rollout backend
 
+> **历史设计文档（2026-08-21）。** 实现过程中若干细节已变：不再有 `dynamo_sglang` 这个 rollout name 和
+> `dynamo_sglang_trainer.yaml`，引擎通过 `engine_kwargs.dynamo.engine=sglang` 切换；入口是
+> `verl.trainer.main_ppo trainer.use_v1=False`。以 README.md 为准。
+
 - 仓库：`/lustre/fsw/portfolios/coreai/users/sopyang/verl_dynamo/verl`
   （core verl @ `6cbca9ce`，`recipe/` 子模块 = `sophiayyya/verl-recipe` 分支 `sopy/dynamo_next` @ `ab641fe`）
 - 参考：

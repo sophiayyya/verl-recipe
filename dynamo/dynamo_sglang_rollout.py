@@ -309,6 +309,11 @@ class SGLangServerAdapter(_SGLangServerAdapter):
 
         bucket_bytes = int(self.config.checkpoint_engine.update_weights_bucket_megabytes) << 20
 
+        # Fresh probe snapshot per sync. An earlier revision stashed it once and never
+        # refreshed, so from step 2 on verify_weight_sync compared the engine's
+        # (correctly updated) weights against step-1 values and failed on success.
+        self._verify_sample = None
+
         # NB: every rank must drain the generator — it all-gathers across the FSDP
         # group internally, so an early return on non-leader ranks deadlocks.
         n_buckets = 0
@@ -380,8 +385,9 @@ class SGLangServerAdapter(_SGLangServerAdapter):
             for group in zip(*gathered, strict=True)
         ]
         if self._sglang_cfg().get("verify_weight_sync", False) and self._verify_sample is None:
-            # Stash a slice of the first parameter of the first bucket so
-            # verify_weight_sync() has something concrete to compare against.
+            # Stash a slice of the first parameter of the first bucket of THIS sync
+            # (update_weights resets the slot) so verify_weight_sync() has something
+            # concrete to compare against.
             probe_name, probe_tensor = params_batch[0]
             self._verify_sample = (
                 probe_name,
@@ -438,16 +444,21 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         except Exception as e:  # noqa: BLE001
             # Infrastructure problem, not a correctness signal — do not fail the run,
             # but do not let it pass silently either.
-            logger.warning(
-                "[dynamo-sglang] weight-sync verification UNAVAILABLE (step=%s): %s", global_steps, e
+            logger.error(
+                "[dynamo-sglang] weight-sync verification UNAVAILABLE (step=%s): %s. "
+                "verify_weight_sync=true did NOT verify anything for this step — "
+                "get_weights_by_name is model-specific and unimplemented for e.g. "
+                "Qwen2/Qwen3ForCausalLM; do not read a passing run as a verified one.",
+                global_steps,
+                e,
             )
             return {}
 
         values = got.get("result", got) if isinstance(got, dict) else got
         flat = _flatten_floats(values)[: len(expected)]
         if len(flat) != len(expected):
-            logger.warning(
-                "[dynamo-sglang] verification inconclusive: engine returned %s values for %s, expected %s",
+            logger.error(
+                "[dynamo-sglang] verification INCONCLUSIVE (nothing verified): engine returned %s values for %s, expected %s",
                 len(flat),
                 name,
                 len(expected),

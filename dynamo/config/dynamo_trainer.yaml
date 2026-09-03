@@ -1,9 +1,10 @@
 # Hydra config for the recipe-side dynamo rollout backend.
 #
 # Inherits everything from the standard ppo_trainer; the only deltas are:
-#   * actor_rollout_ref.rollout.name=dynamo  -> resolves to recipe.dynamo via
-#     the static entries in verl.workers.rollout.base._ROLLOUT_REGISTRY and
-#     verl.workers.rollout.replica.RolloutReplicaRegistry
+#   * actor_rollout_ref.rollout.name=dynamo  -> registered into verl's
+#     _ROLLOUT_REGISTRY / RolloutReplicaRegistry by recipe/dynamo/register.py,
+#     which verl imports via VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+#     (the name is NOT known to core verl without that env var)
 #   * actor_rollout_ref.rollout.mode=async   -> dynamo only ships an async
 #     ServerAdapter (mirrors trtllm/vllm async-server pattern)
 #
@@ -30,7 +31,13 @@ actor_rollout_ref:
         thunderagent:
           enabled: true
           router_block_size: 16
-        # All keys optional; sane defaults applied in DynamoHttpServer.
+        # Sleep/wake the engine around the training phase. verl's own
+        # rollout.free_cache_engine defaults to true; keep the two aligned or the
+        # engine stays resident through training and the trainer OOMs.
+        free_engine_on_train: true
+        # Remaining keys optional; sane defaults applied in DynamoHttpServer.
+        # engine: vllm                  # vllm | sglang
+        # request_completion_token_ids: true   # REQUIRED for RL; sglang refuses to start when unset
         # namespace: verl_dynamo
         # router_mode: kv               # round-robin | kv | random | least-loaded
         # frontend_http_port: 0         # 0 = auto-assign on master node

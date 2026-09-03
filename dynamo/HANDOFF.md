@@ -16,7 +16,7 @@
 ## 2. 环境与路径
 
 ```
-登录        ssh sopyang@cw-dfw-cs-001-login-01.cw-dfw-cs-001.hpc.nvidia.com
+登录        ssh <user>@<dfw login FQDN>（见本地 server.txt，不入库）
             密码登录，用 cc_project/rany.sh（expect 封装）；短主机名会假死，必须用 FQDN
 $B          /lustre/fsw/portfolios/coreai/users/sopyang     （= fs1 路径的符号链接）
 $W          /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/sopyang

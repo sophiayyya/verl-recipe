@@ -4,7 +4,7 @@
 # Per-node, in-container bootstrap for the retool A/B (runs on BOTH nodes).
 #
 # Techniques lifted from the proven vLLM run
-# ($B/verl/recipe/dynamo/train_30b_rl_dynamo_kv_i100_metrics.sh) — a job-unique
+# (recipe/dynamo/train_30b_rl_dynamo_kv_metrics.sh) — a job-unique
 # sandbox-fusion port, the detached-actor patch, and cd'ing into the verl repo
 # before `ray start` so raylet-spawned actors inherit a cwd where relative config
 # paths like recipe/retool/retool.py resolve.
@@ -86,7 +86,7 @@ python -m pip install -q -U accelerate 2>&1 | tail -2
 
 # --- vLLM arm: base wheels only, plus the LOCAL Dynamo source overlay -------- #
 # Mirrors the install in the proven run
-# ($B/verl/recipe/dynamo/train_30b_rl_dynamo_kv_i100_metrics.sh:256): the two
+# (recipe/dynamo/train_30b_rl_dynamo_kv_metrics.sh:256): the two
 # wheels go in with --force-reinstall --no-deps and NO extra, so vLLM's own
 # dependency stack is left exactly as the container built it.
 if [[ "$ARM" == "dynamo_vllm" ]]; then

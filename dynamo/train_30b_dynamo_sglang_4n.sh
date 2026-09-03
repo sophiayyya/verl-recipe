@@ -19,10 +19,19 @@
 #SBATCH --time=04:00:00
 #SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/sopyang/verl/slurm/logs/train_30b_rl_dynamo_sglang_%j.log
 #
-# Qwen3-30B retool RL through Dynamo + SGLang — 2x8 H100.
+# Qwen3-30B retool RL through Dynamo + SGLang — 4x8 H100.
 #
-# Derived from train_30b_rl_dynamo_kv_i100_metrics.sh (the proven Dynamo+vLLM
-# run). Everything that is not engine-specific is kept byte-identical to that
+# Env knobs (defaults = the verified 100-step run, job 17562481, pearson 0.9994):
+#   TOTAL_STEPS=100            training steps
+#   ENFORCE_EAGER=False        False = CUDA graph on (sglang: ~8x faster generation than eager)
+#   DISABLE_PIECEWISE=0        1 adds --disable-piecewise-cuda-graph
+#   STREAM_INTERVAL=           empty = engine default (only a workaround before the logprob patch)
+#   VERL_DEFER_OPTIMIZER_LOAD=0  1 = Adam on CPU through fwd/bwd (needed on 2x8, not on 4x8)
+#   USE_FUSED_KERNELS=0 FUSED_KERNELS_BACKEND=torch EAGER_EXPERTS=0 PPO_MAX_TOKEN_LEN=18432
+#   ULYSSES_SP / ROLLOUT_TP / RESUME_MODE / RESET_CHECKPOINT / CONTAINER / WANDB_KEY_FILE
+#   e.g. sbatch --export=ALL,TOTAL_STEPS=3 train_30b_dynamo_sglang_4n.sh
+#
+# Derived from the proven Dynamo+vLLM run (now train_30b_rl_dynamo_kv_metrics.sh). Everything that is not engine-specific is kept byte-identical to that
 # script: SBATCH block, Ray bring-up, sandbox-fusion, datasets, and every
 # trainer/actor hyper-parameter. The deltas below are the ones the engine swap
 # actually forces, each with the reason it cannot be avoided.
@@ -61,11 +70,11 @@
 #      enable_rl is what registers call_tokenizer_manager, the only way to flush
 #      the radix cache on this path (control/flush_cache returns 404).
 #
-#   6. _experts_implementation=eager. Consequence of (2): transformers 5.x picks
-#      grouped_mm at load time and OOMs the actor update on 2 nodes; "eager"
-#      falls through to Qwen3MoeExperts.forward, which loops over hit experts.
-#      Same math, far lower peak. This is the one hyper-parameter added purely to
-#      compensate for the forced transformers bump.
+#   6. transformers 5.x MoE memory. Consequence of (2): 5.x stores the experts as
+#      one fused 3D tensor and picks grouped_mm, which roughly DOUBLES the actor
+#      update's peak memory versus 4.x (35.6 -> 71.6 GB on this footprint). The
+#      EAGER_EXPERTS=1 knob below trades that for a 39x slower update and is off;
+#      on 4x8 H100 the fused path fits as is.
 set -ex
 WORKSPACE=/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_llm/users/sopyang
 CONTAINER="${CONTAINER:-${WORKSPACE}/images/verl_sgl0512.dev4.sqsh}"
@@ -169,6 +178,7 @@ export HYDRA_FULL_ERROR=1
 # lazy until the first .step()), which is why every run so far cleared step 1 and OOMed
 # in step 2's backward. Exported here, not in the driver, so both raylets carry it and
 # the Ray workers inherit it.
+# Off by default: the verified 4x8 run did not need it. Set 1 on 2x8.
 export VERL_DEFER_OPTIMIZER_LOAD=${VERL_DEFER_OPTIMIZER_LOAD:-0}
 echo "VERL_DEFER_OPTIMIZER_LOAD=${VERL_DEFER_OPTIMIZER_LOAD}"
 unset ROCR_VISIBLE_DEVICES 2>/dev/null
@@ -475,12 +485,12 @@ echo "FUSED_ARGS: ${FUSED_ARGS[*]:-<none>}"
 # 1.0. That is the whole of the pearson=0.05 / probs_diff=0.27 anomaly (HANDOFF 20).
 # Setting the interval to the full response length makes the response a single chunk,
 # so nothing is left to drop. Empty by default = engine default (1).
-# DISABLE_PIECEWISE=0 drops the flag. It was added to dodge the compiler's ENOSPC
-# (HANDOFF 12), but that turned out to be the container writable layer filling up and
-# is already fixed by relocating HOME (HANDOFF 14) -- so it is probably redundant now,
-# and it suppresses a cudagraph path that may cost throughput. Default 1 = unchanged.
+# DISABLE_PIECEWISE=1 adds --disable-piecewise-cuda-graph. It was added to dodge the
+# compiler's ENOSPC (HANDOFF 12), which turned out to be the container writable layer
+# filling up and is fixed by relocating HOME (HANDOFF 14). The verified 100-step run
+# (17562481) ran with it OFF, so 0 is the default.
 SGLANG_EXTRA=()
-if [[ "${DISABLE_PIECEWISE:-1}" == "1" ]]; then
+if [[ "${DISABLE_PIECEWISE:-0}" == "1" ]]; then
   SGLANG_EXTRA+=( "--disable-piecewise-cuda-graph" )
 fi
 if [[ -n "${STREAM_INTERVAL:-}" ]]; then
@@ -558,7 +568,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=30 \
-    actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER:-True} \
+    actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER:-False} \
     actor_rollout_ref.rollout.disable_log_stats=False \
     actor_rollout_ref.rollout.prometheus.enable=True \
     actor_rollout_ref.rollout.prometheus.port=$PROM_PORT \

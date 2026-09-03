@@ -24,6 +24,7 @@ verl's ``workers/rollout/vllm_rollout/__init__`` raises on a vLLM-free image, so
 an eager import here would make the sglang path impossible on those images.
 """
 
+import logging
 import os
 from typing import Any, Optional
 
@@ -36,6 +37,8 @@ from verl.workers.rollout.vllm_rollout.vllm_rollout import (
 
 from recipe.dynamo.dynamo_naming import control_actor_name
 
+
+logger = logging.getLogger(__name__)
 
 class VllmDynamoServerAdapter(_VllmServerAdapter):
     """Per-rank dynamo client for the vLLM engine.
@@ -117,8 +120,8 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
         )
 
         t_enter = _time.time()
-        tag = f"[v4a-4][rank={self.rollout_rank}]"
-        print(f"{tag} ENTER update_weights", flush=True)
+        tag = f"[dynamo-vllm][rank={self.rollout_rank}]"
+        logger.debug(f"{tag} ENTER update_weights")
 
         # The naive path resumes vLLM inside ``WorkerDict.update_weights``;
         # the NCCL/NIXL path returns early before that resume runs, so we
@@ -134,11 +137,8 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
             non_block=True,
             kwargs={**kwargs, "use_shm": self.use_shm},
         )
-        print(
-            f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
-            f"future={'present' if future is not None else 'None (non-rank-0)'}",
-            flush=True,
-        )
+        logger.debug(f"{tag} RPC fired +{_time.time() - t_enter:.2f}s "
+            f"future={'present' if future is not None else 'None (non-rank-0)'}")
 
         # Build sender (every rank has its own zmq_handle to its paired
         # engine worker; receiver setup on engine side is triggered by
@@ -149,7 +149,7 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
             bucket_size_mb=bucket_size_mb,
             use_shm=self.use_shm,
         )
-        print(f"{tag} sender ready zmq_handle={self.zmq_handle}", flush=True)
+        logger.debug(f"{tag} sender ready zmq_handle={self.zmq_handle}")
 
         sender_task = asyncio.create_task(sender.async_send_weights(weights))
 
@@ -162,54 +162,42 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
                 return_when=asyncio.FIRST_COMPLETED,
             )
             elapsed = _time.time() - t_enter
-            print(
-                f"{tag} race done={len(done)} pending={len(pending)} +{elapsed:.2f}s",
-                flush=True,
-            )
+            logger.debug(f"{tag} race done={len(done)} pending={len(pending)} +{elapsed:.2f}s")
             for t in done:
                 which = "future" if t is future_task else "sender"
                 if t.exception():
                     err = t.exception()
-                    print(
-                        f"{tag} {which} ERROR: {type(err).__name__}: {err}",
-                        flush=True,
-                    )
+                    logger.warning(f"{tag} {which} ERROR: {type(err).__name__}: {err}")
                     for p in pending:
                         p.cancel()
                     raise err
-                print(f"{tag} {which} completed OK", flush=True)
+                logger.debug(f"{tag} {which} completed OK")
 
             # Continue waiting for whatever is still pending
             if pending:
-                print(f"{tag} waiting for {len(pending)} pending task(s)...", flush=True)
+                logger.debug(f"{tag} waiting for {len(pending)} pending task(s)...")
                 more_done, more_pending = await asyncio.wait(
                     pending,
                     timeout=600,
                     return_when=asyncio.ALL_COMPLETED,
                 )
                 if more_pending:
-                    print(
-                        f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
-                        f"after 600s +{_time.time() - t_enter:.2f}s",
-                        flush=True,
-                    )
+                    logger.warning(f"{tag} TIMEOUT: {len(more_pending)} task(s) still pending "
+                        f"after 600s +{_time.time() - t_enter:.2f}s")
                     for p in more_pending:
                         p.cancel()
-                    raise RuntimeError("v4a-4 hung: tasks still pending after 660s total")
+                    raise RuntimeError("dynamo-vllm weight sync hung: tasks still pending after 660s total")
                 for t in more_done:
                     which = "future" if t is future_task else "sender"
                     if t.exception():
                         err = t.exception()
-                        print(
-                            f"{tag} {which} ERROR (late): {type(err).__name__}: {err}",
-                            flush=True,
-                        )
+                        logger.warning(f"{tag} {which} ERROR (late): {type(err).__name__}: {err}")
                         raise err
-                    print(f"{tag} {which} completed OK (late)", flush=True)
+                    logger.debug(f"{tag} {which} completed OK (late)")
         else:
             # Non-rank-0: only sender (no future to race against).
             await sender_task
-            print(f"{tag} sender DONE (non-rank-0) +{_time.time() - t_enter:.2f}s", flush=True)
+            logger.debug(f"{tag} sender DONE (non-rank-0) +{_time.time() - t_enter:.2f}s")
 
         # Cleanup once per node: every shared Dynamo actor owns node-local
         # sidecars and caches.
@@ -219,12 +207,9 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
                     self.server_handle.clear_kv_cache.remote(),
                     timeout=30,
                 )
-                print(f"{tag} kv cache cleared", flush=True)
+                logger.debug(f"{tag} kv cache cleared")
             except asyncio.TimeoutError:
-                print(
-                    f"{tag} clear_kv_cache TIMEOUT 30s (continuing; prefix cache may be stale)",
-                    flush=True,
-                )
+                logger.warning(f"{tag} clear_kv_cache TIMEOUT 30s (continuing; prefix cache may be stale)")
             if global_steps is not None:
                 try:
                     await asyncio.wait_for(
@@ -232,9 +217,9 @@ class VllmDynamoServerAdapter(_VllmServerAdapter):
                         timeout=10,
                     )
                 except asyncio.TimeoutError:
-                    print(f"{tag} set_global_steps TIMEOUT 10s", flush=True)
+                    logger.warning(f"{tag} set_global_steps TIMEOUT 10s")
 
-        print(f"{tag} EXIT +{_time.time() - t_enter:.2f}s", flush=True)
+        logger.debug(f"{tag} EXIT +{_time.time() - t_enter:.2f}s")
 
 
 __all__ = ["VllmDynamoServerAdapter"]

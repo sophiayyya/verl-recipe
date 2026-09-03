@@ -4,7 +4,7 @@ This recipe plugs [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) into verl
 as a first-class **async rollout backend**, alongside the built-in `vllm`,
 `sglang`, and `trtllm` backends. Turning it on is a one-line config change
 (`actor_rollout_ref.rollout.name=dynamo`); everything Dynamo-specific
-(KV-aware routing, disaggregated frontend/worker topology, KV-cache offload)
+(KV-aware routing, disaggregated frontend/worker topology)
 is driven from `rollout.engine_kwargs.dynamo.*`.
 
 The backend can front **either inference engine**: `dynamo.vllm` (the default)
@@ -52,7 +52,7 @@ shards.
  │        │                        native control route for sglang)              │
  │   etcd + nats-server (service discovery / messaging)                          │
  │                                                                               │
- │   optional: KV-cache offload (mooncake / flexkv), per-worker metrics sidecar  │
+ │   optional: per-worker metrics sidecar                                        │
  └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -96,14 +96,12 @@ defaults are applied in `DynamoHttpServer`.
 | --- | --- | --- |
 | `engine` | `vllm` (default), `sglang` | Which inference engine the workers run. |
 | `router_mode` | `kv` (default), `round-robin`, `random`, `least-loaded` | Dynamo request-routing policy; `kv` enables KV-cache-aware routing. |
-| `kv_offload_backend` | `none` (default), `mooncake`, `flexkv` | Where to offload the KV cache between steps. |
-| `kv_offload_reset_timeout_s` | `300` | Deadline for the external KV store to flush on weight update (fail-closed when offload is on). |
 | `frontend_http_port` / `etcd_port` / `nats_port` | `0` = auto-assign | Fixed ports if you need them. |
 | `served_model_name` | falls back to `model_config.local_path` | Model name the frontend advertises. |
-| `request_engine_data` / `request_completion_token_ids` | `true` / `false` | Ask the frontend to return `nvext.engine_data` / raw `completion_token_ids` (token-in/token-out for RL). **Required for RL** — without token ids the adapter falls back to re-tokenized text; the sglang engine refuses to start when this key is left unset (an explicit `false` is honored). |
+| `request_engine_data` / `request_completion_token_ids` | `true` / `false` | Ask the frontend to return `nvext.engine_data` (vLLM only) / raw `completion_token_ids` (token-in/token-out for RL). **Required for RL.** The sglang engine refuses to start when `request_completion_token_ids` is left unset (an explicit `false` is honored). If it is `true` and the frontend still returns no token ids, generation raises rather than silently re-tokenizing the text; when it is off, the text re-encode fallback is logged at ERROR (first 3 hits + every 100th). |
 | `return_tokens_as_token_ids` | `true` / `false` | Emit token ids instead of detokenized text. |
 | `request_timeout_s` | `600` (default; scripts use `1800`) | Per-request timeout. |
-| `free_engine_on_train` | `true` | Free the engine (sleep) during the training phase. This is what makes CUDA graph affordable on tight-memory footprints. |
+| `free_engine_on_train` | `true` (set by `config/dynamo_trainer.yaml`; code default `false`) | Free the engine (sleep) during the training phase. Keep it aligned with verl's `rollout.free_cache_engine` (default `true`); the sglang engine additionally requires `rollout.enable_sleep_mode=true` when this is on (that flag adds `--enable-memory-saver`) and refuses to start otherwise. This is what makes CUDA graph affordable on tight-memory footprints. |
 | `enable_worker_system_metrics` | `true` / `false` | Expose the per-worker system-status / metrics port (paired with `metrics_sidecar.py`). Must stay `true` for sglang — that port carries its control plane. |
 | `extra_args` | `["--generation-config","vllm","--stream-interval=100"]` | Extra CLI args forwarded verbatim to the engine worker. |
 
@@ -151,7 +149,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
     actor_rollout_ref.rollout.name=dynamo \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=kv \
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=kv \
     trainer.n_gpus_per_node=2 trainer.nnodes=1 \
     trainer.total_training_steps=2
 ```
@@ -166,9 +164,9 @@ conditional install, never a baked image.
 
 | Script | Engine | What it runs |
 | --- | --- | --- |
-| [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run. |
+| [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below). |
 | [`validate_vllm_kv_metrics.sbatch`](validate_vllm_kv_metrics.sbatch) | vLLM | 3-step validation with KV metrics; the acceptance gate used for the vLLM path. |
-| [`train_30b_dynamo_sglang_4n.sh`](train_30b_dynamo_sglang_4n.sh) | sglang | The verified 100-step retool GRPO run (`TOTAL_STEPS`, `ENFORCE_EAGER`, `STREAM_INTERVAL` knobs in the header). |
+| [`train_30b_dynamo_sglang_4n.sh`](train_30b_dynamo_sglang_4n.sh) | sglang | The verified 100-step retool GRPO run (job 17562481). Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
 | [`train_30b_sglang_native_i100.sh`](train_30b_sglang_native_i100.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
 
 ## NIXL weight sync (checkpoint engine)
@@ -273,10 +271,10 @@ actor_rollout_ref.rollout.multi_turn.enable=True \
 actor_rollout_ref.rollout.agent.num_workers=64 \
 actor_rollout_ref.rollout.agent.agent_loop_config_path=/path/to/agent_config.yaml \
 actor_rollout_ref.rollout.agent.default_agent_loop=<your_loop_name> \
-+actor_rollout_ref.rollout.agent.agent_loop_manager_class=recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
+++actor_rollout_ref.rollout.agent.agent_loop_manager_class=recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
 ```
 
-The `agent_loop_manager_class` override is the key one: it swaps verl's default
+The `agent_loop_manager_class` override is the key one (`++`, not `+`: `config/dynamo_trainer.yaml` already sets it, and Hydra rejects a bare `+` on an existing key): it swaps verl's default
 manager for `DynamoAgentLoopManager`, which talks to the single shared Dynamo
 frontend instead of load-balancing across replicas.
 
@@ -455,7 +453,8 @@ actor_rollout_ref.rollout.name=dynamo \
 ```
 
 Full design and rollout plan: [DESIGN_sglang_backend.md](DESIGN_sglang_backend.md).
-Debugging history, failure catalog, and methodology notes: [HANDOFF.md](HANDOFF.md).
+Debugging history, failure catalog, and methodology notes: [HANDOFF.md](HANDOFF.md)
+(internal, Chinese-language, cluster-specific working log — kept for provenance, not a user guide).
 
 ### What is different from the vLLM path
 
@@ -476,10 +475,13 @@ optional metrics extra and becomes the whole control plane —
 
 ### Prerequisites
 
-1. **A container with `dynamo.sglang`.** `pip install 'ai_dynamo[sglang]'` (pulls
-   `sglang==0.5.14`). The recipe's stock vLLM images do not have it — install
-   per-job, never bake it in (it downgrades vLLM's guided-decoding deps; see
-   [Quick start §3](#3-multi-node-30b-rl)).
+1. **A container with `dynamo.sglang`.** Two validated routes:
+   - the smoke scripts install the `[sglang]` extra from the **local** 1.3.0
+     wheelhouse into the vLLM image (`ai_dynamo==1.3.0` is not on PyPI, only
+     `.post1`/`1.3.1`; the extra pulls `sglang==0.5.14`). Per-job only, never baked in:
+     it downgrades vLLM's guided-decoding deps (see [Quick start §3](#3-multi-node-30b-rl));
+   - the 30B launchers use an image that already ships sglang (`verl_sgl0512.dev4`:
+     sglang 0.5.12 / transformers 5.3.0) and install the dynamo wheels `--no-deps`.
 2. **The log-prob fidelity patch** —
    [required for trustworthy rollout log-probs](#engine-log-prob-fidelity-incremental-vs-cumulative-fix-required-patch);
    apply `patches/dynamo_sglang_incremental_logprobs_11640_backport.patch` to the
@@ -493,7 +495,16 @@ optional metrics extra and becomes the whole control plane —
    kills the worker process.
 4. **`--enable-memory-saver`** is added automatically when
    `rollout.enable_sleep_mode=true`; without it SGLang's torch_memory_saver
-   never arms and memory release silently frees nothing.
+   never arms and memory release silently frees nothing (the server refuses
+   `free_cache_engine=true` + `enable_sleep_mode=false` for this reason). Also
+   **unset `PYTORCH_CUDA_ALLOC_CONF=expandable_segments`** in the job
+   environment: torch_memory_saver refuses to initialise under it, and the
+   engine then sits on ~31 GB/GPU of weights through every training step.
+5. **transformers 5.x memory.** sglang 0.5.x pins transformers 5.x, which stores
+   MoE experts as one fused tensor and roughly **doubles** the actor-update peak
+   versus 4.x (35.6 → 71.6 GB on Qwen3-30B-A3B). On 4×8 H100 it fits as is; on
+   2×8 use `VERL_DEFER_OPTIMIZER_LOAD=1` (patch below). Do not reach for
+   `_experts_implementation=eager` — it costs a 39× slower update.
 
 ### Run
 
@@ -504,8 +515,9 @@ bash recipe/dynamo/smoke_dynamo_sglang.sh
 # 2-step GRPO incl. weight sync + sleep/wake (M2)
 STAGE=train bash recipe/dynamo/smoke_dynamo_sglang.sh
 
-# the verified 4-node 30B run (100 steps)
+# the verified 4-node 30B run (100 steps; defaults = job 17562481)
 sbatch recipe/dynamo/train_30b_dynamo_sglang_4n.sh
+# shorter: sbatch --export=ALL,TOTAL_STEPS=3 recipe/dynamo/train_30b_dynamo_sglang_4n.sh
 ```
 
 ### `engine_kwargs.dynamo.sglang.*`
@@ -513,8 +525,7 @@ sbatch recipe/dynamo/train_30b_dynamo_sglang_4n.sh
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `enable_rl` | `true` | Adds `--enable-rl`; registers `call_tokenizer_manager`, the only route that can flush the radix cache after a weight update. |
-| `serialized_tensor_encoding` | `base64` | Wire form for CUDA-IPC blobs. Keep the default — base64 is SGLang's own contract and works on unpatched dynamo (see Prerequisites); `latin1` is a legacy escape hatch. |
-| `verify_weight_sync` | `false` | Probe engine state after each sync. |
+| `verify_weight_sync` | `false` | Best-effort probe: reads one synced parameter back via `get_weights_by_name` after each sync (snapshot refreshed every sync) and raises on mismatch. That API is model-specific and **unimplemented for Qwen2/Qwen3**, so on those models the probe logs `INCONCLUSIVE` at ERROR and verifies nothing — a passing run is not a verified one. |
 | `page_size` | falls back to `thunderagent.router_block_size` | KV-router block size (`--page-size`). |
 | `skip_tokenizer_init` | `false` | Token-in/token-out. |
 | `extra_args` | `[]` | Forwarded verbatim; `dynamo.sglang` exposes the whole `ServerArgs` CLI. |
@@ -656,13 +667,15 @@ a separate verl PR — see the NIXL section.)
 | patch | target | what it does |
 | --- | --- | --- |
 | `dynamo_sglang_incremental_logprobs_11640_backport.patch` | ai-dynamo/dynamo @ `94accc7389` | sglang log-prob fix above (backport of #11640). |
-| `verl_defer_optimizer_load.patch` | verl @ `6cbca9ce` | Three changes: (1) `VERL_DEFER_OPTIMIZER_LOAD` — keep Adam state on CPU through fwd/bwd, load it only for `optimizer.step()`; measured 7.11 GB/GPU freed at the actor-update peak (32-GPU FSDP sharding), required for 30B on 4×8 H100. (2) `VERL_MEM_DEBUG` — OOM allocation-history snapshots. (3) **Raises the default vLLM weight-transfer `bucket_size_mb` from 512 to 4096** (unconditional, no env gate) — review before applying if you tune weight-sync memory. |
+| `verl_defer_optimizer_load.patch` | verl @ `6cbca9ce` | Opt-in `VERL_DEFER_OPTIMIZER_LOAD=1`: keep Adam state on CPU through fwd/bwd, load it only around `optimizer.step()`; measured 7.11 GB/GPU freed at the actor-update peak (32-GPU FSDP sharding). Needed to fit 30B on 2×8 H100; the verified 4×8 run had it off. |
+| `verl_mem_debug_snapshot.patch` | verl @ `6cbca9ce` | Opt-in `VERL_MEM_DEBUG=1`: CUDA allocation-history snapshot dumped on OOM during the actor update. Diagnostic only. |
+| `verl_vllm_bucket_size_4096.patch` | verl @ `6cbca9ce` | **Raises the default vLLM weight-transfer `bucket_size_mb` from 512 to 4096, unconditionally.** Faster refit for the 30B runs, but known to break other paths (DeepSeek-V4 fp8 requantize fails with `CUDA driver error: invalid argument`). Review before applying; `train_30b_dynamo_sglang_4n.sh` applies the same bump with `sed` at runtime. |
 
 Known-good base versions:
 
 | component | version |
 | --- | --- |
 | dynamo | `94accc7389` + `patches/dynamo_sglang_incremental_logprobs_11640_backport.patch` |
-| verl | `6cbca9ce` + `patches/verl_defer_optimizer_load.patch` |
+| verl | `6cbca9ce` (= `REQUIRED_VERL.txt`) + the three `patches/verl_*.patch` above as needed |
 | sglang | 0.5.14 (via `ai_dynamo[sglang]`) |
 | `ai_dynamo` wheels | 1.3.0, local build (`$DYNAMO_WHEELHOUSE` in the launchers) |

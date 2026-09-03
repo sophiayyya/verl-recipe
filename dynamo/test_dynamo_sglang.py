@@ -336,71 +336,6 @@ async def test_memory_occupation_tags_passed_through():
 # --------------------------------------------------------------------------- #
 
 
-class _FakeAdapter:
-    """Stand-in for DynamoHttpServer.sglang_release/sglang_resume.
-
-    The state lives on the node actor, not the per-rank adapter: the actor's sleep()
-    releases memory (and dynamo unregisters the worker from discovery while
-    released), so per-adapter bookkeeping would skip the matching resume and leave
-    the frontend answering 503 forever. These tests pin the actor-side semantics.
-    """
-
-    def __init__(self):
-        self._released_tags: set[str] = set()
-        self.resumed_calls: list[list[str]] = []
-        self.released_calls: list[list[str]] = []
-        self.sleep_level = 2
-
-    async def release(self):
-        tags = ["kv_cache"] if self.sleep_level == 1 else ["kv_cache", "weights"]
-        self.released_calls.append(tags)
-        self._released_tags.update(tags)
-
-    async def resume(self, tags):
-        wanted = [t for t in tags if t in self._released_tags]
-        if not wanted:
-            return
-        self.resumed_calls.append(wanted)
-        self._released_tags.difference_update(wanted)
-
-
-@pytest.mark.asyncio
-async def test_resume_without_prior_release_is_skipped():
-    """verl resumes weights before the FIRST weight sync, when nothing is released.
-
-    Forwarding that to SGLang raises KeyError inside weight_updater.py and kills the
-    scheduler process (observed as ServerDisconnectedError). vLLM tolerates it, which
-    is why verl does it unconditionally.
-    """
-    a = _FakeAdapter()
-    await a.resume(["weights"])
-    assert a.resumed_calls == [], "resume must be skipped when nothing was released"
-
-
-@pytest.mark.asyncio
-async def test_resume_only_covers_released_tags():
-    """A level-1 sleep releases kv_cache only; resuming weights must not be forwarded."""
-    a = _FakeAdapter()
-    a.sleep_level = 1
-    await a.release()
-    await a.resume(["weights"])
-    assert a.resumed_calls == []
-    await a.resume(["kv_cache"])
-    assert a.resumed_calls == [["kv_cache"]]
-
-
-@pytest.mark.asyncio
-async def test_release_resume_round_trip_clears_state():
-    a = _FakeAdapter()
-    await a.release()
-    assert a._released_tags == {"kv_cache", "weights"}
-    await a.resume(["weights", "kv_cache"])
-    assert a._released_tags == set()
-    # A second resume is now a no-op rather than a fatal engine call.
-    await a.resume(["weights"])
-    assert len(a.resumed_calls) == 1
-
-
 # --------------------------------------------------------------------------- #
 # shard index must come from the GLOBAL rank — regression for the TP=2 silent bug
 # --------------------------------------------------------------------------- #
@@ -602,6 +537,39 @@ def test_sleep_frees_weights_at_every_level(level, monkeypatch):
     )
 
 
+class _FakeControlClient:
+    """Stand-in for DynamoSGLangControlClient: records calls, can fail on demand."""
+
+    def __init__(self, idx: int):
+        self.base_url = f"http://shard{idx}"
+        self.calls: list[tuple[str, tuple[str, ...]]] = []
+        self.fail_next: dict[str, int] = {}
+
+    async def _call(self, method, tags):
+        await asyncio.sleep(0)  # force a yield, as the real HTTP fan-out does
+        self.calls.append((method, tuple(tags)))
+        if self.fail_next.get(method, 0) > 0:
+            self.fail_next[method] -= 1
+            raise RuntimeError(f"{self.base_url} {method} failed")
+        return {"success": True}
+
+    async def release_memory_occupation(self, tags):
+        return await self._call("release_memory_occupation", tags)
+
+    async def resume_memory_occupation(self, tags):
+        return await self._call("resume_memory_occupation", tags)
+
+
+def _server_with_shards(n: int = 1, released: set[str] | None = None) -> DynamoHttpServer:
+    server = DynamoHttpServer.__new__(DynamoHttpServer)
+    server._sglang_clients = [_FakeControlClient(i) for i in range(n)]
+    server._engine_control_endpoints = [c.base_url for c in server._sglang_clients]
+    server._sglang_released_by_shard = None if released is None else [set(released) for _ in range(n)]
+    server._sglang_released_tags = set(released or ())
+    server._sglang_tag_lock = None
+    return server
+
+
 def test_release_is_idempotent_per_tag():
     """A second release of a still-released tag must not reach the engine.
 
@@ -617,16 +585,7 @@ def test_release_is_idempotent_per_tag():
     layers away as HTTP 500 "Failed to fold completions stream", with a Triton
     "cpu tensor?" ValueError in the shard log and nothing naming memory release.
     """
-    server = DynamoHttpServer.__new__(DynamoHttpServer)
-    server._sglang_released_tags = set()
-    server._sglang_tag_lock = None
-    sent = []
-
-    async def fake_control_all(method, **kwargs):
-        sent.append((method, tuple(kwargs.get("tags", ()))))
-        return []
-
-    server._sglang_control_all = fake_control_all
+    server = _server_with_shards(1)
 
     # One event loop for the whole sequence: the lock is created lazily and binds
     # to the loop it was made in, which is exactly how the Ray async actor runs it.
@@ -637,11 +596,11 @@ def test_release_is_idempotent_per_tag():
 
     asyncio.run(main())
 
-    assert sent == [
+    assert server._sglang_clients[0].calls == [
         ("release_memory_occupation", ("kv_cache", "weights")),
         ("resume_memory_occupation", ("kv_cache", "weights")),  # widened
         ("release_memory_occupation", ("kv_cache", "weights")),
-    ], sent
+    ]
     assert server._sglang_released_tags == {"kv_cache", "weights"}
 
 
@@ -652,25 +611,17 @@ def test_release_and_resume_guards_are_symmetric():
     and the release guard was not — one bug fixed, its sibling left in place.
     This asserts the pair, so neither can regress alone.
     """
-    server = DynamoHttpServer.__new__(DynamoHttpServer)
-    server._sglang_released_tags = set()
-    server._sglang_tag_lock = None
-    sent = []
-
-    async def fake_control_all(method, **kwargs):
-        sent.append(method)
-        return []
-
-    server._sglang_control_all = fake_control_all
+    server = _server_with_shards(1)
+    calls = server._sglang_clients[0].calls
 
     async def main():
         await server.sglang_resume(["weights"])    # never released -> no call
-        assert sent == []
+        assert calls == []
         await server.sglang_release(["weights"])
         await server.sglang_release(["weights"])   # already released -> no call
 
     asyncio.run(main())
-    assert sent == ["release_memory_occupation"]
+    assert [m for m, _ in calls] == ["release_memory_occupation"]
 
 
 def test_concurrent_release_reaches_engine_once():
@@ -687,17 +638,7 @@ def test_concurrent_release_reaches_engine_once():
     torch_memory_saver, and the next prefill dies in a Triton kernel with
     "Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)".
     """
-    server = DynamoHttpServer.__new__(DynamoHttpServer)
-    server._sglang_released_tags = set()
-    server._sglang_tag_lock = None
-    calls = []
-
-    async def fake_control_all(method, **kwargs):
-        calls.append((method, tuple(kwargs.get("tags", ()))))
-        await asyncio.sleep(0)  # force a yield, as the real HTTP fan-out does
-        return []
-
-    server._sglang_control_all = fake_control_all
+    server = _server_with_shards(1)
 
     async def main():
         await asyncio.gather(*[server.sglang_release(["kv_cache", "weights"]) for _ in range(4)])
@@ -705,12 +646,12 @@ def test_concurrent_release_reaches_engine_once():
 
     asyncio.run(main())
 
-    assert calls == [
+    assert server._sglang_clients[0].calls == [
         ("release_memory_occupation", ("kv_cache", "weights")),
         # widened: a partial resume would put the shard back in the routing pool
         # with its kv_cache still released
         ("resume_memory_occupation", ("kv_cache", "weights")),
-    ], calls
+    ]
     assert server._sglang_released_tags == set()
 
 
@@ -724,20 +665,64 @@ def test_partial_resume_is_widened_to_every_released_tag():
     in write_req_to_token_pool_triton with "cpu tensor?", surfacing to the trainer
     as 257 unexplained HTTP 500s.
     """
-    server = DynamoHttpServer.__new__(DynamoHttpServer)
-    server._sglang_released_tags = {"kv_cache", "weights"}
-    server._sglang_tag_lock = None
-    sent = []
-
-    async def fake_control_all(method, **kwargs):
-        sent.append((method, tuple(sorted(kwargs.get("tags", ())))))
-        return []
-
-    server._sglang_control_all = fake_control_all
+    server = _server_with_shards(1, released={"kv_cache", "weights"})
     asyncio.run(server.sglang_resume(["weights"]))
 
-    assert sent == [("resume_memory_occupation", ("kv_cache", "weights"))]
+    assert server._sglang_clients[0].calls == [("resume_memory_occupation", ("kv_cache", "weights"))]
     assert server._sglang_released_tags == set()
+
+
+def test_partial_fanout_failure_is_tracked_per_shard():
+    """A release that fails on one shard must not be re-sent to the shards it reached.
+
+    The engine state is per shard; an all-or-nothing node-level record would leave
+    the successful shards marked "not released" and the retry would release them a
+    second time — the same torch_memory_saver double-unbind as the idempotency test,
+    reached through a transient HTTP failure instead of a resume ordering quirk.
+    """
+    server = _server_with_shards(4)
+    server._sglang_clients[3].fail_next["release_memory_occupation"] = 1
+
+    async def main():
+        with pytest.raises(RuntimeError, match="failed on shard"):
+            await server.sglang_release(["kv_cache", "weights"])
+        # shards 0-2 succeeded and are recorded; only shard 3 is still resident
+        assert [len(c.calls) for c in server._sglang_clients] == [1, 1, 1, 1]
+        assert server._sglang_released_by_shard[0] == {"kv_cache", "weights"}
+        assert server._sglang_released_by_shard[3] == set()
+        # retry touches ONLY the failed shard
+        await server.sglang_release(["kv_cache", "weights"])
+        assert [len(c.calls) for c in server._sglang_clients] == [1, 1, 1, 2]
+        assert all(s == {"kv_cache", "weights"} for s in server._sglang_released_by_shard)
+        # resume fans out to every shard exactly once and clears them all
+        await server.sglang_resume(["weights"])
+        assert [c.calls[-1] for c in server._sglang_clients] == [
+            ("resume_memory_occupation", ("kv_cache", "weights"))
+        ] * 4
+        assert server._sglang_released_tags == set()
+
+    asyncio.run(main())
+
+
+def test_sglang_refuses_memory_saver_flag_split():
+    """free_cache_engine=true with enable_sleep_mode=false must be rejected at launch.
+
+    --enable-memory-saver follows enable_sleep_mode, the adapter's release calls
+    follow free_cache_engine. Split, release_memory_occupation still deregisters the
+    worker from discovery but frees nothing, and the trainer OOMs with no log line
+    naming the cause.
+    """
+    server = _make_server(
+        {"engine": "sglang", "request_completion_token_ids": True},
+        enable_sleep_mode=False,
+        free_cache_engine=True,
+    )
+    server.replica_rank = 0
+    server.node_rank = 0
+    server._cuda_visible_devices = "0"
+    server._worker_specs = None
+    with pytest.raises(ValueError, match="enable_sleep_mode"):
+        server._start_vllm_workers()
 
 
 def test_facade_imports_without_vllm(monkeypatch):

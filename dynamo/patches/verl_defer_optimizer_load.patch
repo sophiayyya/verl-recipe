@@ -1,47 +1,10 @@
-diff --git a/verl/workers/engine/base.py b/verl/workers/engine/base.py
-index 161faed0..b1b6e388 100644
---- a/verl/workers/engine/base.py
-+++ b/verl/workers/engine/base.py
-@@ -124,7 +124,38 @@ class BaseEngine:
-         maybe_fix_3d_position_ids(data)
- 
-         self.optimizer_zero_grad()
--        outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-+        # VERL_MEM_DEBUG: attribute the actor-update peak. Reasoning from config alone
-+        # could not explain ~58 GB of the 72 GB seen on Qwen3-30B-A3B/16xH100, so record
-+        # allocation stacks and dump them when the OOM actually fires. The snapshot is
-+        # readable with torch.cuda._memory_viz; the summary goes straight to the log.
-+        _mem_debug = os.environ.get("VERL_MEM_DEBUG", "0") == "1"
-+        if _mem_debug:
-+            import torch
-+
-+            torch.cuda.memory._record_memory_history(max_entries=200000)
-+        try:
-+            outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-+        except Exception:
-+            if _mem_debug:
-+                import traceback
-+
-+                import torch
-+
-+                rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-+                out_dir = os.environ.get("VERL_MEM_DEBUG_DIR", "/tmp")
-+                try:
-+                    os.makedirs(out_dir, exist_ok=True)
-+                    torch.cuda.memory._dump_snapshot(f"{out_dir}/oom_rank{rank}.pickle")
-+                except Exception:
-+                    traceback.print_exc()
-+                print(f"[VERL_MEM_DEBUG rank={rank}] snapshot -> {out_dir}/oom_rank{rank}.pickle", flush=True)
-+                print(torch.cuda.memory_summary(abbreviated=False), flush=True)
-+            raise
-+        finally:
-+            if _mem_debug:
-+                import torch
-+
-+                torch.cuda.memory._record_memory_history(enabled=None)
-         grad_norm = self.optimizer_step()
-         if self.is_mp_src_rank_with_outputs():
-             assert "grad_norm" not in outputs["metrics"]
+Target: verl @ 6cbca9ce7208100d11b4d1b06eccf098cc9e76aa
+Apply:  cd $VERL_CHECKOUT && git apply recipe/dynamo/patches/<this file>
+
+VERL_DEFER_OPTIMIZER_LOAD=1: keep Adam state on CPU through forward/backward and load it only around optimizer.step().
+
+Opt-in via env var; off by default. Measured 7.11 GB/GPU freed at the actor-update peak (Qwen3-30B-A3B, 32-GPU FSDP).
+Needed to fit 30B GRPO on 2x8 H100; the verified 4x8 runs (job 17562481) ran with it OFF.
 diff --git a/verl/workers/engine/fsdp/transformer_impl.py b/verl/workers/engine/fsdp/transformer_impl.py
 index d31c53a7..516e9027 100644
 --- a/verl/workers/engine/fsdp/transformer_impl.py
@@ -124,16 +87,3 @@ index d31c53a7..516e9027 100644
      def __enter__(self):
          assert isinstance(self.engine, FSDPEngine)
          super().__enter__()
-diff --git a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
-index e679b2b3..6680e735 100644
---- a/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
-+++ b/verl/workers/rollout/vllm_rollout/bucketed_weight_transfer.py
-@@ -87,7 +87,7 @@ class BucketedWeightSender:
-     def __init__(
-         self,
-         zmq_handle: str,
--        bucket_size_mb: int = 512,
-+        bucket_size_mb: int = 4096,
-         use_shm: bool = False,
-     ):
-         self.zmq_handle = zmq_handle

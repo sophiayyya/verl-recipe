@@ -61,7 +61,7 @@ MSG
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 
 # Argument set mirrors the proven vLLM dynamo runs in
-# $B/verl/recipe/dynamo/train_30b_rl_dynamo_kv_i100_metrics.sh rather than being
+# recipe/dynamo/train_30b_rl_dynamo_kv_metrics.sh rather than being
 # derived from first principles — deriving it independently already cost one
 # failed run (missing ppo_micro_batch_size_per_gpu). Two things it gets right that
 # the naive version did not:
@@ -72,16 +72,13 @@ export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 # dynamo_rollout.ServerAdapter dispatches on that key, so there is no sglang-specific
 # registry name, trainer yaml or entry point.
 #
-# Entry point is recipe.dynamo.main_dynamo (the recipe's own, pre-existing one) and
-# NOT verl.trainer.main_ppo. That is a core-verl constraint, not an sglang one: at
-# this checkout (6cbca9ce) main_ppo selects TaskRunnerV1, whose _validate builds a
-# TensorDict (ppo/v1/trainer_base.py:988) and hands it to
-# agent_loop.generate_sequences, which still does prompts.non_tensor_batch (verl PR
-# #6572, landed after REQUIRED_VERL.txt's pin d82d2777) ->
+# Entry point is verl.trainer.main_ppo with trainer.use_v1=False. That flag is a
+# core-verl constraint, not an sglang one: at this checkout (6cbca9ce) the default
+# TaskRunnerV1 builds a TensorDict (ppo/v1/trainer_base.py:988) and hands it to
+# agent_loop.generate_sequences, which still does prompts.non_tensor_batch ->
 #   AttributeError: 'TensorDict' object has no attribute 'non_tensor_batch'
-# It breaks the vLLM dynamo path identically. main_dynamo.py imports
-# main_ppo_v0.TaskRunner precisely to force the v0 trainer, which still passes
-# DataProto.
+# It breaks the vLLM dynamo path identically; the v0 TaskRunner still passes
+# DataProto. (recipe.dynamo.main_dynamo remains as a shim that pins the same.)
 COMMON_ARGS=(
     algorithm.adv_estimator=grpo
     algorithm.use_kl_in_reward=False
@@ -118,10 +115,8 @@ COMMON_ARGS=(
     # ("only support equal chunk. Got size of DataProto 1 and chunk 8"). The default
     # is 8 workers, which cannot divide a smoke-sized batch of 1.
     actor_rollout_ref.rollout.agent.num_workers=1
-    # '++' not '+': dynamo_sglang_trainer.yaml already defines this key, so a
-    # bare '+' (append) errors with "An item is already at ...". The proven
-    # scripts can use '+' only because they go through main_ppo, which has no
-    # recipe yaml underneath it.
+    # '++' not '+': config/dynamo_trainer.yaml already defines this key, so a
+    # bare '+' (append) errors with "An item is already at ...".
     ++actor_rollout_ref.rollout.agent.agent_loop_manager_class=recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_engine_data=true

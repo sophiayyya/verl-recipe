@@ -235,6 +235,12 @@ class DynamoHttpServer:
         # adapter believed nothing was released, skipped the resume, and left the
         # frontend answering 503 "Model is not ready to serve requests yet".
         self._sglang_released_tags: set[str] = set()
+        # Per-shard truth behind the node-level view above (index = local shard
+        # index, same order as _engine_control_endpoints). A fan-out can succeed on
+        # some shards and fail on others; recording only the all-or-nothing outcome
+        # let the next release re-release the shards that had already succeeded
+        # (the torch_memory_saver double-unbind described in sglang_release).
+        self._sglang_released_by_shard: list[set[str]] | None = None
         # Guards the check-then-act in sglang_release/sglang_resume. Ray async
         # actors run methods concurrently on one event loop, and every shard's
         # adapter on this node calls in parallel (4 shards at TP=2 on 8 GPUs), so
@@ -309,6 +315,17 @@ class DynamoHttpServer:
             self._sglang_tag_lock = asyncio.Lock()
         return self._sglang_tag_lock
 
+    def _sglang_shard_state(self) -> list[set[str]]:
+        """Per-shard released-tag sets, sized lazily to the number of control clients."""
+        n = len(self._sglang_control_clients())
+        if self._sglang_released_by_shard is None or len(self._sglang_released_by_shard) != n:
+            self._sglang_released_by_shard = [set() for _ in range(n)]
+        return self._sglang_released_by_shard
+
+    def _refresh_node_released_view(self) -> None:
+        shards = self._sglang_released_by_shard or []
+        self._sglang_released_tags = set().union(*shards) if shards else set()
+
     async def sglang_release(self, tags: list[str]):
         """Release only tags not already released; double-release corrupts the pool.
 
@@ -329,15 +346,36 @@ class DynamoHttpServer:
         names memory release, so the guard has to be here.
         """
         async with self._tag_lock():
-            wanted = [t for t in tags if t not in self._sglang_released_tags]
-            if not wanted:
+            per_shard = self._sglang_shard_state()
+            targets = []
+            for idx, released in enumerate(per_shard):
+                wanted = [t for t in tags if t not in released]
+                if wanted:
+                    targets.append((idx, wanted))
+            if not targets:
                 logger.info("[DynamoHttpServer] sglang release%s skipped, already released (released=%s)",
                             list(tags), sorted(self._sglang_released_tags))
                 return
-            await self._sglang_control_all("release_memory_occupation", tags=wanted)
-            self._sglang_released_tags.update(wanted)
-            logger.info("[DynamoHttpServer] sglang released %s (now released=%s)", wanted,
+            outcomes = await self._sglang_control_fanout(
+                "release_memory_occupation", [(idx, {"tags": wanted}) for idx, wanted in targets]
+            )
+            errors = []
+            for (idx, wanted), result in zip(targets, outcomes, strict=True):
+                if isinstance(result, Exception):
+                    errors.append((idx, result))
+                else:
+                    per_shard[idx].update(wanted)
+            self._refresh_node_released_view()
+            logger.info("[DynamoHttpServer] sglang released %s on %d/%d shard(s) (now released=%s)",
+                        sorted({t for _, w in targets for t in w}), len(targets) - len(errors), len(targets),
                         sorted(self._sglang_released_tags))
+            if errors:
+                # Successful shards are already recorded above, so a retry only
+                # touches the ones that failed instead of double-releasing the rest.
+                raise RuntimeError(
+                    f"dynamo.sglang release_memory_occupation failed on shard(s) {errors}; "
+                    f"state recorded per shard, retry will skip the {len(targets) - len(errors)} that succeeded"
+                )
 
     async def sglang_resume(self, tags: list[str]):
         """Resume only tags actually released; resuming others kills the scheduler.
@@ -349,7 +387,9 @@ class DynamoHttpServer:
         nothing has been released — so this filter is load-bearing, not defensive.
         """
         async with self._tag_lock():
-            if not self._sglang_released_tags:
+            per_shard = self._sglang_shard_state()
+            targets = [(idx, sorted(released)) for idx, released in enumerate(per_shard) if released]
+            if not targets:
                 logger.info("[DynamoHttpServer] sglang resume%s skipped (released=%s)", list(tags),
                             sorted(self._sglang_released_tags))
                 return
@@ -367,14 +407,41 @@ class DynamoHttpServer:
             # which reached the trainer only as 257x HTTP 500 "Failed to fold
             # completions stream" (job 16441143). Resuming kv_cache early is safe: its
             # contents are stale, and the weight sync's flush_cache drops them.
-            wanted = sorted(self._sglang_released_tags)
-            if set(wanted) != set(tags):
+            widened = sorted({t for _, w in targets for t in w})
+            if set(widened) != set(tags):
                 logger.info("[DynamoHttpServer] sglang resume%s widened to %s so the shard "
-                            "does not rejoin discovery half-restored", list(tags), wanted)
-            await self._sglang_control_all("resume_memory_occupation", tags=wanted)
-            self._sglang_released_tags.difference_update(wanted)
-            logger.info("[DynamoHttpServer] sglang resumed %s (now released=%s)", wanted,
-                        sorted(self._sglang_released_tags))
+                            "does not rejoin discovery half-restored", list(tags), widened)
+            outcomes = await self._sglang_control_fanout(
+                "resume_memory_occupation", [(idx, {"tags": wanted}) for idx, wanted in targets]
+            )
+            errors = []
+            for (idx, wanted), result in zip(targets, outcomes, strict=True):
+                if isinstance(result, Exception):
+                    errors.append((idx, result))
+                else:
+                    per_shard[idx].difference_update(wanted)
+            self._refresh_node_released_view()
+            logger.info("[DynamoHttpServer] sglang resumed %s on %d/%d shard(s) (now released=%s)",
+                        widened, len(targets) - len(errors), len(targets), sorted(self._sglang_released_tags))
+            if errors:
+                raise RuntimeError(
+                    f"dynamo.sglang resume_memory_occupation failed on shard(s) {errors}; "
+                    f"state recorded per shard, retry will skip the {len(targets) - len(errors)} that succeeded"
+                )
+
+    async def _sglang_control_fanout(self, method: str, targets: list[tuple[int, dict]]) -> list:
+        """Call ``method(**kwargs)`` on the selected shards concurrently.
+
+        Returns one entry per target, in order; a failed shard yields its exception
+        instead of raising, so callers can record which shards succeeded.
+        """
+        clients = self._sglang_control_clients()
+        if not targets:
+            return []
+        return await asyncio.gather(
+            *[getattr(clients[idx], method)(**kw) for idx, kw in targets],
+            return_exceptions=True,
+        )
 
     async def _sglang_control_all(self, method: str, *args, **kwargs):
         """Fan a control call out to every local sglang shard, concurrently.
@@ -382,7 +449,9 @@ class DynamoHttpServer:
         Same rationale as ``_engine_method_all``'s parallel dispatch: several of
         these (weight refit, memory release) are synchronization points inside the
         engine, and serialising them across shards deadlocks when the trainer side
-        is waiting on all shards to arrive together.
+        is waiting on all shards to arrive together. Raises if any shard failed;
+        release/resume use ``_sglang_control_fanout`` instead because they must
+        record partial success.
         """
         clients = self._sglang_control_clients()
         if not clients:
@@ -783,6 +852,22 @@ class DynamoHttpServer:
                     "(the default False yields no token ids on sglang: engine_data is "
                     "a vLLM-only channel, so generation silently trains on re-encoded "
                     "text). Set it to false explicitly if you really intend that."
+                )
+            # The two halves of memory release are gated on different verl flags:
+            # --enable-memory-saver (arms torch_memory_saver) follows
+            # rollout.enable_sleep_mode, while the adapter's release/resume calls
+            # follow rollout.free_cache_engine. With sleep_mode off and
+            # free_cache_engine on, release_memory_occupation still runs -- dynamo
+            # deregisters the worker from discovery -- but frees nothing, and the
+            # trainer OOMs with no log line naming the cause. Refuse the split.
+            if is_sglang and getattr(self.config, "free_cache_engine", True) and not getattr(
+                self.config, "enable_sleep_mode", True
+            ):
+                raise ValueError(
+                    "engine=sglang: rollout.free_cache_engine=true requires "
+                    "rollout.enable_sleep_mode=true (it adds --enable-memory-saver; "
+                    "without it release_memory_occupation deregisters the worker but "
+                    "frees no GPU memory). Set both true, or both false."
                 )
             system_metrics_port = (
                 self._allocate_stable_node_port(_SYSTEM_METRICS_PORT_BASE, spec_idx, window=8)
@@ -1509,7 +1594,7 @@ class DynamoHttpServer:
         max_tokens = sp.pop("max_tokens", None) or sp.pop("max_new_tokens", None)
         if max_tokens is None:
             max_tokens = max(
-                0,
+                1,
                 min(
                     self.config.response_length,
                     self.config.prompt_length + self.config.response_length - len(prompt_token_ids),
@@ -1642,14 +1727,14 @@ class DynamoHttpServer:
         max_tokens = sp.pop("max_tokens", None) or sp.pop("max_new_tokens", None)
         if max_tokens is None:
             max_tokens = max(
-                0,
+                1,
                 min(
                     self.config.response_length,
                     self.config.prompt_length + self.config.response_length - len(prompt_token_ids),
                 ),
             )
-        max_possible_tokens = max(0, self.config.prompt_length + self.config.response_length - len(prompt_token_ids))
-        sp["max_tokens"] = int(max(0, min(max_tokens, max_possible_tokens)))
+        max_possible_tokens = max(1, self.config.prompt_length + self.config.response_length - len(prompt_token_ids))
+        sp["max_tokens"] = int(max(1, min(max_tokens, max_possible_tokens)))
         sp["logprobs"] = 0 if sp.pop("logprobs", False) else None
         sp.pop("prompt_logprobs", None)
         sp.setdefault("repetition_penalty", getattr(self.config, "repetition_penalty", 1.0))
@@ -1711,10 +1796,25 @@ class DynamoHttpServer:
         self._log_engine_data_token_ids_status(choice, data)
         token_ids = self._extract_completion_token_ids(choice, data, tokenizer)
         if token_ids is None:
-            logger.warning(
-                "Dynamo frontend response did not include parseable token ids; falling back to text encode. "
-                "For strict token-in/token-out parity, expose generated token ids in the frontend response."
-            )
+            if self._request_completion_token_ids():
+                # Token ids were explicitly requested and the frontend still returned
+                # none: re-encoding the text would make the trainer score tokens the
+                # engine never sampled, with every metric staying plausible. Fail.
+                raise RuntimeError(
+                    "Dynamo frontend response carried no parseable token ids although "
+                    "request_completion_token_ids=true; refusing to re-encode the text. "
+                    f"Check the dynamo build/frontend flags. Response: {str(data)[:500]}"
+                )
+            self._text_reencode_hits = getattr(self, "_text_reencode_hits", 0) + 1
+            hits = self._text_reencode_hits
+            if hits <= 3 or hits % 100 == 0:
+                logger.error(
+                    "Dynamo frontend response did not include parseable token ids; falling back to "
+                    "re-encoding the response text (hit #%d). The trainer is scoring re-tokenized text, "
+                    "not the engine's sampled tokens. Set "
+                    "engine_kwargs.dynamo.request_completion_token_ids=true for token-in/token-out.",
+                    hits,
+                )
             token_ids = normalize_token_ids(tokenizer.encode(text, add_special_tokens=False))
         if not token_ids:
             raise RuntimeError(f"Dynamo frontend returned an empty completion: {data}")
