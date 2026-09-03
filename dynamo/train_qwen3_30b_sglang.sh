@@ -1,12 +1,5 @@
 #!/bin/bash
-# Qwen3-30B retool RL through Dynamo + SGLang on 4 nodes -- the A/B partner of
-# baseline_qwen3_30b_sglang_native.sh.
-#
-# Generated FROM that script by reverting only the rollout path (rollout.name, the
-# engine_kwargs.dynamo.* block, the dynamo agent-loop manager, and
-# VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register). Everything else -- image, node
-# orchestration, memory fixes, checkpoint/resume, wandb -- is byte-identical, so a
-# comparison between the two isolates the rollout backend and nothing else.
+# Qwen3-30B retool RL through Dynamo + SGLang on 4 nodes.
 #SBATCH --job-name=verl-dyn-sglang-i100
 #SBATCH --account=coreai_dlalgo_llm
 #SBATCH --partition=batch

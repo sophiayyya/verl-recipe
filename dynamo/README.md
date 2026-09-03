@@ -161,7 +161,6 @@ conditional install, never a baked image.
 | --- | --- | --- |
 | [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below). |
 | [`train_qwen3_30b_sglang.sh`](train_qwen3_30b_sglang.sh) | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
-| [`baseline_qwen3_30b_sglang_native.sh`](baseline_qwen3_30b_sglang_native.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
 
 ## NIXL weight sync (checkpoint engine)
 
