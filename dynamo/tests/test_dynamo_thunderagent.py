@@ -533,7 +533,7 @@ def test_recipe_pins_tested_verl_and_dynamo_revisions() -> None:
     repository_readme = (REPOSITORY_ROOT / "README.md").read_text()
 
     assert "MODE=pinned_commit" in required_verl
-    assert "COMMIT=d82d2777b5dc3e96a8a45168d02660312707ab98" in required_verl
+    assert "COMMIT=6cbca9ce7208100d11b4d1b06eccf098cc9e76aa" in required_verl
     assert "59d614641837e593f0567b79d75394aae5f864e0" in readme
     assert "dynamo/REQUIRED_VERL.txt" in repository_readme
 
