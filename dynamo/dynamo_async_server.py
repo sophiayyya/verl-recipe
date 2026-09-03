@@ -2115,7 +2115,7 @@ class DynamoHttpServer:
 
         Padding is LOUD and non-catastrophic. See _logprob_fill_value for why the pad
         value is the sequence mean and not 0.0. The padding itself is a symptom: the
-        engine returns one fewer logprob than token ids (HANDOFF 21.4), and the real
+        engine returns one fewer logprob than token ids, and the real
         fix belongs on the dynamo side.
         """
         raw = list(values[:token_count])

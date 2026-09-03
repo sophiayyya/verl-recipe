@@ -26,7 +26,7 @@ trainer and the engine workers share GPUs the same way the native backends do.
 [Agent-loop RL](#running-a-full-agent-loop-rl-run) ·
 [ThunderAgent](#thunderagent-extension) ·
 [SGLang engine](#sglang-engine-engine_kwargsdynamoenginesglang) ·
-[Sibling-repo patches](#patches-for-repos-outside-this-recipe)
+[Sibling-repo changes](#changes-required-in-sibling-repos)
 
 ## How it works
 
@@ -78,7 +78,6 @@ Request routing happens inside Dynamo's KV router, **not** in verl's
 | [`metrics_sidecar.py`](metrics_sidecar.py) | Optional per-worker system-status / metrics scraper. |
 | [`test_dynamo_sglang.py`](test_dynamo_sglang.py) | CPU unit tests for the sglang path (adapter invariants, payload shapes, fail-fast rules). |
 | [`check_continuations.py`](check_continuations.py) | Guard script: rejects launcher scripts where a comment interrupts a `\` line-continuation chain (which silently drops every following CLI arg). |
-| [`patches/`](patches/) | Required changes to sibling repos (dynamo, verl) as `git apply`-able diffs — see [Sibling-repo patches](#patches-for-repos-outside-this-recipe). |
 
 Enable the backend by pointing verl at the recipe's registration module:
 
@@ -124,8 +123,7 @@ recipe on the pinned checkout (`6cbca9ce`):
 
 [`main_dynamo.py`](main_dynamo.py) remains as a shim that applies the same pinning
 programmatically. Both engines are verified on this entry: sglang 4-node retool GRPO
-(job 17581380, pearson 0.9994) and the vLLM KV-metrics validation (job 17581381,
-`rc=0`).
+(pearson 0.9994) and the vLLM KV-metrics validation (`rc=0`).
 
 ### 1. Generation-only smoke
 
@@ -166,7 +164,7 @@ conditional install, never a baked image.
 | --- | --- | --- |
 | [`train_30b_rl_dynamo_kv_metrics.sh`](train_30b_rl_dynamo_kv_metrics.sh) | vLLM | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below). |
 | [`validate_vllm_kv_metrics.sbatch`](validate_vllm_kv_metrics.sbatch) | vLLM | 3-step validation with KV metrics; the acceptance gate used for the vLLM path. |
-| [`train_qwen3_30b_sglang.sh`](train_qwen3_30b_sglang.sh) | sglang | The verified 100-step retool GRPO run (job 17562481). Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
+| [`train_qwen3_30b_sglang.sh`](train_qwen3_30b_sglang.sh) | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
 | [`baseline_qwen3_30b_sglang_native.sh`](baseline_qwen3_30b_sglang_native.sh) | — | **Baseline**: verl's native `rollout.name=sglang`, no Dynamo, for A/B comparison. |
 
 ## NIXL weight sync (checkpoint engine)
@@ -452,10 +450,6 @@ actor_rollout_ref.rollout.name=dynamo \
 ++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
 ```
 
-Full design and rollout plan: [DESIGN_sglang_backend.md](DESIGN_sglang_backend.md).
-Debugging history, failure catalog, and methodology notes: [HANDOFF.md](HANDOFF.md)
-(internal, Chinese-language, cluster-specific working log — kept for provenance, not a user guide).
-
 ### What is different from the vLLM path
 
 | | vLLM | SGLang |
@@ -482,16 +476,16 @@ optional metrics extra and becomes the whole control plane —
      it downgrades vLLM's guided-decoding deps (see [Quick start §3](#3-multi-node-30b-rl));
    - the 30B launchers use an image that already ships sglang (`verl_sgl0512.dev4`:
      sglang 0.5.12 / transformers 5.3.0) and install the dynamo wheels `--no-deps`.
-2. **The log-prob fidelity patch** —
-   [required for trustworthy rollout log-probs](#engine-log-prob-fidelity-incremental-vs-cumulative-fix-required-patch);
-   apply `patches/dynamo_sglang_incremental_logprobs_11640_backport.patch` to the
-   dynamo checkout.
+2. **The log-prob fidelity fix** —
+   [required for trustworthy rollout log-probs](#engine-log-prob-fidelity-incremental-vs-cumulative-fix-required-fix):
+   a dynamo build that includes upstream #11640, or its log-prob portion
+   backported onto `94accc7389` (three files, described in that section).
 3. **No patching needed for the weight-sync payload.** The CUDA-IPC blobs go on
    the wire base64-encoded, which is SGLang's own contract:
    `serialized_named_tensors` is typed `List[Union[str, bytes]]` and
    `MultiprocessingSerializer.deserialize` b64-decodes any `str`. Verified
-   end-to-end against an unmodified dynamo 1.3.0 + sglang 0.5.14 on an H100
-   (job 16215105). Note a malformed payload does **not** return an error — it
+   end-to-end against an unmodified dynamo 1.3.0 + sglang 0.5.14 on an H100.
+   Note a malformed payload does **not** return an error — it
    kills the worker process.
 4. **`--enable-memory-saver`** is added automatically when
    `rollout.enable_sleep_mode=true`; without it SGLang's torch_memory_saver
@@ -515,7 +509,7 @@ bash recipe/dynamo/smoke_dynamo_sglang.sh
 # 2-step GRPO incl. weight sync + sleep/wake (M2)
 STAGE=train bash recipe/dynamo/smoke_dynamo_sglang.sh
 
-# the verified 4-node 30B run (100 steps; defaults = job 17562481)
+# the verified 4-node 30B run (100 steps; defaults reproduce it)
 sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
 # shorter: sbatch --export=ALL,TOTAL_STEPS=3 recipe/dynamo/train_qwen3_30b_sglang.sh
 ```
@@ -540,12 +534,12 @@ sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
 - **SGLang-native streaming `/generate`** (token-in/token-out) — needs a dynamo
   build with [#11640](https://github.com/ai-dynamo/dynamo/pull/11640);
   generation currently goes through the same frontend `/v1/completions` path as
-  vLLM. (Our `patches/` backport covers only the log-prob portion of #11640,
-  not the `/generate` endpoint itself.)
+  vLLM. (Only the log-prob portion of #11640 is needed by this recipe, not the
+  `/generate` endpoint itself.)
 
-### Engine log-prob fidelity: incremental-vs-cumulative fix (required patch)
+### Engine log-prob fidelity: incremental-vs-cumulative fix (required fix)
 
-**Status: fixed and verified end-to-end (2026-09-01).** Requires the dynamo-side patch below.
+**Status: fixed and verified end-to-end (2026-09-01).** Requires the dynamo-side fix below.
 
 **Symptom.** With the sglang engine, the outlier-sensitive rollout-vs-actor
 diagnostics are destroyed, while k1 KL is silently biased but still lands in a
@@ -557,7 +551,7 @@ plausible range — which is exactly why the bug hides:
 | `rollout_corr/k3_kl` | up to 1635 | 0.0020 |
 | `rollout_corr/kl` (k1) | 0.0032 – 0.0037 (looks plausible!) | 0.0020 |
 
-A dynamo+vLLM reference run (job 17017864, 3 steps) shows the same healthy
+A dynamo+vLLM reference run (3 steps) shows the same healthy
 profile as native sglang: pearson 0.9993, k3_kl 0.0019.
 
 In the default recipe config, training itself learns normally despite this —
@@ -580,15 +574,9 @@ the signature above.
 **Fix.** Backport of the log-prob portion of upstream
 [ai-dynamo/dynamo#11640](https://github.com/ai-dynamo/dynamo/pull/11640)
 (the PR title does not mention log-probs — the fix ships inside the
-engine-native generate endpoint work; search by file, not by subject). Apply on
-top of dynamo `94accc7389`:
-
-```bash
-cd $DYNAMO_CHECKOUT
-git apply $RECIPE/dynamo/patches/dynamo_sglang_incremental_logprobs_11640_backport.patch
-```
-
-Three files: `common/backend/logprobs.py` (slice the chunk head instead of a
+engine-native generate endpoint work; search by file, not by subject). Either
+build dynamo from a commit that already contains #11640, or backport its
+log-prob portion (~20 lines) onto `94accc7389`. Three files: `common/backend/logprobs.py` (slice the chunk head instead of a
 running cursor), `sglang/request_handlers/llm/decode_handler.py` and
 `sglang/llm_engine.py` (pass `num_output_tokens_in_chunk=len(output_ids)`, drop
 the cursor state, fix the comments that still described the old cumulative
@@ -607,7 +595,7 @@ semantics).
 - Each sglang worker gets an explicitly allocated `--nccl-port`
   (fixes `EADDRINUSE` when several workers share a node).
 
-**Verification** — job 17562481: Qwen3-30B-A3B-Base retool GRPO, 4 nodes × 8 H100,
+**Verification** — Qwen3-30B-A3B-Base retool GRPO, 4 nodes × 8 H100,
 CUDA graph on, **no** `--stream-interval` workaround, 100 steps in 2h07
 (65.5 s/step), 0 padding events, 0 OOM. Against a native-sglang run
 (`rollout.name=sglang`, no dynamo) over the native run's full 21 steps:
@@ -653,29 +641,26 @@ construction. Candidates: CUDA graph (on for dynamo, eager for native in all
 data so far) and sampling-parameter passthrough at the OpenAI frontend. Not yet
 root-caused.
 
-## Patches for repos outside this recipe
+## Changes required in sibling repos
 
-This branch only carries `recipe/` files. Changes required in sibling repos
-live in [`patches/`](patches/) and must be applied to the corresponding
-checkouts by hand. This is sufficient — no wheel rebuild: the launch scripts
-prepend `$DYNAMO_SRC/components/src` to `PYTHONPATH`, which shadows the
-installed `ai_dynamo` wheel, and run verl from the checkout mounted as
-`$VERL_SRC_IN_CONTAINER`. (One exception is not shipped here: the NIXL
-LIBFABRIC path needs a `backends` kwarg on `NIXLCheckpointEngine`, pending as
-a separate verl PR — see the NIXL section.)
+This branch only carries `recipe/` files; the changes below live in the
+corresponding checkouts. No wheel rebuild is needed: the launch scripts prepend
+`$DYNAMO_SRC/components/src` to `PYTHONPATH`, which shadows the installed
+`ai_dynamo` wheel, and run verl from the checkout mounted as
+`$VERL_SRC_IN_CONTAINER`.
 
-| patch | target | what it does |
+| repo | change | status |
 | --- | --- | --- |
-| `dynamo_sglang_incremental_logprobs_11640_backport.patch` | ai-dynamo/dynamo @ `94accc7389` | sglang log-prob fix above (backport of #11640). |
-| `verl_defer_optimizer_load.patch` | verl @ `6cbca9ce` | Opt-in `VERL_DEFER_OPTIMIZER_LOAD=1`: keep Adam state on CPU through fwd/bwd, load it only around `optimizer.step()`; measured 7.11 GB/GPU freed at the actor-update peak (32-GPU FSDP sharding). Needed to fit 30B on 2×8 H100; the verified 4×8 run had it off. |
-| `verl_mem_debug_snapshot.patch` | verl @ `6cbca9ce` | Opt-in `VERL_MEM_DEBUG=1`: CUDA allocation-history snapshot dumped on OOM during the actor update. Diagnostic only. |
-| `verl_vllm_bucket_size_4096.patch` | verl @ `6cbca9ce` | **Raises the default vLLM weight-transfer `bucket_size_mb` from 512 to 4096, unconditionally.** Faster refit for the 30B runs, but known to break other paths (DeepSeek-V4 fp8 requantize fails with `CUDA driver error: invalid argument`). Review before applying; `train_qwen3_30b_sglang.sh` applies the same bump with `sed` at runtime. |
+| ai-dynamo/dynamo | log-prob portion of [#11640](https://github.com/ai-dynamo/dynamo/pull/11640) (see the fix section above) | **required** for the sglang engine; upstream from that PR onward |
+| verl | `bucket_size_mb` 512 → 4096 for the vLLM CUDA-IPC weight sender | applied at runtime by `train_qwen3_30b_sglang.sh` with `sed`; unconditional, and known to break DeepSeek-V4 fp8 requantize (`CUDA driver error: invalid argument`) — drop it there |
+| verl | opt-in `VERL_DEFER_OPTIMIZER_LOAD=1` (Adam state on CPU through fwd/bwd, loaded only around `optimizer.step()`; ~7 GB/GPU at the actor-update peak on 32-GPU FSDP) | needed to fit 30B on 2×8 H100 only; the verified 4×8 run did not use it. Not on this branch; available as a separate verl change |
+| verl | NIXL `backends` kwarg on `NIXLCheckpointEngine` (LIBFABRIC transport) | pending as a separate verl PR — see the NIXL section |
 
 Known-good base versions:
 
 | component | version |
 | --- | --- |
-| dynamo | `94accc7389` + `patches/dynamo_sglang_incremental_logprobs_11640_backport.patch` |
-| verl | `6cbca9ce` (= `REQUIRED_VERL.txt`) + the three `patches/verl_*.patch` above as needed |
+| dynamo | `94accc7389` + the #11640 log-prob fix |
+| verl | `6cbca9ce` (= `REQUIRED_VERL.txt`), stock |
 | sglang | 0.5.14 (via `ai_dynamo[sglang]`) |
 | `ai_dynamo` wheels | 1.3.0, local build (`$DYNAMO_WHEELHOUSE` in the launchers) |

@@ -68,7 +68,7 @@ export VERL_DEFER_OPTIMIZER_LOAD=1"
   # every other script in this directory pairs them. This run only validates the
   # rollout refactor, so switch the metrics off rather than repair a config we are
   # not testing.
-  # fused kernels: kv_metrics.sh predates the OOM findings in HANDOFF section 6 and
+  # fused kernels: kv_metrics.sh predates the later OOM findings and
   # sets neither eager experts nor fused kernels, so step 1 forward would OOM at
   # its 18432-token budget. Override rather than edit the script under test.
   # 2026-08-31: dropped the gpu_memory_utilization=0.35 and

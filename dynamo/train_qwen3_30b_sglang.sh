@@ -475,19 +475,19 @@ echo "FUSED_ARGS: ${FUSED_ARGS[*]:-<none>}"
 # stream_interval 实测无效，已撤除（2026-08-27）：dynamo 侧尾部饱和层
 # interval 1 -> 100 的 per_token 均值变化 2.6981 -> 2.6982。注入方式本身是对的
 # (dynamo 走 extra_args 进 CLI，native 走 engine_kwargs.sglang 进 ServerArgs)，
-# 两侧都验证过真的到达引擎，所以这不是"设了没生效"。详见 HANDOFF.md 8.4。
+# 两侧都验证过真的到达引擎，所以这不是"设了没生效"。
 
 # sglang engine extra CLI args, assembled as a JSON array for hydra.
 # STREAM_INTERVAL (2026-08-31): the Dynamo frontend aggregates streamed chunks back
 # into one non-streaming response, but keeps only the FIRST chunk's logprobs while
 # token ids accumulate correctly -- measured live on job 4803: 7 usable logprobs out
 # of 1647 tokens (0.425%), the rest padded to 0.0 which verl reads as probability
-# 1.0. That is the whole of the pearson=0.05 / probs_diff=0.27 anomaly (HANDOFF 20).
+# 1.0. That is the whole of the pearson=0.05 / probs_diff=0.27 anomaly.
 # Setting the interval to the full response length makes the response a single chunk,
 # so nothing is left to drop. Empty by default = engine default (1).
 # DISABLE_PIECEWISE=1 adds --disable-piecewise-cuda-graph. It was added to dodge the
-# compiler's ENOSPC (HANDOFF 12), which turned out to be the container writable layer
-# filling up and is fixed by relocating HOME (HANDOFF 14). The verified 100-step run
+# compiler's ENOSPC, which turned out to be the container writable layer
+# filling up and is fixed by relocating HOME. The verified 100-step run
 # (17562481) ran with it OFF, so 0 is the default.
 SGLANG_EXTRA=()
 if [[ "${DISABLE_PIECEWISE:-0}" == "1" ]]; then

@@ -2,3 +2,6 @@
 *.bak*
 _archive/
 retool_ab.sbatch
+patches/
+HANDOFF.md
+DESIGN_sglang_backend.md

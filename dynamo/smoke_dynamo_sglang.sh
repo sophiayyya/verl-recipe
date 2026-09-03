@@ -53,7 +53,7 @@ FAIL: 'import dynamo.sglang' failed. Install it for THIS JOB ONLY with:
               "\$DYNAMO_WHEEL_DIR/ai_dynamo_runtime-1.3.0-cp310-abi3-manylinux_2_39_x86_64.whl"
 
 (DYNAMO_WHEEL_DIR currently = ${DYNAMO_WHEEL_DIR})
-Do not pre-install it into the container image — see recipe/dynamo/DESIGN_sglang_backend.md risk 10.
+Do not pre-install it into the container image.
 MSG
     exit 1
 }
