@@ -23,7 +23,10 @@ V1 (default) runs TaskRunnerV1 → ``trainer.v1.trainer_mode``
 ``trainer.use_v1=false`` until upstream removes it (deprecated, v0.9.0).
 """
 
+import os
+
 import hydra
+from omegaconf import open_dict
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import TaskRunnerV1, run_ppo
@@ -32,9 +35,38 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device
 
 
+def _propagate_registry_to_ray_workers(config) -> None:
+    """Ship VERL_USE_EXTERNAL_MODULES to every Ray worker via the job's runtime_env.
+
+    Multi-node clusters are started with `ray start` BEFORE this driver runs, so
+    Ray workers inherit their environment from the raylet's shell, not from this
+    process — an export here never reaches them, and workers then fail with
+    "Rollout dynamo with mode async not found" because the registry module was
+    never imported. main_ppo merges config.ray_kwargs.ray_init.runtime_env into
+    ray.init(), which Ray forwards to all workers regardless of how the raylet
+    was launched. The schema's runtime_env node is a struct without an env_vars
+    field (see verl main_ppo's own ConfigKeyError note), hence open_dict.
+
+    setdefault semantics: an explicit user-provided value (config or the
+    ++ray_kwargs CLI override documented in the README) wins.
+    """
+    modules = os.environ.get("VERL_USE_EXTERNAL_MODULES", "recipe.dynamo.register")
+    try:
+        runtime_env = config.ray_kwargs.ray_init.runtime_env
+    except (AttributeError, KeyError):
+        # Trimmed configs (unit-test doubles, minimal launchers) may not carry
+        # the ray_kwargs schema; single-node runs don't need the injection.
+        return
+    with open_dict(runtime_env):
+        if runtime_env.get("env_vars") is None:
+            runtime_env.env_vars = {}
+        runtime_env.env_vars.setdefault("VERL_USE_EXTERNAL_MODULES", modules)
+
+
 @hydra.main(config_path="config", config_name="dynamo_trainer", version_base=None)
 def main(config):
     auto_set_device(config)
+    _propagate_registry_to_ray_workers(config)
     config = migrate_legacy_reward_impl(config)
     validate_config(
         config=config,

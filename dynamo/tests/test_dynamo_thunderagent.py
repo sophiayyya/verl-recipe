@@ -1161,3 +1161,46 @@ def test_thunderagent_sglang_workers_use_internal_model_name(monkeypatch) -> Non
     base_calls.clear()
     server._build_sglang_cmd("test-model", 1, kv_events_config_json="{}")
     assert base_calls == [("test-model", {"kv_events_config_json": "{}"})]
+
+
+def test_registry_env_propagates_via_ray_runtime_env(monkeypatch) -> None:
+    # Multi-node: Ray workers inherit env from the pre-started raylet, so the
+    # entry point must ship VERL_USE_EXTERNAL_MODULES through the job
+    # runtime_env. The schema's runtime_env node is a struct without env_vars,
+    # so the injection must survive struct mode, and an explicit user value
+    # must win over the default.
+    from omegaconf import OmegaConf
+    from recipe.dynamo.main_dynamo import _propagate_registry_to_ray_workers
+
+    def make_config():
+        cfg = OmegaConf.create({"ray_kwargs": {"ray_init": {"num_cpus": None, "runtime_env": {"py_executable": None}}}})
+        OmegaConf.set_struct(cfg, True)
+        return cfg
+
+    monkeypatch.delenv("VERL_USE_EXTERNAL_MODULES", raising=False)
+    cfg = make_config()
+    _propagate_registry_to_ray_workers(cfg)
+    assert cfg.ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES == "recipe.dynamo.register"
+
+    # driver env with extra modules is forwarded as-is
+    monkeypatch.setenv("VERL_USE_EXTERNAL_MODULES", "recipe.dynamo.register,other.mod")
+    cfg = make_config()
+    _propagate_registry_to_ray_workers(cfg)
+    assert cfg.ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES == "recipe.dynamo.register,other.mod"
+
+    # explicit user-provided value wins (setdefault semantics)
+    cfg = make_config()
+    from omegaconf import open_dict
+
+    with open_dict(cfg.ray_kwargs.ray_init.runtime_env):
+        cfg.ray_kwargs.ray_init.runtime_env.env_vars = {"VERL_USE_EXTERNAL_MODULES": "user.custom"}
+    _propagate_registry_to_ray_workers(cfg)
+    assert cfg.ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES == "user.custom"
+
+
+def test_registry_env_injection_tolerates_trimmed_configs() -> None:
+    # Entry-point test doubles (and minimal launchers) may omit ray_kwargs
+    # entirely — the injection must skip, not crash.
+    from recipe.dynamo.main_dynamo import _propagate_registry_to_ray_workers
+
+    _propagate_registry_to_ray_workers(SimpleNamespace(trainer=SimpleNamespace(use_v1=True)))

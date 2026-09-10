@@ -19,6 +19,7 @@ export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 
 python3 -m verl.trainer.main_ppo \
     --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    "++ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register" \
     trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \

@@ -308,6 +308,42 @@ separate_async re-routes aborted retries across pools, so the client records
 60 s); cleanup counts as confirmed only when all ack, and unconfirmed
 cleanups count toward `thunderagent.finalize_leak_threshold`.
 
+### Multi-node runs (pre-started Ray clusters)
+
+On a pre-started Ray cluster (`ray start` on each node, driver connects with
+`RAY_ADDRESS`), workers inherit their environment from the **raylet's** shell,
+not from the driver — exports in your launch script never reach them. Two
+rules:
+
+1. **`VERL_USE_EXTERNAL_MODULES` is shipped automatically** when you launch
+   through `recipe.dynamo.main_dynamo` (injected into the job's Ray
+   `runtime_env`). If you launch through `verl.trainer.main_ppo` directly, add:
+
+   ```
+   "++ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register"
+   ```
+
+   (`++` is required: the schema's `runtime_env` node is a struct without an
+   `env_vars` field.) Without this, workers fail with
+   `Rollout dynamo with mode async not found`.
+
+2. **Everything else must be exported before `ray start` on every node** —
+   deployment-specific paths cannot live in the repo config. Checklist (each
+   row is a failure observed in practice when missing):
+
+   | env before `ray start` | symptom when missing |
+   | --- | --- |
+   | `HF_HOME=<writable path>` | `OSError: Read-only file system` (datasets cache lands on the read-only model mount) |
+   | `PYTHONPATH=<ws>:<ws>/verl`, `PATH+=<etcd/nats dir>` | recipe import / infra binary failures |
+   | `unset DD_*`, `unset LD_PRELOAD` | raylet crashes parsing injected quoted-JSON env |
+   | `unset PYTORCH_CUDA_ALLOC_CONF` | sglang torch_memory_saver incompatibility |
+
+Small-GPU multi-node smokes only: size pods so no single node can hold every
+per-node bundle (verl places each node's bundle as an independent placement
+group with no cross-node constraint — full 8-GPU-per-node deployments are
+unaffected), and assert the pool spans the expected node count
+(`[DynamoReplica pool] ready: ... nodes=N`).
+
 ### Legacy V0 path (compatibility only)
 
 The original PR #110/#126 flow — `--config-name=dynamo_trainer` (which pins
