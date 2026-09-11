@@ -201,6 +201,25 @@ adapter ([uniagent_gateway.py](uniagent_gateway.py)) applies the same rules
 Subagents are off by default in the Uni-Agent Claude Code recipe; enable them
 in the Task Config with `agent.enable_subagents: true`.
 
+### Scoring a subagent run
+
+`benchmarks/thunderagent_subagent_bench.py` reduces captures of the router's
+`metrics` endpoint to the numbers subagents actually move: leaked programs,
+unpinned-turn rate (turns that reached a replica without a pin, each one a
+re-prefill), pause/forced-resume counts, and vLLM's prefix-cache hit rate as an
+independent cross-check.
+
+```bash
+# capture the router metrics endpoint before and after a rollout, then:
+python -m recipe.dynamo.benchmarks.thunderagent_subagent_bench \
+    --before before.json --after after.json --label ta
+```
+
+Run the same capture for `VARIANT=dynamo` and `VARIANT=global` to get a matched
+comparison. A correct subagent run reports `leaked_programs = 0`; a non-zero
+value means subagent programs outlived their trajectory and inflated the working
+set that pause/resume decisions are computed from.
+
 ## Results
 
 ### Qwen3-30B-A3B-Base · ReTool · 8×H100
