@@ -35,11 +35,10 @@ transfer_queue:
 
 actor_rollout_ref:
   actor:
-    fsdp_config:
-      # separate_async's Decoupled PPO (bypass_mode=false) uses DTensor-based
-      # save_model_to_cpu/restore_model_from_cpu — only fsdp2/veomni/megatron
-      # work; default FSDP1 asserts on the first mini step.
-      strategy: fsdp2
+    # separate_async's Decoupled PPO (bypass_mode=false) uses DTensor-based
+    # save_model_to_cpu/restore_model_from_cpu — only fsdp2/veomni/megatron
+    # work; default FSDP1 asserts on the first mini step.
+    strategy: fsdp2
   rollout:
     # Standalone pool size — MUST be overridden to the real rollout topology.
     # If you raise gpu_memory_utilization, leave headroom on the rollout GPUs
