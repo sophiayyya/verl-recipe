@@ -1839,6 +1839,10 @@ class DynamoHttpServer:
                     self.config.prompt_length + self.config.response_length - len(prompt_token_ids),
                 ),
             )
+        # Tool observations grow the prompt between turns. Match the direct
+        # engine path by bounding explicit sampling limits as well as defaults.
+        max_possible_tokens = max(1, self.config.prompt_length + self.config.response_length - len(prompt_token_ids))
+        max_tokens = min(int(max_tokens), max_possible_tokens)
         sp.pop("logprobs", None)
         nvext = sp.pop("nvext", None)
         payload: dict[str, Any] = {
