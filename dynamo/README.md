@@ -118,31 +118,66 @@ The shared defaults are in [dynamo_base.yaml](config/dynamo_base.yaml).
   ThunderAgent and native baselines; [NIXL smoke](run_nixl_smoke.sh) and
   [bandwidth probe](nixl_bench.py) cover checkpoint-engine weight transfer.
 
+### Enable ThunderAgent
+
+Set `thunderagent.enabled=true` on a Dynamo launcher. For a vLLM V1 smoke:
+
+```bash
+bash recipe/dynamo/smoke_dynamo_v1_colocate.sh \
+    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=true
+```
+
+For the UniAgent workload used in the results below:
+
+```bash
+VARIANT=ta RAY_DATA_HOME=/path/to/verl-data bash recipe/dynamo/run_uniagent_variant.sh
+```
+
+Use `VARIANT=dynamo` for the built-in KV-router baseline or `VARIANT=global`
+for native verl vLLM. V1 supports ThunderAgent in `colocate_async` and
+`separate_async`. ThunderAgent GPU validation covers vLLM; SGLang routing
+validation is still pending.
+
 ## Results
 
 ### Qwen3-30B-A3B-Base · ReTool · 8×H100
 
-Four independent **50-step** V0 GRPO runs, each on one 8×H100 80GB node with
-two TP4 replicas. Dynamo uses KV-aware routing with KV events enabled and
-ThunderAgent disabled. All four runs completed training and saved step-50 checkpoints.
+V0 GRPO on one 8×H100 80GB node per arm, with two TP4 replicas. Dynamo uses
+KV-aware routing, KV events enabled, and ThunderAgent disabled. This comparison
+uses **steps 1–30** of each independent 50-step run.
 
-| Backend | gen (ms/token) ↓ | Output tokens/s ↑ | Step time (s) ↓ | W&B |
-| --- | ---: | ---: | ---: | --- |
-| Dynamo + vLLM | 0.210304 | 4,789.09 | 101.53 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/f945b6c47154) |
-| Native vLLM | 0.218803 | 4,609.28 | 106.41 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/08746adedc30) |
-| Dynamo + SGLang | 0.244768 | 4,097.10 | 123.38 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/b286d10e992d) |
-| Native SGLang | 0.241076 | 4,572.12 | 120.00 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/a31f8e690eda) |
+Lower is better. These are all 30 raw logged steps, including step 1.
 
-Mean `timing_per_token_ms/gen` is **3.88% lower with Dynamo + vLLM** and
-**1.53% higher with Dynamo + SGLang**, relative to the matching native engine.
-This metric includes tool-return context tokens; output throughput counts only
-model-generated tokens. Step time is the arithmetic mean over all 50 steps.
+| Arm | Mean timing_per_token_ms/gen | Mean vs. native |
+| --- | ---: | ---: |
+| Dynamo + vLLM | 0.23511 | −5.63% |
+| Native vLLM | 0.24915 | baseline |
+| Dynamo + SGLang | 0.26091 | −3.66% |
+| Native SGLang | 0.27082 | baseline |
 
-These runs used additional experiment-specific verl/data/tool preparations.
-One run per arm, evolving policies, and sparse tool use limit the conclusions;
-these results do not isolate the effect of KV routing. See the
-[benchmark report](benchmarks/retool_h100_20260916.md) for the setup, metric
-definitions and validation scope.
+Means are in ms/token, with equal weight per step and no W&B smoothing.
+This metric includes tool-return context tokens. These runs used additional
+verl/data/tool preparations; evolving policies and sparse tool use limit
+conclusions about KV routing alone. See the [benchmark report](benchmarks/retool_h100_20260916.md)
+for the setup, W&B links, metric definitions and full 50-step results.
+
+### ThunderAgent · UniAgent · 8×H20-3e
+
+Qwen3-Coder-30B-A3B-Instruct on 8×H20-3e (140.4 GiB/GPU), with two TP4 replicas
+and colocated, synchronous GRPO. The comparison is Dynamo ThunderAgent versus
+verl's native Global LB on vLLM.
+
+| Concurrency | Rollout-phase speedup | Full-step speedup |
+| ---: | ---: | ---: |
+| 384 | 1.94× | 1.39× |
+| 512 | 2.40× | 1.60× |
+
+At concurrency 64–256, performance was near parity. Rollout throughput counts
+model-generated tokens per rollout second; full-step measurements also include
+reward/advantage computation, log-probability evaluation, actor updates and
+weight synchronization.
+
+### Entry-point validation
 
 The subsequent `main_ppo` entry-point cleanup passed **141 CPU tests per engine**
 and **6 native CLI configuration checks**. GPU training was not repeated for that cleanup.
