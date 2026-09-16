@@ -621,7 +621,7 @@ def test_v1_presets_compose_expectations() -> None:
     assert separate["trainer"]["v1"]["trainer_mode"] == "separate_async"
     assert separate["actor_rollout_ref"]["rollout"]["checkpoint_engine"]["backend"] == "nccl"
     assert separate["actor_rollout_ref"]["rollout"]["nnodes"] >= 1
-    assert separate["actor_rollout_ref"]["actor"]["fsdp_config"]["strategy"] == "fsdp2"
+    assert separate["actor_rollout_ref"]["actor"]["strategy"] == "fsdp2"
 
     # Both V1 presets must be PRIMARY configs (own hydra.searchpath) and pull
     # the shared fragment via defaults; the fragment must stay hydra-free.
@@ -645,50 +645,31 @@ def test_recipe_pins_tested_verl_and_dynamo_revisions() -> None:
     assert "dynamo/REQUIRED_VERL.txt" in repository_readme
 
 
-def _entrypoint_config(*, use_v1: bool, manager_class=None):
-    return SimpleNamespace(
-        trainer=SimpleNamespace(use_v1=use_v1),
-        actor_rollout_ref=SimpleNamespace(rollout={"agent": {"agent_loop_manager_class": manager_class}}),
-    )
+def test_legacy_manager_rejects_v1_before_initialization(monkeypatch) -> None:
+    from recipe.dynamo.dynamo_agent_loop import DynamoAgentLoopManager
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+
+    def unexpected_init(*args, **kwargs):
+        pytest.fail("V1 must be rejected before initializing the V0 manager")
+
+    monkeypatch.setattr(AgentLoopManager, "__init__", unexpected_init)
+    config = SimpleNamespace(trainer=SimpleNamespace(use_v1=True))
+    with pytest.raises(ValueError, match="does not write TransferQueue"):
+        DynamoAgentLoopManager(config=config, llm_client=None)
 
 
-def test_training_entrypoint_dispatches_on_use_v1(monkeypatch) -> None:
-    from recipe.dynamo import main_dynamo
+def test_legacy_manager_keeps_v0_client_contract(monkeypatch) -> None:
+    from recipe.dynamo.dynamo_agent_loop import DynamoAgentLoopManager
 
-    from verl.trainer.main_ppo import TaskRunnerV1
-    from verl.trainer.main_ppo_v0 import TaskRunner as TaskRunnerV0
+    from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 
     calls = []
-    monkeypatch.setattr(main_dynamo, "auto_set_device", lambda _config: None)
-    monkeypatch.setattr(main_dynamo, "migrate_legacy_reward_impl", lambda config: config)
-    monkeypatch.setattr(main_dynamo, "validate_config", lambda **_kwargs: None)
-    monkeypatch.setattr(main_dynamo, "need_reference_policy", lambda _config: False)
-    monkeypatch.setattr(main_dynamo, "need_critic", lambda _config: False)
-    monkeypatch.setattr(main_dynamo, "run_ppo", lambda config, **kwargs: calls.append(kwargs))
-
-    main_dynamo.main.__wrapped__(_entrypoint_config(use_v1=True))
-    main_dynamo.main.__wrapped__(_entrypoint_config(use_v1=False))
-
-    assert calls[0] == {"task_runner_class": TaskRunnerV1}
-    assert calls[1] == {"task_runner_class": TaskRunnerV0}
-
-
-def test_training_entrypoint_rejects_v1_with_legacy_manager(monkeypatch) -> None:
-    from recipe.dynamo import main_dynamo
-
-    monkeypatch.setattr(main_dynamo, "auto_set_device", lambda _config: None)
-    monkeypatch.setattr(main_dynamo, "migrate_legacy_reward_impl", lambda config: config)
-    monkeypatch.setattr(main_dynamo, "validate_config", lambda **_kwargs: None)
-    monkeypatch.setattr(main_dynamo, "need_reference_policy", lambda _config: False)
-    monkeypatch.setattr(main_dynamo, "need_critic", lambda _config: False)
-    monkeypatch.setattr(main_dynamo, "run_ppo", lambda config, **kwargs: None)
-
-    config = _entrypoint_config(
-        use_v1=True,
-        manager_class="recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager",
-    )
-    with pytest.raises(ValueError, match="does not write TransferQueue"):
-        main_dynamo.main.__wrapped__(config)
+    monkeypatch.setattr(AgentLoopManager, "__init__", lambda self, config, **kwargs: calls.append((config, kwargs)))
+    config = SimpleNamespace(trainer=SimpleNamespace(use_v1=False))
+    client = object()
+    DynamoAgentLoopManager(config=config, llm_client=client)
+    assert calls == [(config, {"llm_client": client})]
 
 
 # --------------------------------------------------------------------------- #
@@ -1161,46 +1142,3 @@ def test_thunderagent_sglang_workers_use_internal_model_name(monkeypatch) -> Non
     base_calls.clear()
     server._build_sglang_cmd("test-model", 1, kv_events_config_json="{}")
     assert base_calls == [("test-model", {"kv_events_config_json": "{}"})]
-
-
-def test_registry_env_propagates_via_ray_runtime_env(monkeypatch) -> None:
-    # Multi-node: Ray workers inherit env from the pre-started raylet, so the
-    # entry point must ship VERL_USE_EXTERNAL_MODULES through the job
-    # runtime_env. The schema's runtime_env node is a struct without env_vars,
-    # so the injection must survive struct mode, and an explicit user value
-    # must win over the default.
-    from omegaconf import OmegaConf
-    from recipe.dynamo.main_dynamo import _propagate_registry_to_ray_workers
-
-    def make_config():
-        cfg = OmegaConf.create({"ray_kwargs": {"ray_init": {"num_cpus": None, "runtime_env": {"py_executable": None}}}})
-        OmegaConf.set_struct(cfg, True)
-        return cfg
-
-    monkeypatch.delenv("VERL_USE_EXTERNAL_MODULES", raising=False)
-    cfg = make_config()
-    _propagate_registry_to_ray_workers(cfg)
-    assert cfg.ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES == "recipe.dynamo.register"
-
-    # driver env with extra modules is forwarded as-is
-    monkeypatch.setenv("VERL_USE_EXTERNAL_MODULES", "recipe.dynamo.register,other.mod")
-    cfg = make_config()
-    _propagate_registry_to_ray_workers(cfg)
-    assert cfg.ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES == "recipe.dynamo.register,other.mod"
-
-    # explicit user-provided value wins (setdefault semantics)
-    cfg = make_config()
-    from omegaconf import open_dict
-
-    with open_dict(cfg.ray_kwargs.ray_init.runtime_env):
-        cfg.ray_kwargs.ray_init.runtime_env.env_vars = {"VERL_USE_EXTERNAL_MODULES": "user.custom"}
-    _propagate_registry_to_ray_workers(cfg)
-    assert cfg.ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES == "user.custom"
-
-
-def test_registry_env_injection_tolerates_trimmed_configs() -> None:
-    # Entry-point test doubles (and minimal launchers) may omit ray_kwargs
-    # entirely — the injection must skip, not crash.
-    from recipe.dynamo.main_dynamo import _propagate_registry_to_ray_workers
-
-    _propagate_registry_to_ray_workers(SimpleNamespace(trainer=SimpleNamespace(use_v1=True)))

@@ -493,9 +493,15 @@ class DynamoAgentLoopWorker(AgentLoopWorker):
 class DynamoAgentLoopManager(AgentLoopManager):
     """AgentLoopManager compatible with the current verl LLMServerClient API."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
+        if config.trainer.use_v1:
+            raise ValueError(
+                "DynamoAgentLoopManager does not write TransferQueue and cannot run with trainer.use_v1=true. "
+                "Use a dynamo_trainer_v1_* preset with agent_loop_manager_class=null, "
+                "or set trainer.use_v1=false for the legacy path."
+            )
         self.agent_loop_workers_class = ray.remote(DynamoAgentLoopWorker)
-        super().__init__(*args, **kwargs)
+        super().__init__(config, *args, **kwargs)
 
     @classmethod
     @auto_await

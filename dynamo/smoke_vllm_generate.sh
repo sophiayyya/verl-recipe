@@ -15,11 +15,11 @@ MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-0.5B-Instruct"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 
 python3 -m verl.trainer.main_ppo \
     --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
-    "++ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register" \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
     trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \

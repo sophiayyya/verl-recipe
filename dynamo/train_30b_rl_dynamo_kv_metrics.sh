@@ -21,7 +21,7 @@ CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 METRICS_DIR=${METRICS_DIR:-"${RAY_DATA_HOME}/logs/${exp_name}"}
 METRICS_PORT=${METRICS_PORT:-9200}
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 export VERL_DYNAMO_WORKER_METRICS_DIR="${METRICS_DIR}/workers"
 mkdir -p "${VERL_DYNAMO_WORKER_METRICS_DIR}"
 
@@ -35,6 +35,7 @@ trap 'kill "${sidecar_pid}" 2>/dev/null || true' EXIT
 
 python3 -m verl.trainer.main_ppo \
     --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
     trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \

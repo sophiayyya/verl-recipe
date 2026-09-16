@@ -35,8 +35,8 @@ def _patch_dynamo_llm_server_manager():
         # register module re-entrantly (VERL_USE_EXTERNAL_MODULES). Worker
         # processes never instantiate LLMServerManager, so skipping the patch
         # here is harmless; raising would kill every AgentLoopWorker actor.
-        # The driver process always imports verl first (via main_dynamo /
-        # main_ppo), where the patch applies cleanly.
+        # The driver imports verl first via main_ppo, where the patch applies
+        # cleanly.
         return
 
     from recipe.dynamo.dynamo_agent_loop import DynamoLLMServerManager

@@ -34,14 +34,17 @@ MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen2.5-0.5B-Instruct"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
+DYNAMO_CONFIG_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/config" && pwd)
 
 # bypass_mode: use rollout logprobs as old_log_probs directly (matches the
 # uni-agent claude_code recipe). The Decoupled save/restore alternative is
 # DTensor-based and a 1-GPU trainer's FSDP2 wrap yields no DTensor params —
 # multi-GPU runs may drop this and exercise Decoupled PPO instead.
-python3 -m recipe.dynamo.main_dynamo \
+python3 -m verl.trainer.main_ppo \
+    --config-path "${DYNAMO_CONFIG_DIR}" \
     --config-name=dynamo_trainer_v1_separate \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
     algorithm.rollout_correction.bypass_mode=true \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \

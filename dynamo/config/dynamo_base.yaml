@@ -41,3 +41,11 @@ actor_rollout_ref:
 
 trainer:
   project_name: verl-dynamo
+
+# Forward the driver registration to workers on pre-started Ray clusters.
+# Use a literal: main_ppo passes runtime_env to Ray before resolving config.
+ray_kwargs:
+  ray_init:
+    runtime_env:
+      env_vars:
+        VERL_USE_EXTERNAL_MODULES: recipe.dynamo.register

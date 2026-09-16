@@ -3,7 +3,7 @@
 # Inherits ppo_trainer + dynamo_base. Pins trainer.use_v1=false: this preset
 # carries the V0-era defaults (DynamoAgentLoopManager, ThunderAgent on) which
 # violate the V1 TransferQueue contract — the V1 path lives in
-# dynamo_trainer_v1_colocate.yaml. main_dynamo.py dispatches on trainer.use_v1.
+# dynamo_trainer_v1_colocate.yaml. verl.trainer.main_ppo dispatches on trainer.use_v1.
 
 hydra:
   searchpath:

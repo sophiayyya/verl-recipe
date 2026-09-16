@@ -86,7 +86,7 @@ MSG
 # Say which logprobs.py this run is about to trust (wheel vs. overlay).
 python3 -c 'import dynamo.common.backend.logprobs as m; print("dynamo.common.backend.logprobs:", m.__file__)'
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 
 # Argument set mirrors the proven vLLM dynamo runs in
 # recipe/dynamo/train_30b_rl_dynamo_kv_metrics.sh rather than being
@@ -164,6 +164,7 @@ COMMON_ARGS=(
 if [[ "${STAGE}" == "gen" ]]; then
     python3 -m verl.trainer.main_ppo \
         --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+        "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
         trainer.use_v1=False \
         "${COMMON_ARGS[@]}" \
         trainer.val_before_train=True \
@@ -174,6 +175,7 @@ if [[ "${STAGE}" == "gen" ]]; then
 else
     python3 -m verl.trainer.main_ppo \
         --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+        "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
         trainer.use_v1=False \
         "${COMMON_ARGS[@]}" \
         actor_rollout_ref.rollout.free_cache_engine=True \

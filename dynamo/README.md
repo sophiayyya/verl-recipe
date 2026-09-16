@@ -62,7 +62,6 @@ Request routing happens inside Dynamo's KV router, **not** in verl's
 | File                                                           | Role                                                                                                                                                                                                              |
 | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[register.py](register.py)`                                   | Registers `dynamo` in verl's rollout registries; loaded via `VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register`.                                                                                                   |
-| `[main_dynamo.py](main_dynamo.py)`                             | Entry point used by the V1 smokes: dispatches on `trainer.use_v1` (`TaskRunnerV1` / legacy V0 `TaskRunner`), refuses V1 + `DynamoAgentLoopManager`, runs the legacy-reward-key migration; see [Quick start](#quick-start). |
 | `[config/dynamo_trainer.yaml](config/dynamo_trainer.yaml)`     | Hydra config: inherits `ppo_trainer`, sets `rollout.name=dynamo`, `rollout.mode=async`.                                                                                                                           |
 | `[dynamo_async_server.py](dynamo_async_server.py)`             | `DynamoReplica` / `DynamoHttpServer` — spawns and watchdogs etcd, nats-server, engine workers, and `dynamo.frontend`, for both engines.                                                                           |
 | `[dynamo_rollout.py](dynamo_rollout.py)`                       | `ServerAdapter` — engine-agnostic facade; dispatches on `engine_kwargs.dynamo.engine` and lazily imports the chosen adapter (no module-scope engine imports), so it loads on an image that ships only one engine. |
@@ -127,14 +126,22 @@ not the legacy top-level `custom_reward_function.*`: the v0 runner reads
 `config.reward.*` and `main_ppo` never runs the legacy-key migration, so legacy
 keys are **silently ignored** (the run proceeds with the default reward).
 
-`[main_dynamo.py](main_dynamo.py)` is the convenience entry point: it dispatches on
-`trainer.use_v1` exactly like upstream (`TaskRunnerV1` when it is `true`, the legacy V0
-`TaskRunner` when it is `false`), refuses the V1 + `DynamoAgentLoopManager` combination
-with a clear error, and runs verl's legacy-reward-key migration itself, so the
-`reward.custom_reward_function.*` namespace is not required when you launch through it.
-Its default primary config is `dynamo_trainer` (V0), so pass `--config-name=dynamo_trainer_v1_*`
-for V1, as the V1 smokes do. The V0 launchers call `verl.trainer.main_ppo` directly and
-therefore set both explicitly.
+V0 and V1 both launch through `python3 -m verl.trainer.main_ppo`. Select the
+trainer with the recipe preset; upstream dispatches on `trainer.use_v1`.
+For example, V1 colocate training uses:
+
+```bash
+export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+python3 -m verl.trainer.main_ppo \
+    --config-path ../../recipe/dynamo/config \
+    --config-name dynamo_trainer_v1_colocate \
+    actor_rollout_ref.model.path=... data.train_files=... data.val_files=...
+```
+
+The V1 presets select the TransferQueue-compatible default agent manager.
+The legacy `DynamoAgentLoopManager` rejects V1 configuration when instantiated.
+All presets forward the registry module through the Ray job runtime environment.
+Custom rewards use `reward.custom_reward_function.*` for both trainer versions.
 
 ### 1. Generation-only smoke
 
@@ -315,16 +322,19 @@ On a pre-started Ray cluster (`ray start` on each node, driver connects with
 not from the driver — exports in your launch script never reach them. Two
 rules:
 
-1. **`VERL_USE_EXTERNAL_MODULES` is shipped automatically** when you launch
-   through `recipe.dynamo.main_dynamo` (injected into the job's Ray
-   `runtime_env`). If you launch through `verl.trainer.main_ppo` directly, add:
+1. **`VERL_USE_EXTERNAL_MODULES` is forwarded by the shared recipe config**
+   (`dynamo_base.yaml`) through `ray_kwargs.ray_init.runtime_env.env_vars`.
+   The config supplies the literal default `recipe.dynamo.register`. The supplied
+   scripts also forward the driver's module list as a literal CLI value. For
+   direct commands with extra modules, pass an explicit override:
 
    ```
-   "++ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register"
+   "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'"
    ```
 
-   (`++` is required: the schema's `runtime_env` node is a struct without an
-   `env_vars` field.) Without this, workers fail with
+   This applies to both V0 and V1 when launched through `verl.trainer.main_ppo`
+   with a Dynamo preset. Export the registration module in the driver as well.
+   Workers on pre-started Ray clusters otherwise fail with
    `Rollout dynamo with mode async not found`.
 
 2. **Everything else must be exported before `ray start` on every node** —

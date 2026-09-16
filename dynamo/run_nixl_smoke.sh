@@ -16,13 +16,14 @@ TEST_FILE=${TEST_FILE:-/workspace/data_aime/data/aime-2024.parquet}
 BUCKET_MB=${BUCKET_MB:-1024}
 EXP_NAME=${EXP_NAME:-nixl-smoke-${CE_BACKEND}-n${NNODES}}
 
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
 export HYDRA_FULL_ERROR=1
 
 cd /workspace/verl
 
 python3 -m verl.trainer.main_ppo \
     --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
     trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     data.train_files="${TRAIN_FILE}" \

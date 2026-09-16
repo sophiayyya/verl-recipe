@@ -51,7 +51,7 @@
 #     extra: it drags vLLM's guided-decoding stack down with it. The Dynamo wheels are
 #     installed --no-deps below for the same reason.
 #   * Entry point is verl.trainer.main_ppo with trainer.use_v1=False: the legacy V0
-#     agent-loop path this run was validated on (the V1 path uses main_dynamo.py with
+#     agent-loop path this run was validated on (the V1 path uses the same entry point with
 #     the dynamo_trainer_v1_* presets). hydra resolves --config-path relative to
 #     verl/trainer/, not to CWD.
 #   * The recipe registers --engine-route flush_cache:tm for the radix cache;
@@ -436,6 +436,7 @@ echo "SGLANG_EXTRA_JSON: ${SGLANG_EXTRA_JSON}"
 
 python3 -m verl.trainer.main_ppo \
     --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
+    "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'" \
     trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \

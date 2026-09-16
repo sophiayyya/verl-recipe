@@ -27,19 +27,18 @@ export PYTHONPATH="${UNIAGENT_ROOT}:${PYTHONPATH:-}"
 
 case "${VARIANT}" in
     global)
-        target_module=verl.trainer.main_ppo
         backend_args=(
             trainer.use_v1=False
             actor_rollout_ref.rollout.name=vllm
         )
         ;;
     dynamo | ta)
-        target_module=verl.trainer.main_ppo
-        export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+        export VERL_USE_EXTERNAL_MODULES="${VERL_USE_EXTERNAL_MODULES:-recipe.dynamo.register}"
         thunderagent_enabled=false
         [[ "${VARIANT}" == "ta" ]] && thunderagent_enabled=true
         backend_args=(
             --config-path ../../recipe/dynamo/config --config-name dynamo_trainer
+            "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'"
             trainer.use_v1=False
             actor_rollout_ref.rollout.name=dynamo
             "++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=${thunderagent_enabled}"
@@ -56,7 +55,8 @@ case "${VARIANT}" in
         ;;
 esac
 
-python3 -m "${target_module}" \
+python3 -m verl.trainer.main_ppo \
+    "${backend_args[@]}" \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
@@ -91,7 +91,6 @@ python3 -m "${target_module}" \
     actor_rollout_ref.rollout.agent.num_workers=8 \
     actor_rollout_ref.rollout.agent.agent_loop_config_path="${AGENT_CONFIG}" \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    "${backend_args[@]}" \
     trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
