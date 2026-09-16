@@ -53,32 +53,32 @@ Use separate environments for the two inference engines. The tested versions are
 
 ### Install Dynamo
 
-Build the tested commit with one engine per container. On a Linux GPU host
-with Docker and the NVIDIA Container Toolkit:
+The DFW runs used existing verl `.sqsh` images, a separate `uv` environment per
+engine, and **two local Dynamo wheels built from `8c5a737`**. Python components
+were loaded from the same source checkout through `PYTHONPATH`.
+
+Inside the prepared experiment container, the Dynamo installation was:
 
 ```bash
-git clone https://github.com/ai-dynamo/dynamo.git
-cd dynamo
-git checkout 8c5a73723109058f96c15fff3fc912231d65ad6e
-python3 -m venv .render-env
-source .render-env/bin/activate
-python3 -m pip install pyyaml jinja2
-DYNAMO_ENGINE=sglang  # or vllm
-python3 container/render.py --framework "$DYNAMO_ENGINE" --target dev --output-short-filename
-docker build -f container/rendered.Dockerfile -t "dynamo:8c5a737-$DYNAMO_ENGINE" .
+BENCH_ENGINE=sglang  # or vllm
+DYNAMO_PYTHON="/experiment/engines/$BENCH_ENGINE/venv/bin/python"
+uv pip install --python "$DYNAMO_PYTHON" \
+    /experiment/runtime/wheels/ai_dynamo_runtime-1.5.0-cp310-abi3-manylinux_2_39_x86_64.whl \
+    /experiment/runtime/wheels/ai_dynamo-1.5.0-py3-none-any.whl \
+    'aisimulate==0.12.0.dev2' 'protobuf>=6.33.5,<7'
+export PATH="/experiment/engines/$BENCH_ENGINE/venv/bin:/experiment/bin:$PATH"
+export PYTHONPATH="/dynamo/components/src:/experiment/src/verl:/experiment/setup"
 ```
 
-Continue with the [installation guide](INSTALL.md) to start the container,
-install verl and this recipe, configure dependencies, and verify the environment.
-It also covers an existing environment/source-build route. The selected commit's
-backend dependencies use CUDA 13; match the driver, toolkit and CuPy to that stack.
+The runtime wheel supplies `dynamo._core`; the mounted checkout supplies the
+frontend and engine Python code. See the [installation guide](INSTALL.md) for
+the actual wheel-build commands, image/mount layout, environment preparation
+and verification. `/experiment` and `/dynamo` above are paths inside the job's
+container; the staged experiment files and wheels must already be present.
 
-Official guides: [Dynamo source build](https://docs.dynamo.nvidia.com/dynamo/advanced-customizations/building-from-source),
-[containers and wheels](https://docs.dynamo.nvidia.com/dynamo/dev/cli/installation/install-dynamo).
-
-Run the training commands below from the verl checkout, with this repository
-at `recipe/`. Keep `etcd` and `nats-server` on `PATH`; for SGLang, unset
-`PYTORCH_CUDA_ALLOC_CONF`.
+Run training from the verl checkout with this repository at `recipe/`. Keep
+`etcd` and `nats-server` on `PATH`; for SGLang, unset `PYTORCH_CUDA_ALLOC_CONF`
+and `PYTORCH_ALLOC_CONF`.
 
 ### Launch
 

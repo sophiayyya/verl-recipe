@@ -1,145 +1,153 @@
-# Installation guide
+# Installation used by the DFW H100 runs
 
-Use one environment per engine: **vLLM 0.28.0** or **SGLang 0.5.19**.
-The commands below use the Dynamo and verl commits listed in the
-[README](README.md#required-versions). The H100 benchmark also used the
-[experiment-specific preparations](benchmarks/retool_h100_20260916.md#experiment-prerequisites-and-limitations).
+The [ReTool results](benchmarks/retool_h100_20260916.md) used this sequence:
+**existing verl image → isolated engine environment → local Dynamo wheels →
+mounted Python source**. This guide follows the experiment's `build_dynamo.sh`,
+`prepare.sbatch`, `setup/prepare_environment.py`, `setup/prepare_cpu.py` and
+training launchers. Those experiment scripts and artifacts are stored in the
+experiment archive; they are not packaged in this recipe repository.
 
-## 1. Build and start a Dynamo container
+## 1. Build the two Dynamo wheels
 
-Use a Linux GPU host with a compatible NVIDIA driver, Docker/BuildKit and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html).
-The pinned backend stack uses CUDA 13. Run the [README build commands](README.md#install-dynamo)
-with `DYNAMO_ENGINE=sglang` or `vllm`. The `dev` image includes the selected engine,
-Dynamo's compiled runtime, build tools, etcd and NATS.
-
-Then, from the same host shell:
+The wheels were built once from commit
+`8c5a73723109058f96c15fff3fc912231d65ad6e` and copied into the DFW experiment's
+`runtime/wheels/` directory. These are the build commands, with paths normalized:
 
 ```bash
-mkdir -p ../verl-workspace
-docker run --rm -it --gpus all --network host --ipc host \
-    -v "$PWD/../verl-workspace:/work" -w /work \
-    "dynamo:8c5a737-$DYNAMO_ENGINE" bash
-```
-
-For Slurm/Pyxis, use the same image and mount a shared workspace at the same
-path on every node. Use your cluster's container launcher instead of Docker.
-For other image targets, see the [pinned container guide](https://github.com/ai-dynamo/dynamo/blob/8c5a73723109058f96c15fff3fc912231d65ad6e/container/README.md).
-
-## 2. Install verl and the recipe
-
-Run inside the container. Keep the engine's Torch, CUDA and Transformers versions
-when adding training dependencies:
-
-```bash
-cd /work
-python3 - <<'CHECK'
-from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
-pins = []
-for name in ("torch", "torchvision", "torchaudio", "transformers", "vllm", "sglang", "nixl"):
-    try:
-        pins.append(f"{name}=={version(name)}")
-    except PackageNotFoundError:
-        pass
-Path("engine-constraints.txt").write_text("\n".join(pins) + "\n")
-CHECK
-python3 -m pip install -c /work/engine-constraints.txt \
-    accelerate codetiming datasets dill hydra-core 'numpy>=2' pandas peft \
-    'pyarrow>=19' pybind11 pylatexenc 'ray[default]' torchdata \
-    'tensordict==0.10.0' wandb tensorboard packaging cachetools \
-    mathruler qwen-vl-utils nvtx liger-kernel ninja psutil setuptools wheel
-python3 -m pip install -c /work/engine-constraints.txt \
-    'TransferQueue @ git+https://github.com/Ascend/TransferQueue.git@434f8c476b4be24bc087e6e95070e64efcc739f9' \
-    'cupy-cuda13x==14.0.1'
-
-git clone https://github.com/verl-project/verl.git
-git -C verl checkout 6cbca9ce7208100d11b4d1b06eccf098cc9e76aa
-git clone --branch sopy/dynamo_sglang https://github.com/sophiayyya/verl-recipe.git verl/recipe
-cd verl
-python3 -m pip install --no-deps -e .
-```
-
-The final `--no-deps` is intentional: this verl pin declares `transformers<5.11`,
-while SGLang 0.5.19 requires 5.12.1. Its inference extras also target older engines.
-The commands install training dependencies explicitly and preserve the engine
-stack. A package-metadata check can therefore report the known verl/Transformers
-mismatch; use the import, configuration and training checks below to validate
-this combination. See [verl's installation guide](https://verl.readthedocs.io/en/latest/start/install.html)
-for other training backends.
-
-For the FSDP2 path, install FlashAttention 2 against the active Torch/CUDA build.
-In this dedicated container, remove FlashAttention 4 first if present; both
-packages use the `flash_attn` namespace. The SGLang recipe uses FlashInfer for
-inference:
-
-```bash
-python3 -m pip uninstall -y flash-attn-4
-MAX_JOBS=4 python3 -m pip install -c /work/engine-constraints.txt \
-    --no-build-isolation 'flash-attn==2.8.3'
-python3 -c 'import torch, flash_attn_2_cuda; print(torch.__version__, torch.version.cuda)'
-```
-
-A prebuilt FlashAttention wheel must match Python, Torch, CUDA and the C++ ABI.
-For a separately prepared CUDA 12 environment, use `cupy-cuda12x` instead of
-`cupy-cuda13x`; install only one CuPy package. See the
-[CuPy installation guide](https://docs.cupy.dev/en/stable/install.html).
-
-## 3. Existing environment: build Dynamo from source
-
-If you already have a working verl environment with the selected engine,
-activate it and install the system libraries and Rust toolchain from the
-[official source-build guide](https://docs.dynamo.nvidia.com/dynamo/advanced-customizations/building-from-source).
-Use the Rust version in the checkout's `rust-toolchain.toml`.
-
-From a fresh workspace, build both the native runtime and Python components
-from the same commit:
-
-```bash
-git clone https://github.com/ai-dynamo/dynamo.git
-cd dynamo
+DYNAMO_SRC=/path/to/dynamo
+DYNAMO_WHEELHOUSE=/path/to/wheels
+mkdir -p "$DYNAMO_WHEELHOUSE"
+rustup toolchain install 1.96.1 --profile minimal
+cd "$DYNAMO_SRC"
 git checkout 8c5a73723109058f96c15fff3fc912231d65ad6e
-python3 -m pip install 'maturin[patchelf]'
-(cd lib/bindings/python && maturin develop --release)
-python3 -m pip install -e lib/gpu_memory_service
-python3 -m pip install -e .
-python3 -m dynamo.frontend --help
+uv build --wheel --out-dir "$DYNAMO_WHEELHOUSE"
+cd lib/bindings/python
+maturin build --release --locked \
+    --features 'kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3' \
+    --out "$DYNAMO_WHEELHOUSE"
+sha256sum "$DYNAMO_WHEELHOUSE"/*.whl > "$DYNAMO_WHEELHOUSE/SHA256SUMS"
 ```
 
-The base install above keeps engine selection in your prepared environment.
-Dynamo also provides `.[vllm]` and `.[sglang]` extras for dependency resolution;
-use them only in separate environments and recheck the training stack afterward.
-A Python-only editable install does not rebuild `dynamo._core`.
+The original build reused an existing build environment, Cargo cache, libclang
+and Clang headers (`CARGO_TARGET_DIR`, `LIBCLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS`).
+For a fresh build host, prepare those tools using the
+[official source-build guide](https://docs.dynamo.nvidia.com/dynamo/advanced-customizations/building-from-source).
+Use a runtime wheel compatible with the target container's architecture and glibc.
 
-Install the [etcd binary](https://etcd.io/docs/v3.5/install/) and
-[nats-server binary](https://github.com/nats-io/nats-server/releases) for your
-platform, and add their directory to `PATH` on every node. The recipe starts
-its own services; an external Docker Compose deployment is not required.
+The recorded artifacts were:
 
-## 4. Verify before training
+| Wheel | Provides |
+| --- | --- |
+| `ai_dynamo_runtime-1.5.0-cp310-abi3-manylinux_2_39_x86_64.whl` | Compiled Rust runtime, including `dynamo._core` |
+| `ai_dynamo-1.5.0-py3-none-any.whl` | Dynamo Python package |
 
-Run from the verl checkout using the same interpreter as your training job:
+## 2. Use the existing images and mounts
+
+The DFW jobs used site-local images with Python 3.12:
+
+| Engine | Base image | Version installed in the new environment |
+| --- | --- | --- |
+| vLLM | `verl_vllm024.dev2.sqsh` | 0.28.0 |
+| SGLang | `verl_sgl0512.dev4.sqsh` | 0.5.19 |
+
+The image filenames describe their original contents; the experiment installed
+its own engine versions into `/experiment/engines/<engine>/venv`.
+The same prepared environments were reused by the four formal training runs.
+
+From an allocated Slurm CPU job, the preparation command had this shape:
 
 ```bash
+EXPERIMENT_ROOT=/path/to/staged/retool-h100-20260916
+DYNAMO_SRC=/path/to/dynamo
+MODEL_DIR=/path/to/Qwen3-30B-A3B-Base
+BASE_IMAGE=/path/to/images/verl_sgl0512.dev4.sqsh
+export BENCH_ENGINE=sglang  # use vllm and its image for the other environment
+srun --container-image="$BASE_IMAGE" --no-container-mount-home \
+    --container-mounts="$EXPERIMENT_ROOT:/experiment,$DYNAMO_SRC/components:/dynamo/components:ro,$MODEL_DIR:/model:ro" \
+    --container-workdir=/experiment \
+    python3 /experiment/setup/prepare_cpu.py
+```
+
+This command expects the original staged experiment, including its setup scripts,
+source/data snapshots, wheels and model files. The container mounts were:
+
+| Container path | Contents |
+| --- | --- |
+| `/experiment` | Experiment archive and writable per-engine environments |
+| `/dynamo/components` | Read-only Python components from the pinned Dynamo checkout |
+| `/model` | Read-only Qwen3-30B-A3B-Base model |
+| `/experiment/bin` | Existing `etcd` and `nats-server` binaries copied during staging |
+
+## 3. Prepare dependencies, then install the wheels
+
+`prepare_environment.py` created each environment with
+`uv venv --python /usr/bin/python3`, without inheriting the image's Python packages.
+It generated `environment-requirements.txt` from the selected engine's package
+metadata, excluded `flash-attn-4`, and added the training/tool dependencies.
+Key pins were Torch **2.13.0**, Transformers **5.12.1**, Ray **2.56.1**,
+CuPy **14.0.1** (`cupy-cuda13x`), and NIXL **1.3.2** for vLLM / **1.4.0** for SGLang.
+The engine itself was then installed with `--no-deps`; TransferQueue came from
+commit `434f8c476b4be24bc087e6e95070e64efcc739f9`.
+
+After that environment was ready, `prepare_cpu.py` installed a matching local
+FlashAttention **2.8.3** wheel, verified the Dynamo wheel hashes against
+`wheel-manifest.json`, and ran the following installation sequence. The paths
+below use the underlying archive directories rather than its per-engine symlinks:
+
+```bash
+BENCH_ENGINE=sglang  # or vllm
+DYNAMO_PYTHON="/experiment/engines/$BENCH_ENGINE/venv/bin/python"
+uv pip install --python "$DYNAMO_PYTHON" \
+    /experiment/runtime/"$BENCH_ENGINE"/flash_attn-*.whl
+uv pip install --python "$DYNAMO_PYTHON" \
+    /experiment/runtime/wheels/ai_dynamo_runtime-1.5.0-cp310-abi3-manylinux_2_39_x86_64.whl \
+    /experiment/runtime/wheels/ai_dynamo-1.5.0-py3-none-any.whl \
+    'aisimulate==0.12.0.dev2' 'protobuf>=6.33.5,<7'
+uv pip install --python "$DYNAMO_PYTHON" --no-deps -e /experiment/src/verl
+```
+
+The Dynamo install above resolves dependencies. The `--no-deps` editable install
+applies to the prepared verl snapshot, preserving the selected engine stack and
+its experiment-specific compatibility changes.
+
+The repository's [SGLang Slurm launcher](train_qwen3_30b_sglang.sh) uses the same
+local-wheel/source-overlay pattern, but installs its two wheels with
+`pip install --force-reinstall --no-deps`. Its default wheelhouse is historical;
+set `DYNAMO_WHEELHOUSE` to the wheels for the chosen commit and `DYNAMO_SRC` to
+the matching checkout, using paths visible inside its container. That launcher's
+bootstrap differs from the DFW comparison's `uv` preparation above.
+
+## 4. Load the source overlay and verify
+
+The DFW preparation and training processes used these paths:
+
+```bash
+export PATH="/experiment/engines/$BENCH_ENGINE/venv/bin:/experiment/bin:$PATH"
+export PYTHONPATH="/dynamo/components/src:/experiment/src/verl:/experiment/setup"
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
-unset PYTORCH_CUDA_ALLOC_CONF  # required by the SGLang sleep/wake path
+unset PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF
+cd /experiment/src/verl
+python3 -c 'import torch, flash_attn_2_cuda, dynamo._core; print(torch.__version__, dynamo._core.__file__)'
+python3 -m dynamo.frontend --help
 etcd --version
 nats-server --version
-python3 -c 'import torch, dynamo._core, verl, recipe.dynamo.register; assert torch.cuda.is_available()'
-python3 -m dynamo.frontend --help
-python3 -m verl.trainer.main_ppo \
-    --config-path ../../recipe/dynamo/config \
-    --config-name dynamo_trainer_v1_colocate_sglang --cfg job --resolve
 ```
 
-For vLLM, use `dynamo_trainer_v1_colocate` in the configuration check.
-On a GPU node, also run `python3 -m dynamo.sglang --help` or
-`python3 -m dynamo.vllm --help`. Then set `MODEL_PATH`, `TRAIN_FILE` and `TEST_FILE`
-and run the matching [two-step smoke](README.md#launch). CLI/configuration
-checks do not exercise generation, sleep/wake or weight synchronization.
+Keep the source overlay and runtime wheel at the same commit. Check the actual
+Python import location inside the job, for example on SGLang:
 
-For multiple nodes, make the environment, source paths and binaries available
-at identical paths before starting Ray. Mount model/data directories and use a
-writable Hugging Face cache. ReTool additionally requires its prepared dataset,
-reward function and a working SandboxFusion tool service; see the
+```bash
+python3 - <<'CHECK'
+from pathlib import Path
+from dynamo.sglang.request_handlers import handler_base
+path = Path(handler_base.__file__).resolve()
+print(path)
+assert path.is_relative_to(Path("/dynamo/components/src/dynamo"))
+CHECK
+```
+
+Preparation also resolved the real trainer configs and saved dependency/import
+reports. The allocated H100 job checked the backend CLI, GPU availability and
+SandboxFusion before starting `verl.trainer.main_ppo`. ReTool dataset, reward,
+tool-service and training-side changes are described in the
 [benchmark prerequisites](benchmarks/retool_h100_20260916.md#experiment-prerequisites-and-limitations).
