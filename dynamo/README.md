@@ -61,18 +61,18 @@ Request routing happens inside Dynamo's KV router, **not** in verl's
 
 | File                                                           | Role                                                                                                                                                                                                              |
 | -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[register.py](register.py)`                                   | Registers `dynamo` in verl's rollout registries; loaded via `VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register`.                                                                                                   |
-| `[config/dynamo_trainer.yaml](config/dynamo_trainer.yaml)`     | Hydra config: inherits `ppo_trainer`, sets `rollout.name=dynamo`, `rollout.mode=async`.                                                                                                                           |
-| `[dynamo_async_server.py](dynamo_async_server.py)`             | `DynamoReplica` / `DynamoHttpServer` — spawns and watchdogs etcd, nats-server, engine workers, and `dynamo.frontend`, for both engines.                                                                           |
-| `[dynamo_rollout.py](dynamo_rollout.py)`                       | `ServerAdapter` — engine-agnostic facade; dispatches on `engine_kwargs.dynamo.engine` and lazily imports the chosen adapter (no module-scope engine imports), so it loads on an image that ships only one engine. |
-| `[dynamo_vllm_rollout.py](dynamo_vllm_rollout.py)`             | `VllmDynamoServerAdapter` — per-rank client for the vLLM engine; HTTP generation via the frontend, control RPCs (sleep/wake/`update_weights`) to the shared per-node actor.                                       |
-| `[dynamo_sglang_rollout.py](dynamo_sglang_rollout.py)`         | `SGLangServerAdapter` — per-rank client for the sglang engine (shard-local TP group, CUDA-IPC weight sync via `update_weights_from_tensor`).                                                                      |
-| `[dynamo_sglang_engine.py](dynamo_sglang_engine.py)`           | HTTP client for `dynamo.sglang`'s native `/engine/control/*` RL routes.                                                                                                                                           |
-| `[dynamo_naming.py](dynamo_naming.py)`                         | `control_actor_name()` — the one place the `dynamo_server_{replica}_{node}` actor-name contract is spelled out.                                                                                                   |
-| `[dynamo_agent_loop.py](dynamo_agent_loop.py)`                 | `DynamoServerManager` / `DynamoLLMServerManager` — talk to the single shared frontend instead of load-balancing across replicas.                                                                                  |
-| `[dynamo_worker_extension.py](dynamo_worker_extension.py)`     | vLLM `worker_extension_cls` that maps each DP shard to a node-global rank so trainer and engine agree on the CUDA-IPC socket path.                                                                                |
-| `[_dynamo_vllm_with_control.py](_dynamo_vllm_with_control.py)` | Private ZMQ control sidecar that bridges verl's `collective_rpc` into the `dynamo.vllm` subprocess (vLLM only; sglang has native control routes).                                                                 |
-| `[metrics_sidecar.py](metrics_sidecar.py)`                     | Optional per-worker system-status / metrics scraper.                                                                                                                                                              |
+| [register.py](register.py)                                   | Registers `dynamo` in verl's rollout registries; loaded via `VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register`.                                                                                                   |
+| [config/dynamo_trainer.yaml](config/dynamo_trainer.yaml)     | Hydra config: inherits `ppo_trainer`, sets `rollout.name=dynamo`, `rollout.mode=async`.                                                                                                                           |
+| [dynamo_async_server.py](dynamo_async_server.py)             | `DynamoReplica` / `DynamoHttpServer` — spawns and watchdogs etcd, nats-server, engine workers, and `dynamo.frontend`, for both engines.                                                                           |
+| [dynamo_rollout.py](dynamo_rollout.py)                       | `ServerAdapter` — engine-agnostic facade; dispatches on `engine_kwargs.dynamo.engine` and lazily imports the chosen adapter (no module-scope engine imports), so it loads on an image that ships only one engine. |
+| [dynamo_vllm_rollout.py](dynamo_vllm_rollout.py)             | `VllmDynamoServerAdapter` — per-rank client for the vLLM engine; HTTP generation via the frontend, control RPCs (sleep/wake/`update_weights`) to the shared per-node actor.                                       |
+| [dynamo_sglang_rollout.py](dynamo_sglang_rollout.py)         | `SGLangServerAdapter` — per-rank client for the sglang engine (shard-local TP group, CUDA-IPC weight sync via `update_weights_from_tensor`).                                                                      |
+| [dynamo_sglang_engine.py](dynamo_sglang_engine.py)           | HTTP client for `dynamo.sglang`'s native `/engine/control/*` RL routes.                                                                                                                                           |
+| [dynamo_naming.py](dynamo_naming.py)                         | `control_actor_name()` — the one place the `dynamo_server_{replica}_{node}` actor-name contract is spelled out.                                                                                                   |
+| [dynamo_agent_loop.py](dynamo_agent_loop.py)                 | `DynamoServerManager` / `DynamoLLMServerManager` — talk to the single shared frontend instead of load-balancing across replicas.                                                                                  |
+| [dynamo_worker_extension.py](dynamo_worker_extension.py)     | vLLM `worker_extension_cls` that maps each DP shard to a node-global rank so trainer and engine agree on the CUDA-IPC socket path.                                                                                |
+| [_dynamo_vllm_with_control.py](_dynamo_vllm_with_control.py) | Private ZMQ control sidecar that bridges verl's `collective_rpc` into the `dynamo.vllm` subprocess (vLLM only; sglang has native control routes).                                                                 |
+| [metrics_sidecar.py](metrics_sidecar.py)                     | Optional per-worker system-status / metrics scraper.                                                                                                                                                              |
 
 
 Enable the backend by pointing verl at the recipe's registration module:
@@ -185,8 +185,8 @@ conditional install, never a baked image.
 
 | Script                                                                       | Engine | What it runs                                                                                                                                                                                                                                                             |
 | ---------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `[train_30b_rl_dynamo_kv_metrics.sh](train_30b_rl_dynamo_kv_metrics.sh)`     | vLLM   | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below).                                                                                                                                                                      |
-| `[train_qwen3_30b_sglang.sh](train_qwen3_30b_sglang.sh)`                     | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
+| [train_30b_rl_dynamo_kv_metrics.sh](train_30b_rl_dynamo_kv_metrics.sh)     | vLLM   | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below).                                                                                                                                                                      |
+| [train_qwen3_30b_sglang.sh](train_qwen3_30b_sglang.sh)                     | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
 
 
 
@@ -244,9 +244,9 @@ At 0.5B the LIBFABRIC path is at parity with naive (the shared per-rank
 engine-consume dominates); at 8B it is ~9% faster. The UCX column shows
 the send/recv emulation ceiling — protocol-level, not tunable.
 
-Two helpers ship with the recipe: `[run_nixl_smoke.sh](run_nixl_smoke.sh)` (a
+Two helpers ship with the recipe: [run_nixl_smoke.sh](run_nixl_smoke.sh) (a
 3-step GRPO training smoke parameterised over `NNODES` / `CE_BACKEND`) and
-`[nixl_bench.py](nixl_bench.py)` (a standalone cross-node bandwidth probe for
+[nixl_bench.py](nixl_bench.py) (a standalone cross-node bandwidth probe for
 checking what a fabric actually delivers before debugging the training path).
 When running in containers/Kubernetes, give worker pods the fabric's
 RDMA device resource (e.g. `rdma/ib`) and the `IPC_LOCK` capability —
@@ -360,8 +360,9 @@ The original PR #110/#126 flow — `--config-name=dynamo_trainer` (which pins
 `trainer.use_v1=false`), colocated `hybrid_engine=True`, and the legacy
 `DynamoAgentLoopManager` — still works but is a **compatibility path**:
 upstream has deprecated the V0 trainer (removal planned in v0.9.0), and the
-legacy manager must NOT be combined with `trainer.use_v1=true` (the entry
-point fails fast on that combination because it does not write TransferQueue).
+legacy manager must NOT be combined with `trainer.use_v1=true`.
+`DynamoAgentLoopManager` rejects that configuration when initialized because
+it does not write TransferQueue.
 
 ```bash
 actor_rollout_ref.rollout.mode=async \
@@ -448,7 +449,7 @@ frontend, ThunderAgent, workers, NATS, then etcd.
 
 ### Configuration
 
-The recipe's default config (`[config/dynamo_base.yaml](config/dynamo_base.yaml)`,
+The recipe's default config ([config/dynamo_base.yaml](config/dynamo_base.yaml),
 inherited by `dynamo_trainer.yaml`) enables ThunderAgent. It is validated end to end
 on the vLLM path. The sglang engine has the worker-side glue (its workers register
 under the internal `--verl-thunderagent-backend` name so only the router serves the
@@ -502,7 +503,7 @@ standard verl PPO configuration.
 
 ### UniAgent variants
 
-`[run_uniagent_variant.sh](run_uniagent_variant.sh)` is a concise UniAgent
+[run_uniagent_variant.sh](run_uniagent_variant.sh) is a concise UniAgent
 training example. Select one rollout path with `VARIANT`:
 
 - `ta` (default): Dynamo with ThunderAgent enabled.
