@@ -641,7 +641,7 @@ def test_recipe_pins_tested_verl_and_dynamo_revisions() -> None:
     # Pin carried forward from the sglang branch (V1 interfaces verified there).
     assert "COMMIT=6cbca9ce7208100d11b4d1b06eccf098cc9e76aa" in required_verl
     assert "COMMIT=d82d2777" not in required_verl
-    assert "59d614641837e593f0567b79d75394aae5f864e0" in readme
+    assert "8c5a73723109058f96c15fff3fc912231d65ad6e" in readme
     assert "dynamo/REQUIRED_VERL.txt" in repository_readme
 
 

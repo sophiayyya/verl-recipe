@@ -1,620 +1,158 @@
 # Dynamo rollout backend for verl
 
-This recipe plugs [NVIDIA Dynamo](https://github.com/ai-dynamo/dynamo) into verl
-as a first-class **async rollout backend**, alongside the built-in `vllm`,
-`sglang` backends. Turning it on is a one-line config change
-(`actor_rollout_ref.rollout.name=dynamo`); everything Dynamo-specific
-is driven from `rollout.engine_kwargs.dynamo.*`. The backend can front **either inference engine**: `dynamo.vllm` (the default)
-or `dynamo.sglang` (`engine_kwargs.dynamo.engine=sglang`).
+Run verl training with **vLLM or SGLang** behind Dynamo's **KV-aware router**.
+The recipe supports shared or separate training/rollout GPUs, weight updates,
+and engine sleep/wake. All training launchers use `verl.trainer.main_ppo`.
 
-Dynamo owns request routing behind a single logical frontend, so its
-**KV-cache-aware router** can raise the prefix-cache hit rate across a rollout
-step. Weight updates flow through verl's colocated CUDA-IPC path when trainer
-and engine workers share GPUs (`colocate_async` / legacy V0), and through a
-two-hop checkpoint-engine path (nccl across pools → node-local CUDA-IPC) for
-the standalone rollout pool in `separate_async`.
+[Architecture](#architecture) · [Quick start](#quick-start) ·
+[Configuration](#configuration) · [Results](#results) · [Key files](#key-files)
 
-**Contents** —
-[How it works](#how-it-works) ·
-[Configuration](#configuration) ·
-[Quick start](#quick-start) ·
-[V1 async trainers](#running-a-full-rl-run-v1-trainer--the-main-path) ·
-[NIXL weight sync](#nixl-weight-sync-checkpoint-engine) ·
-[KV-aware routing result](#kv-aware-routing-result) ·
-[Legacy V0 path](#legacy-v0-path-compatibility-only) ·
-[ThunderAgent](#thunderagent-extension) ·
-[SGLang engine](#sglang-engine-engine_kwargsdynamoenginesglang)
+## Architecture
 
-## How it works
+```mermaid
+flowchart LR
+    V("verl<br/>PPO trainer + agent loops")
+    F("Shared Dynamo frontend<br/>KV-aware router")
+    subgraph P["Rollout worker pool"]
+        direction TB
+        W1("Node 1<br/>vLLM or SGLang workers")
+        WN("Node N<br/>vLLM or SGLang workers")
+    end
+    V -->|Generation requests| F
+    F --> W1
+    F --> WN
 
-The Dynamo backend keeps verl's AgentLoop execution model but replaces the
-rollout server with a Dynamo deployment. A single Ray actor per node
-(`DynamoHttpServer`) supervises the whole Dynamo stack as subprocesses; it
-reserves **no** GPUs of its own — the colocated trainer workers already own
-them, and the actor only forwards `CUDA_VISIBLE_DEVICES` into the engine
-shards.
-
-```
- verl trainer (colocated, owns GPUs)
-        │  HTTP chat/completions            control RPC (sleep / wake /
-        │  (per-rank ServerAdapter)         update_weights) via Ray
-        ▼                                             │
- ┌─────────────────── DynamoHttpServer (Ray actor, 1 / node) ────────────────────┐
- │  supervises + watchdogs subprocesses, forwards CUDA_VISIBLE_DEVICES           │
- │                                                                               │
- │   dynamo.frontend ──► KV-aware router ──► engine workers × N (one / DP        │
- │        ▲                                        │     shard; dynamo.vllm      │
- │        │                       CUDA-IPC weight sync    or dynamo.sglang)      │
- │        │                       (ZMQ receiver for vLLM;                        │
- │        │                        native control route for sglang)              │
- │   etcd + nats-server (service discovery / messaging)                          │
- │                                                                               │
- │   optional: per-worker metrics sidecar                                        │
- └───────────────────────────────────────────────────────────────────────────────┘
+    classDef trainer fill:#eff6ff,stroke:#2563eb,color:#1e3a8a,stroke-width:1.5px
+    classDef router fill:#ecfdf5,stroke:#059669,color:#064e3b,stroke-width:2px
+    classDef worker fill:#f8fafc,stroke:#64748b,color:#0f172a,stroke-width:1.5px
+    class V trainer
+    class F router
+    class W1,WN worker
+    style P fill:transparent,stroke:#94a3b8,stroke-dasharray:5 5
 ```
 
-Request routing happens inside Dynamo's KV router, **not** in verl's
-`GlobalRequestLoadBalancer` — verl only ever talks to the one shared frontend.
-
-### Key files
-
-
-| File                                                           | Role                                                                                                                                                                                                              |
-| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [register.py](register.py)                                   | Registers `dynamo` in verl's rollout registries; loaded via `VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register`.                                                                                                   |
-| [config/dynamo_trainer.yaml](config/dynamo_trainer.yaml)     | Hydra config: inherits `ppo_trainer`, sets `rollout.name=dynamo`, `rollout.mode=async`.                                                                                                                           |
-| [dynamo_async_server.py](dynamo_async_server.py)             | `DynamoReplica` / `DynamoHttpServer` — spawns and watchdogs etcd, nats-server, engine workers, and `dynamo.frontend`, for both engines.                                                                           |
-| [dynamo_rollout.py](dynamo_rollout.py)                       | `ServerAdapter` — engine-agnostic facade; dispatches on `engine_kwargs.dynamo.engine` and lazily imports the chosen adapter (no module-scope engine imports), so it loads on an image that ships only one engine. |
-| [dynamo_vllm_rollout.py](dynamo_vllm_rollout.py)             | `VllmDynamoServerAdapter` — per-rank client for the vLLM engine; HTTP generation via the frontend, control RPCs (sleep/wake/`update_weights`) to the shared per-node actor.                                       |
-| [dynamo_sglang_rollout.py](dynamo_sglang_rollout.py)         | `SGLangServerAdapter` — per-rank client for the sglang engine (shard-local TP group, CUDA-IPC weight sync via `update_weights_from_tensor`).                                                                      |
-| [dynamo_sglang_engine.py](dynamo_sglang_engine.py)           | HTTP client for `dynamo.sglang`'s native `/engine/control/*` RL routes.                                                                                                                                           |
-| [dynamo_naming.py](dynamo_naming.py)                         | `control_actor_name()` — the one place the `dynamo_server_{replica}_{node}` actor-name contract is spelled out.                                                                                                   |
-| [dynamo_agent_loop.py](dynamo_agent_loop.py)                 | `DynamoServerManager` / `DynamoLLMServerManager` — talk to the single shared frontend instead of load-balancing across replicas.                                                                                  |
-| [dynamo_worker_extension.py](dynamo_worker_extension.py)     | vLLM `worker_extension_cls` that maps each DP shard to a node-global rank so trainer and engine agree on the CUDA-IPC socket path.                                                                                |
-| [_dynamo_vllm_with_control.py](_dynamo_vllm_with_control.py) | Private ZMQ control sidecar that bridges verl's `collective_rpc` into the `dynamo.vllm` subprocess (vLLM only; sglang has native control routes).                                                                 |
-| [metrics_sidecar.py](metrics_sidecar.py)                     | Optional per-worker system-status / metrics scraper.                                                                                                                                                              |
-
-
-Enable the backend by pointing verl at the recipe's registration module:
-
-```bash
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
-```
-
-
-
-## Configuration
-
-Everything Dynamo-specific lives under
-`actor_rollout_ref.rollout.engine_kwargs.dynamo`. All keys are optional; sane
-defaults are applied in `DynamoHttpServer`.
-
-
-| Key                                                    | Values / example                                                   | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------------------------------------------ | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `engine`                                               | `vllm` (default), `sglang`                                         | Which inference engine the workers run.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `router_mode`                                          | `kv` (default), `round-robin`, `random`, `least-loaded`            | Dynamo request-routing policy; `kv` enables KV-cache-aware routing.                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `frontend_http_port` / `etcd_port` / `nats_port`       | `0` = auto-assign                                                  | Fixed ports if you need them.                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `served_model_name`                                    | falls back to `model_config.local_path`                            | Model name the frontend advertises.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `request_engine_data` / `request_completion_token_ids` | `true` / `false`                                                   | Ask the frontend to return `nvext.engine_data` (vLLM only) / raw `completion_token_ids` (token-in/token-out for RL). **Required for RL.** The sglang engine refuses to start when `request_completion_token_ids` is left unset (an explicit `false` is honored). If it is `true` and the frontend still returns no token ids, generation raises rather than silently re-tokenizing the text; when it is off, the text re-encode fallback is logged at ERROR (first 3 hits + every 100th). |
-| `return_tokens_as_token_ids`                           | `true` / `false`                                                   | Emit token ids instead of detokenized text.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `request_timeout_s`                                    | `600` (default; scripts use `1800`)                                | Per-request timeout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `free_engine_on_train` | mirrors `rollout.free_cache_engine` (default `true`; set in `config/dynamo_base.yaml`) | Sleep the engine during the training phase. Validated against `rollout.free_cache_engine` at startup: an explicit value that contradicts it fails fast instead of silently no-op'ing (and OOM'ing) in colocate training. |
-| `enable_kv_events`                                     | `true` (default) / `false`                                         | Pass `--kv-events-config` to every engine shard (vLLM and SGLang) so the KV router indexes real block residency. Without it the SGLang worker registers `use_kv_events=False` and the router only has its predict-on-route guesses (measured: router-estimated hit 0.87 vs engine 0.63). Set `false` for `round-robin`, where the events are pure overhead.                                                                                                                               |
-| `router_session_affinity_ttl_secs`                     | unset (default, off) / `1`..`31536000`                             | Frontend `--router-session-affinity-ttl-secs`: pin every request carrying the same `x-dynamo-session-id` to one worker. The recipe sends verl's per-trajectory request_id as that header, so the later turns of a multi-turn rollout land on the worker that already holds their prefix. Works in every `router_mode`; with ThunderAgent on, the program id it sets is the key.                                                                                                                                                                    |
-| `enable_worker_system_metrics`                         | `true` / `false`                                                   | Expose the per-worker system-status / metrics port (paired with `metrics_sidecar.py`). Must stay `true` for sglang — that port carries its control plane.                                                                                                                                                                                                                                                                                                                                 |
-| `extra_args`                                           | `["--generation-config","vllm","--stream-interval=100"]`           | Extra CLI args forwarded verbatim to the engine worker.                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-
-
-
+**One frontend per rollout pool, shared across nodes and replicas.** Ray manages
+one server actor per node; only the pool's first node starts the frontend,
+etcd and NATS. Workers publish KV-cache events for routing. Weight updates use
+node-local CUDA IPC; separate pools receive weights through verl's checkpoint
+engine before applying them locally.
 
 ## Quick start
 
-All examples use verl's standard entry point. Three things make it work with this
-recipe on the pinned checkout (`6cbca9ce`):
+### Required versions
 
-- `--config-path ../../recipe/dynamo/config --config-name dynamo_trainer` loads the
-recipe's Hydra config. Hydra resolves the relative path against `verl/trainer/`
-(the module declaring `@hydra.main`), so it is CWD-independent as long as this
-repository sits at `recipe/` inside the verl checkout.
-- `trainer.use_v1=False` selects the legacy V0 `TaskRunner` that `dynamo_trainer`
-(agent-loop path, `DynamoAgentLoopManager`) is written for. The V1 unified trainer is
-the main path now; it uses the `dynamo_trainer_v1_*` presets described below, which
-set `trainer.use_v1: true` explicitly.
-- Custom rewards must use the canonical `reward.custom_reward_function.*` namespace,
-not the legacy top-level `custom_reward_function.*`: the v0 runner reads
-`config.reward.*` and `main_ppo` never runs the legacy-key migration, so legacy
-keys are **silently ignored** (the run proceeds with the default reward).
+Use separate environments for the two inference engines. The tested versions are:
 
-V0 and V1 both launch through `python3 -m verl.trainer.main_ppo`. Select the
-trainer with the recipe preset; upstream dispatches on `trainer.use_v1`.
-For example, V1 colocate training uses:
+| Component | Version |
+| --- | --- |
+| verl | [6cbca9ce](REQUIRED_VERL.txt) |
+| Dynamo | [8c5a737](https://github.com/ai-dynamo/dynamo/commit/8c5a73723109058f96c15fff3fc912231d65ad6e), after [PR #13951](https://github.com/ai-dynamo/dynamo/pull/13951) |
+| Inference engine | vLLM 0.28.0 **or** SGLang 0.5.19 |
+| V1 trainer | TransferQueue 0.1.9; `cupy-cuda12x` for the separate-pool NCCL backend |
+
+Install the selected Dynamo engine and keep `etcd` and `nats-server` on `PATH`.
+Place this repository at `recipe/` inside the verl checkout and run commands
+from that checkout. For SGLang, unset `PYTORCH_CUDA_ALLOC_CONF`.
+
+### Launch
+
+Choose a preset and supply your model, datasets, and resource overrides:
 
 ```bash
 export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
 python3 -m verl.trainer.main_ppo \
     --config-path ../../recipe/dynamo/config \
-    --config-name dynamo_trainer_v1_colocate \
-    actor_rollout_ref.model.path=... data.train_files=... data.val_files=...
+    --config-name dynamo_trainer_v1_colocate_sglang \
+    actor_rollout_ref.model.path=/path/to/model \
+    data.train_files=/path/to/train.parquet \
+    data.val_files=/path/to/val.parquet \
+    trainer.n_gpus_per_node=1 trainer.nnodes=1
 ```
 
-The V1 presets select the TransferQueue-compatible default agent manager.
-The legacy `DynamoAgentLoopManager` rejects V1 configuration when instantiated.
-All presets forward the registry module through the Ray job runtime environment.
-Custom rewards use `reward.custom_reward_function.*` for both trainer versions.
+| Preset | Trainer / placement |
+| --- | --- |
+| [dynamo_trainer_v1_colocate](config/dynamo_trainer_v1_colocate.yaml) | V1, vLLM, shared GPUs |
+| [dynamo_trainer_v1_colocate_sglang](config/dynamo_trainer_v1_colocate_sglang.yaml) | V1, SGLang, shared GPUs |
+| [dynamo_trainer_v1_separate](config/dynamo_trainer_v1_separate.yaml) | V1, separate rollout pool; vLLM by default |
+| [dynamo_trainer](config/dynamo_trainer.yaml) | Legacy V0, shared GPUs |
 
-### 1. Generation-only smoke
+For a small training smoke, set `MODEL_PATH`, `TRAIN_FILE` and `TEST_FILE`, then
+choose one launcher. Colocate defaults to 1 GPU; separate needs at least 2:
 
-Verifies the full Dynamo stack (etcd + nats + workers + frontend) can serve a
-completion, no training loop. Passes when the log prints `PASS:`.
+| Placement | vLLM | SGLang |
+| --- | --- | --- |
+| Shared GPUs | [Colocate smoke](smoke_dynamo_v1_colocate.sh) | [Colocate smoke](smoke_dynamo_v1_colocate_sglang.sh) |
+| Separate pools | [Separate smoke](smoke_dynamo_v1_separate.sh) | [Separate smoke](smoke_dynamo_v1_separate_sglang.sh) |
 
 ```bash
-bash recipe/dynamo/smoke_vllm_generate.sh          # Qwen2.5-0.5B-Instruct, 1 GPU
+TOTAL_STEPS=2 bash recipe/dynamo/smoke_dynamo_v1_colocate_sglang.sh
 ```
 
-
-
-### 2. One-node training smoke
-
-```bash
-export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
-python3 -m verl.trainer.main_ppo \
-    --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
-    trainer.use_v1=False \
-    algorithm.adv_estimator=grpo \
-    data.train_files=.../gsm8k/train.parquet \
-    data.val_files=.../gsm8k/test.parquet \
-    actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
-    actor_rollout_ref.rollout.name=dynamo \
-    actor_rollout_ref.rollout.mode=async \
-    ++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=kv \
-    trainer.n_gpus_per_node=2 trainer.nnodes=1 \
-    trainer.total_training_steps=2
-```
-
-
-
-### 3. Multi-node 30B RL
-
-Proven `Qwen3-30B-A3B-Base` launchers (SLURM, 4 × 8 H100 unless noted). vLLM and
-sglang **cannot share one job**: installing the `ai_dynamo[sglang]` extra
-downgrades vLLM's guided-decoding stack (`llguidance`, `outlines_core`, …), and
-the breakage only surfaces at runtime — so each engine gets its own job with a
-conditional install, never a baked image.
-
-
-| Script                                                                       | Engine | What it runs                                                                                                                                                                                                                                                             |
-| ---------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [train_30b_rl_dynamo_kv_metrics.sh](train_30b_rl_dynamo_kv_metrics.sh)     | vLLM   | KV router + metrics sidecar RL run (inner command, `NNODES` default 2; driven by the sbatch below).                                                                                                                                                                      |
-| [train_qwen3_30b_sglang.sh](train_qwen3_30b_sglang.sh)                     | sglang | The verified 100-step retool GRPO run. Defaults reproduce it (`ENFORCE_EAGER=False`, `DISABLE_PIECEWISE=0`, deferred optimizer load / fused kernels / eager experts all off); every env knob is listed in the script header, e.g. `sbatch --export=ALL,TOTAL_STEPS=3 …`. |
-
-
-
-
-## NIXL weight sync (checkpoint engine)
-
-By default the trainer pushes weights to the Dynamo workers through verl's
-naive CUDA-IPC path. Setting
-
-```bash
-actor_rollout_ref.rollout.checkpoint_engine.backend=nixl \
-actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024
-```
-
-routes refit through verl's `CheckpointEngineManager` instead: the recipe
-spawns one `CheckpointEngineWorker` Ray actor per rollout rank (colocated on
-the paired GPU — CUDA IPC requires same-GPU pairing) and NIXL moves the
-buckets down a trainer → CE₁ → … → CEₙ chain, which crosses nodes at most
-twice regardless of world size.
-
-### Support matrix
-
-
-| backend | single-node | multi-node            |
-| ------- | ----------- | --------------------- |
-| naive   | ✅           | ✅                     |
-| NIXL    | ✅           | ✅ (2×8 GPU validated) |
-
-
-
-
-### Transport selection (read this before multi-node)
-
-NIXL's default backend is UCX, and UCX picks its transport from `UCX_TLS`.
-The right setting depends on the RDMA fabric:
-
-
-| fabric                                                   | recommendation                                                                                                                                                                                                                                                                                                                |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| RDMA with native RDMA-read (e.g. InfiniBand / RoCE)      | `UCX_TLS=cuda_ipc,cuda_copy,rc,tcp` — `rc` gives native RDMA read at line rate.                                                                                                                                                                                                                                               |
-| RDMA without native RDMA-read (send/recv-only protocols) | UCX can only emulate one-sided reads over send/recv — we measured 0.23 GB/s. Use NIXL's **LIBFABRIC** backend instead: `+actor_rollout_ref.rollout.checkpoint_engine.engine_kwargs.nixl.backends=[LIBFABRIC]`, with your fabric's libfabric provider (≥1.18) on `LD_LIBRARY_PATH`. Same 1 GiB cross-node read: **48.5 GB/s**. |
-
-
-Cross-node measured on 2 nodes × 8×H100 (RDMA fabric), 3-step GRPO,
-step-3 `update_weights`:
-
-
-| model        | naive  | NIXL UCX (tcp / one-sided read emulated over send/recv) | NIXL LIBFABRIC |
-| ------------ | ------ | ------------------------------------------------------- | -------------- |
-| Qwen2.5-0.5B | 3.08 s | 12.2 s / 11.6 s                                         | 3.09 s         |
-| Qwen3-8B     | 29.7 s | —                                                       | **27.1 s**     |
-
-
-At 0.5B the LIBFABRIC path is at parity with naive (the shared per-rank
-engine-consume dominates); at 8B it is ~9% faster. The UCX column shows
-the send/recv emulation ceiling — protocol-level, not tunable.
-
-Two helpers ship with the recipe: [run_nixl_smoke.sh](run_nixl_smoke.sh) (a
-3-step GRPO training smoke parameterised over `NNODES` / `CE_BACKEND`) and
-[nixl_bench.py](nixl_bench.py) (a standalone cross-node bandwidth probe for
-checking what a fabric actually delivers before debugging the training path).
-When running in containers/Kubernetes, give worker pods the fabric's
-RDMA device resource (e.g. `rdma/ib`) and the `IPC_LOCK` capability —
-NIXL needs it to pin memory for RDMA registration, and transfers hang
-without it.
-
-> `engine_kwargs.nixl.backends` requires a small verl-side change (a
-> `backends` kwarg on `NIXLCheckpointEngine`, pending as a separate verl
-> PR); on IB/RoCE fabrics the stock UCX backend needs no verl change.
-
-
-
-## KV-aware routing result
-
-The matched comparison below keeps only Dynamo KV routing with
-`stream-interval=100` and the native vLLM baseline. Lower `ms/token` is better;
-the similar response lengths are a sanity check that generation behavior stayed
-comparable.
-
-
-| Backend                           | ms/token | Mean response length | KV-cache hits / queries | KV-cache hit rate |
-| --------------------------------- | -------- | -------------------- | ----------------------- | ----------------- |
-| Dynamo KV (`stream-interval=100`) | 1.5956   | 876.1                | 2,248,368 / 2,520,362   | 89.21%            |
-| vLLM baseline                     | 1.7220   | 872.3                | 1,860,816 / 2,432,064   | 76.51%            |
-
-
-Dynamo KV shows approximately **7.3% lower per-token latency** (≈7.9% faster)
-in this comparison and improves the KV-cache hit rate by **12.70 percentage points**.
-
-## Running a full RL run (V1 trainer — the main path)
-
-The recipe now targets verl's **V1 unified trainer** (see `REQUIRED_VERL.txt`
-for the tested pin). Three entry configs ship ready to run:
-
-| Entry config | Mode | Engine | Placement |
-| --- | --- | --- | --- |
-| `--config-name=dynamo_trainer_v1_colocate` | `colocate_async` | vLLM | trainer + rollout share GPUs; replicas abort + sleep every train step |
-| `--config-name=dynamo_trainer_v1_colocate_sglang` | `colocate_async` | SGLang | same shape; adds the switches sglang hard-requires (`enable_sleep_mode`, `request_completion_token_ids`, `enable_worker_system_metrics`) |
-| `--config-name=dynamo_trainer_v1_separate` | `separate_async` | vLLM; SGLang with the four overrides `smoke_dynamo_v1_separate_sglang.sh` adds (`engine=sglang`, `request_completion_token_ids=true`, `enable_worker_system_metrics=true`, `rollout.enable_sleep_mode=true`) | standalone rollout pool (`rollout.nnodes × n_gpus_per_node`); weights flow nccl → node-local (CUDA-IPC for vLLM, the HTTP control route for sglang) |
-
-Smoke them end-to-end (real training steps, tiny model), one script per engine:
-
-```bash
-bash recipe/dynamo/smoke_dynamo_v1_colocate.sh
-bash recipe/dynamo/smoke_dynamo_v1_colocate_sglang.sh
-bash recipe/dynamo/smoke_dynamo_v1_separate.sh          # needs >= 2 GPUs and cupy (nccl backend)
-bash recipe/dynamo/smoke_dynamo_v1_separate_sglang.sh   # same requirements
-```
-
-Under V1, leave `agent.agent_loop_manager_class` at `null` (the presets do):
-verl's `AgentLoopManagerTQ` drives the loop and writes TransferQueue, and
-`DynamoLLMServerManager` upgrades the client to a partial-rollout-aware
-`FullyAsyncLLMServerClient` (with ThunderAgent affinity when enabled).
-Multi-turn agent frameworks (e.g. uni-agent) plug in unchanged via their own
-`agent_loop_manager_class` — validated with the uni-agent mem-agent recipe by
-only switching `rollout.name=vllm` → `dynamo`.
-
-ThunderAgent under V1: programs are keyed by the caller's stable `request_id`
-and auto-finalized per generate call (`thunderagent.auto_finalize`, default
-true). Multi-turn callers that want cross-turn affinity set
-`auto_finalize: false` and call the client's `finalize_program(session_id)`
-from their trajectory-end hook. Program tables are frontend-local and
-separate_async re-routes aborted retries across pools, so the client records
-**every server that serves a generation attempt** and finalizes each of them
-(each finalize RPC bounded by `thunderagent.finalize_timeout_s`, default
-60 s); cleanup counts as confirmed only when all ack, and unconfirmed
-cleanups count toward `thunderagent.finalize_leak_threshold`.
-
-### Multi-node runs (pre-started Ray clusters)
-
-On a pre-started Ray cluster (`ray start` on each node, driver connects with
-`RAY_ADDRESS`), workers inherit their environment from the **raylet's** shell,
-not from the driver — exports in your launch script never reach them. Two
-rules:
-
-1. **`VERL_USE_EXTERNAL_MODULES` is forwarded by the shared recipe config**
-   (`dynamo_base.yaml`) through `ray_kwargs.ray_init.runtime_env.env_vars`.
-   The config supplies the literal default `recipe.dynamo.register`. The supplied
-   scripts also forward the driver's module list as a literal CLI value. For
-   direct commands with extra modules, pass an explicit override:
-
-   ```
-   "ray_kwargs.ray_init.runtime_env.env_vars.VERL_USE_EXTERNAL_MODULES='${VERL_USE_EXTERNAL_MODULES}'"
-   ```
-
-   This applies to both V0 and V1 when launched through `verl.trainer.main_ppo`
-   with a Dynamo preset. Export the registration module in the driver as well.
-   Workers on pre-started Ray clusters otherwise fail with
-   `Rollout dynamo with mode async not found`.
-
-2. **Everything else must be exported before `ray start` on every node** —
-   deployment-specific paths cannot live in the repo config. Checklist (each
-   row is a failure observed in practice when missing):
-
-   | env before `ray start` | symptom when missing |
-   | --- | --- |
-   | `HF_HOME=<writable path>` | `OSError: Read-only file system` (datasets cache lands on the read-only model mount) |
-   | `PYTHONPATH=<ws>:<ws>/verl`, `PATH+=<etcd/nats dir>` | recipe import / infra binary failures |
-   | `unset DD_*`, `unset LD_PRELOAD` | raylet crashes parsing injected quoted-JSON env |
-   | `unset PYTORCH_CUDA_ALLOC_CONF` | sglang torch_memory_saver incompatibility |
-
-Small-GPU multi-node smokes only: size pods so no single node can hold every
-per-node bundle (verl places each node's bundle as an independent placement
-group with no cross-node constraint — full 8-GPU-per-node deployments are
-unaffected), and assert the pool spans the expected node count
-(`[DynamoReplica pool] ready: ... nodes=N`).
-
-### Legacy V0 path (compatibility only)
-
-The original PR #110/#126 flow — `--config-name=dynamo_trainer` (which pins
-`trainer.use_v1=false`), colocated `hybrid_engine=True`, and the legacy
-`DynamoAgentLoopManager` — still works but is a **compatibility path**:
-upstream has deprecated the V0 trainer (removal planned in v0.9.0), and the
-legacy manager must NOT be combined with `trainer.use_v1=true`.
-`DynamoAgentLoopManager` rejects that configuration when initialized because
-it does not write TransferQueue.
-
-```bash
-actor_rollout_ref.rollout.mode=async \
-actor_rollout_ref.rollout.multi_turn.enable=True \
-actor_rollout_ref.rollout.agent.num_workers=64 \
-actor_rollout_ref.rollout.agent.agent_loop_config_path=/path/to/agent_config.yaml \
-actor_rollout_ref.rollout.agent.default_agent_loop=<your_loop_name> \
-++actor_rollout_ref.rollout.agent.agent_loop_manager_class=recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
-```
-
-The `agent_loop_manager_class` override is the key one (`++`, not `+`: `config/dynamo_trainer.yaml` already sets it, and Hydra rejects a bare `+` on an existing key): it swaps verl's default
-manager for `DynamoAgentLoopManager`, which talks to the single shared Dynamo
-frontend instead of load-balancing across replicas.
-
-### Recommended `engine_kwargs.dynamo` for RL
-
-Token-in/token-out generation (so the trainer scores the exact tokens the engine
-produced), KV-aware routing, and freeing engine memory during the training
-phase. See the [Configuration](#configuration) table for every key. The
-`extra_args` shown are **vLLM-only** — drop them for the sglang engine (the
-verified sglang run used none).
-
-```bash
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.router_mode=kv \
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_engine_data=true \
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_completion_token_ids=true \
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.return_tokens_as_token_ids=false \
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.request_timeout_s=1800 \
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.enable_worker_system_metrics=true \
-'++actor_rollout_ref.rollout.engine_kwargs.dynamo.extra_args=["--generation-config","vllm","--stream-interval=100"]'
-```
-
-
-
-### Optional: KV-metrics sidecar
-
-With `enable_worker_system_metrics=true`, each worker writes an
-`.endpoints` file under `$VERL_DYNAMO_WORKER_METRICS_DIR`. Run the sidecar
-alongside training to scrape those `/metrics` endpoints into JSONL (KV-cache hit
-rate, queue depth, …):
-
-```bash
-python3 recipe/dynamo/metrics_sidecar.py \
-    --endpoints-glob "$VERL_DYNAMO_WORKER_METRICS_DIR/*.endpoints" \
-    --output /path/to/logs/kv_metrics.jsonl \
-    --label dynamo_kv --interval 30 &
-```
-
-
-
-## ThunderAgent extension
-
-
-
-### Required versions
-
-- Dynamo, vLLM engine: PyPI `ai-dynamo>=1.3.0.post1` (ships `dynamo.vllm`,
-`dynamo.frontend`, and `dynamo.thunderagent_router`, including
-[PR #11185](https://github.com/ai-dynamo/dynamo/pull/11185)). Supersedes the
-previous source build at commit `59d614641837e593f0567b79d75394aae5f864e0`.
-- Dynamo, sglang engine: additionally requires the incremental-logprobs fix
-  (dynamo#11640 area) which no stable PyPI release contains yet — use the
-  source build at `94accc7389` (the #11185 merge commit) with the
-  incremental-logprobs backport (dynamo#11640) applied, or
-  an image carrying that backport. Without it ~99.8% of sglang logprobs pad
-  and rollout-correction metrics explode.
-- verl: pinned commit in [REQUIRED_VERL.txt](REQUIRED_VERL.txt).
-- `separate_async` additionally needs `cupy-cuda12x` (verl's nccl
-checkpoint-engine backend registers only when cupy imports); the V1 trainer
-itself needs `TransferQueue` (tested with `0.1.9`).
-
-
-### Topology
-
-With ThunderAgent enabled, verl launches processes in this order:
-
-```text
-etcd -> NATS -> Dynamo engine workers (vLLM or SGLang) -> ThunderAgent router -> frontend
-```
-
-ThunderAgent owns the internal KV router and forwards to the worker
-endpoint `<namespace>.backend.generate`. Shutdown reverses the consumer side:
-frontend, ThunderAgent, workers, NATS, then etcd.
-
-### Configuration
-
-The recipe's default config ([config/dynamo_base.yaml](config/dynamo_base.yaml),
-inherited by `dynamo_trainer.yaml`) enables ThunderAgent. It is validated end to end
-on the vLLM path. The sglang engine has the worker-side glue (its workers register
-under the internal `--verl-thunderagent-backend` name so only the router serves the
-public model name), but its routing assertions still await a GPU rerun, so every
-sglang launcher here passes `thunderagent.enabled=false` explicitly:
-
-```yaml
-actor_rollout_ref:
-  rollout:
-    agent:
-      agent_loop_manager_class: recipe.dynamo.dynamo_agent_loop.DynamoAgentLoopManager
-    engine_kwargs:
-      dynamo:
-        thunderagent:
-          enabled: true
-          router_block_size: 16
-```
-
-`router_block_size` is applied to the engine (vLLM `--block-size`, SGLang
-`--page-size`) and to ThunderAgent alike. Pass scheduler
-CLI options without hard-coding them in the recipe:
-
-```yaml
-thunderagent:
-  enabled: true
-  router_block_size: 16
-  extra_args:
-    - --pause-threshold
-    - "0.95"
-```
-
-Optional finalization controls are `finalize_max_attempts` (default `3`) and
-`finalize_retry_delay_s` (default `0.1`). Set `thunderagent.enabled=false` for
-the PR #110 KV-router baseline.
-
-### Run
-
-From a verl checkout containing this repository at `recipe/`:
-
-```bash
-VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register \
-python -m verl.trainer.main_ppo \
-  --config-path ../../recipe/dynamo/config --config-name dynamo_trainer \
-  trainer.use_v1=False \
-  actor_rollout_ref.model.path=/path/to/model \
-  actor_rollout_ref.rollout.tensor_model_parallel_size=1
-```
-
-Supply the remaining dataset, trainer, and resource overrides required by the
-standard verl PPO configuration.
-
-### UniAgent variants
-
-[run_uniagent_variant.sh](run_uniagent_variant.sh) is a concise UniAgent
-training example. Select one rollout path with `VARIANT`:
-
-- `ta` (default): Dynamo with ThunderAgent enabled.
-- `dynamo`: the native Dynamo KV-router baseline with ThunderAgent disabled.
-- `global`: the native verl vLLM rollout baseline, bypassing Dynamo. The
-historical name does not mean that this script explicitly configures a
-GlobalLoadBalancer.
-
-Run it from the verl root:
-
-```bash
-VARIANT=ta     RAY_DATA_HOME=/path/to/verl-data bash recipe/dynamo/run_uniagent_variant.sh
-VARIANT=dynamo RAY_DATA_HOME=/path/to/verl-data bash recipe/dynamo/run_uniagent_variant.sh
-VARIANT=global RAY_DATA_HOME=/path/to/verl-data bash recipe/dynamo/run_uniagent_variant.sh
-```
-
-### End-to-end ThunderAgent result
-
-The ThunderAgent comparison used the following matched setup:
-
-- Uni-Agent × verl synchronous end-to-end GRPO, including rollout,
-reward/advantage, old log-probability, actor update, and weight
-synchronization.
-- Training and inference colocated and time-multiplexed on 8 × NVIDIA H20-3e
-GPUs (140.4 GiB/GPU), with two TP4 replicas.
-- Qwen3-Coder-30B-A3B-Instruct.
-- The only backend change was verl Global LB versus Dynamo ThunderAgent.
-
-Here, `rollout.mode=async` only enables concurrent agent requests within the
-rollout phase; the RL algorithm remains synchronous and does not use a
-`staleness_threshold`. Rollout throughput is generated response tokens divided
-by rollout wall time. Full-step throughput also includes reward/advantage,
-old-log-probability, actor-update, and weight-synchronization time.
-
-At concurrency 64–256, ThunderAgent and Global LB are near parity. At
-concurrency 384, ThunderAgent reaches **1.94× rollout-phase speedup** and
-**1.39× observed full-step speedup**; at concurrency 512, the speedups reach
-**2.40×** and **1.60×**, respectively.
-
-## SGLang engine (`engine_kwargs.dynamo.engine=sglang`)
-
-The SGLang control client now requires Dynamo after
-[ai-dynamo/dynamo#13951](https://github.com/ai-dynamo/dynamo/pull/13951)
-(tested commit `8c5a73723109058f96c15fff3fc912231d65ad6e`, SGLang 0.5.19).
-It pauses generation before releasing memory and continues only after restoring
-all released tags. The worker command registers `--engine-route flush_cache:tm`
-for readiness and refit; existing explicit registrations in `extra_args` are
-preserved. The legacy `call_tokenizer_manager` endpoint is no longer used by the
-standard lifecycle. The optional legacy parameter-readback diagnostic still
-requires its old endpoint and is not part of this validation.
-
-See [the 8×H100 ReTool validation](benchmarks/retool_h100_20260916.md) for all four
-50-step runs, software pins, metric definitions and experiment limitations.
-
-The Dynamo backend can front **either** `dynamo.vllm` (default, everything
-above) or `dynamo.sglang`. Engine selection is a single switch —
-`rollout.name=dynamo` stays fixed for both engines, and
-`recipe.dynamo.dynamo_rollout.ServerAdapter` dispatches on
-`engine_kwargs.dynamo.engine` (an earlier revision used a separate
-`rollout.name=dynamo_sglang`; that name is no longer registered):
-
-```bash
-actor_rollout_ref.rollout.name=dynamo \
-++actor_rollout_ref.rollout.engine_kwargs.dynamo.engine=sglang
-```
-
-
-
-### What is different from the vLLM path
-
-
-|                | vLLM                                                                | SGLang                                                                              |
-| -------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| Worker process | `python -m recipe.dynamo._dynamo_vllm_with_control` (verl wrapper)  | stock `python -m dynamo.sglang`                                                     |
-| Control plane  | verl-private ZMQ REP sidecar → `engine.collective_rpc`              | **native** `/engine/control/`* on `DYN_SYSTEM_PORT`                                 |
-| Weight sync    | `BucketedWeightSender` → ZMQ-IPC socket → `update_weights_from_ipc` | `MultiprocessingSerializer` CUDA-IPC handles → `control/update_weights_from_tensor` |
-| Sleep / wake   | `engine.sleep(level=…)`                                             | `release_memory_occupation(tags=…)` / `resume_memory_occupation`                    |
-| KV events      | `--kv-events-config <json>`                                         | same JSON, passed by default (`enable_kv_events`); sglang's ZMQ publisher plus `DynamoSglangPublisher` re-publish on the event plane |
-| Cache flush    | `reset_prefix_cache`                                                | `/engine/flush_cache` (registered with `--engine-route flush_cache:tm`)                   |
-
-
-`dynamo.sglang` registers its RL control routes itself
-(`request_handlers/handler_base.py::register_engine_routes`), which is why this
-path ships no sidecar. The trade is that `DYN_SYSTEM_PORT` stops being an
-optional metrics extra and becomes the whole control plane —
-`enable_worker_system_metrics=false` is rejected outright for this engine.
-
-### Run
-
-```bash
-# generation-only smoke (M1)
-bash recipe/dynamo/smoke_dynamo_sglang.sh
-
-# 2-step GRPO incl. weight sync + sleep/wake (M2)
-STAGE=train bash recipe/dynamo/smoke_dynamo_sglang.sh
-
-# the verified 4-node 30B run (100 steps; defaults reproduce it)
-sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
-# shorter: sbatch --export=ALL,TOTAL_STEPS=3 recipe/dynamo/train_qwen3_30b_sglang.sh
-```
-
-
-
-### `engine_kwargs.dynamo.sglang.*`
-
-
-| Key                   | Default                                        | Purpose                                                                                                                                                                                                                                                                                                                                      |
-| --------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enable_rl`           | `true`                                         | Forwards `--enable-rl`. Native lifecycle routes are built in; the recipe separately registers `flush_cache:tm`, including when this flag is disabled.                                                                                                                                                                                                                 |
-| `verify_weight_sync`  | `false`                                        | Best-effort probe: reads one synced parameter back via `get_weights_by_name` after each sync (snapshot refreshed every sync) and raises on mismatch. That API is model-specific and **unimplemented for Qwen2/Qwen3**, so on those models the probe logs `INCONCLUSIVE` at ERROR and verifies nothing — a passing run is not a verified one. |
-| `page_size`           | falls back to `thunderagent.router_block_size` | KV-router block size (`--page-size`).                                                                                                                                                                                                                                                                                                        |
-| `skip_tokenizer_init` | `false`                                        | Token-in/token-out.                                                                                                                                                                                                                                                                                                                          |
-| `attention_backend`   | `flashinfer`                                   | `--attention-backend`. sglang's Hopper default (fa3) decodes ~8% slower with the router page size; an explicit value or an `--attention-backend` in `extra_args` wins. |
-| `extra_args`          | `[]`                                           | Forwarded verbatim; `dynamo.sglang` exposes the whole `ServerArgs` CLI.                                                                                                                                                                                                                                                                      |
+The SGLang launchers include its required engine and sleep-mode settings.
+The separate launchers also set the rollout pool size and batch constraints.
+For 30B examples, see the [vLLM launcher](train_30b_rl_dynamo_kv_metrics.sh) and
+[SGLang Slurm launcher](train_qwen3_30b_sglang.sh); adapt paths and cluster resources.
+
+## Configuration
+
+Dynamo options live under `actor_rollout_ref.rollout.engine_kwargs.dynamo`.
+The shared defaults are in [dynamo_base.yaml](config/dynamo_base.yaml).
+
+| Option | Purpose |
+| --- | --- |
+| `engine` | `vllm` or `sglang`; keep `rollout.name=dynamo` for both |
+| `router_mode` | `kv`, `round-robin`, `random`, or `least-loaded` |
+| `enable_kv_events` | Keep `true` for KV-aware routing |
+| `thunderagent.enabled` | `false` for the built-in KV router; V1 presets set this explicitly |
+| `request_completion_token_ids` | Return exact generated token IDs for RL |
+| `enable_worker_system_metrics` | Required for SGLang's native control routes |
+| `free_engine_on_train` | Must match `rollout.free_cache_engine` |
+
+- **V1:** keep `agent.agent_loop_manager_class=null` to use TransferQueue.
+  The legacy `DynamoAgentLoopManager` only supports V0.
+- **Rewards:** use `reward.custom_reward_function.*` with either trainer.
+- **Multiple nodes:** presets forward the registry through Ray's runtime environment;
+  scripts also forward extra modules from the driver. Set paths and engine
+  environment variables on every node before starting Ray.
+- **Optional extensions:** [UniAgent variants](run_uniagent_variant.sh) cover
+  ThunderAgent and native baselines; [NIXL smoke](run_nixl_smoke.sh) and
+  [bandwidth probe](nixl_bench.py) cover checkpoint-engine weight transfer.
+
+## Results
+
+### Qwen3-30B-A3B-Base · ReTool · 8×H100
+
+Four independent **50-step** V0 GRPO runs, each on one 8×H100 80GB node with
+two TP4 replicas. Dynamo uses KV-aware routing with KV events enabled and
+ThunderAgent disabled. All four runs completed training and saved step-50 checkpoints.
+
+| Backend | gen (ms/token) ↓ | Output tokens/s ↑ | Step time (s) ↓ | W&B |
+| --- | ---: | ---: | ---: | --- |
+| Dynamo + vLLM | 0.210304 | 4,789.09 | 101.53 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/f945b6c47154) |
+| Native vLLM | 0.218803 | 4,609.28 | 106.41 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/08746adedc30) |
+| Dynamo + SGLang | 0.244768 | 4,097.10 | 123.38 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/b286d10e992d) |
+| Native SGLang | 0.241076 | 4,572.12 | 120.00 | [Run](https://wandb.ai/yangjingyi_algo/qwen3-30b-base-retool/runs/a31f8e690eda) |
+
+Mean `timing_per_token_ms/gen` is **3.88% lower with Dynamo + vLLM** and
+**1.53% higher with Dynamo + SGLang**, relative to the matching native engine.
+This metric includes tool-return context tokens; output throughput counts only
+model-generated tokens. Step time is the arithmetic mean over all 50 steps.
+
+These runs used additional experiment-specific verl/data/tool preparations.
+One run per arm, evolving policies, and sparse tool use limit the conclusions;
+these results do not isolate the effect of KV routing. See the
+[benchmark report](benchmarks/retool_h100_20260916.md) for the setup, metric
+definitions and validation scope.
+
+The subsequent `main_ppo` entry-point cleanup passed **141 CPU tests per engine**
+and **6 native CLI configuration checks**. GPU training was not repeated for that cleanup.
+
+## Key files
+
+| File | Role |
+| --- | --- |
+| [register.py](register.py) | Register the Dynamo backend with verl |
+| [config/](config/) | V0/V1 presets and shared defaults |
+| [dynamo_async_server.py](dynamo_async_server.py) | Shared frontend, worker pool and lifecycle |
+| [dynamo_rollout.py](dynamo_rollout.py) | Select the vLLM or SGLang adapter |
+| [dynamo_agent_loop.py](dynamo_agent_loop.py) | Agent-loop clients and async integration |
