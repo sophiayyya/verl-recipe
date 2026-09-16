@@ -45,14 +45,40 @@ Use separate environments for the two inference engines. The tested versions are
 
 | Component | Version |
 | --- | --- |
+| Python | 3.12 |
 | verl | [6cbca9ce](REQUIRED_VERL.txt) |
 | Dynamo | [8c5a737](https://github.com/ai-dynamo/dynamo/commit/8c5a73723109058f96c15fff3fc912231d65ad6e), after [PR #13951](https://github.com/ai-dynamo/dynamo/pull/13951) |
 | Inference engine | vLLM 0.28.0 **or** SGLang 0.5.19 |
-| V1 trainer | TransferQueue 0.1.9; `cupy-cuda12x` for the separate-pool NCCL backend |
+| V1 trainer | TransferQueue 0.1.9; CuPy matching CUDA for the separate-pool NCCL backend |
 
-Install the selected Dynamo engine and keep `etcd` and `nats-server` on `PATH`.
-Place this repository at `recipe/` inside the verl checkout and run commands
-from that checkout. For SGLang, unset `PYTORCH_CUDA_ALLOC_CONF`.
+### Install Dynamo
+
+Build the tested commit with one engine per container. On a Linux GPU host
+with Docker and the NVIDIA Container Toolkit:
+
+```bash
+git clone https://github.com/ai-dynamo/dynamo.git
+cd dynamo
+git checkout 8c5a73723109058f96c15fff3fc912231d65ad6e
+python3 -m venv .render-env
+source .render-env/bin/activate
+python3 -m pip install pyyaml jinja2
+DYNAMO_ENGINE=sglang  # or vllm
+python3 container/render.py --framework "$DYNAMO_ENGINE" --target dev --output-short-filename
+docker build -f container/rendered.Dockerfile -t "dynamo:8c5a737-$DYNAMO_ENGINE" .
+```
+
+Continue with the [installation guide](INSTALL.md) to start the container,
+install verl and this recipe, configure dependencies, and verify the environment.
+It also covers an existing environment/source-build route. The selected commit's
+backend dependencies use CUDA 13; match the driver, toolkit and CuPy to that stack.
+
+Official guides: [Dynamo source build](https://docs.dynamo.nvidia.com/dynamo/advanced-customizations/building-from-source),
+[containers and wheels](https://docs.dynamo.nvidia.com/dynamo/dev/cli/installation/install-dynamo).
+
+Run the training commands below from the verl checkout, with this repository
+at `recipe/`. Keep `etcd` and `nats-server` on `PATH`; for SGLang, unset
+`PYTORCH_CUDA_ALLOC_CONF`.
 
 ### Launch
 
