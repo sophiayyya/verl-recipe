@@ -88,7 +88,6 @@ MAX_REQUEST_STATUS_ENTRIES = 100_000
 class ServerStatus(str, Enum):
     INITIALIZING = "initializing"
     INITIALIZED = "initialized"
-    SHUTTING_DOWN = "shutting_down"
     SHUTDOWN_COMPLETE = "shutdown_complete"
     ERROR = "error"
 
@@ -220,7 +219,6 @@ class TinkerServer:
         self._request_status: dict[str, RequestStatus] = {}
         self._retrieved_request_status_archive: dict[str, RequestStatus] = {}
         self._shutdown_started = False
-        self._shutdown_task: Optional[asyncio.Task] = None
         self._model_to_base_model: dict[str, str] = {}
         self._saved_state_paths: dict[str, str] = {}
         self._model_metadata: dict[str, dict[str, Any]] = {}
@@ -254,14 +252,6 @@ class TinkerServer:
         if self._engine is None:
             raise RuntimeError("Server is initialized without an actor engine")
         return self._engine
-
-    def _begin_shutdown(self) -> bool:
-        if getattr(self, "_shutdown_started", False):
-            return False
-        self._shutdown_started = True
-        self._status = ServerStatus.SHUTTING_DOWN
-        self._error = "Server shutdown requested"
-        return True
 
     def _require_ready(self) -> None:
         if getattr(self, "_status", None) != ServerStatus.INITIALIZED:
@@ -416,67 +406,9 @@ class TinkerServer:
                 logger.info("Tinker server initialization complete")
         except Exception as e:
             logger.exception(f"Initialization failed: {e}")
-            self._shutdown_current_engine("failed initialization")
             if not self._shutdown_started:
                 self._status = ServerStatus.ERROR
                 self._error = str(e)
-
-    async def _wait_for_engine_initialization(self):
-        init_future = getattr(self, "_init_future", None)
-        if init_future is not None and not init_future.done():
-            logger.info("Shutdown requested: waiting for engine initialization to finish")
-            await asyncio.shield(init_future)
-
-    async def _drain_pending_tasks(self):
-        while self._pending:
-            tasks = tuple(self._pending.values())
-            logger.info("Shutdown requested: waiting for %d scheduled task(s) to finish", len(tasks))
-            await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
-
-    async def _shutdown_process(self):
-        """Drain local work and mark this deployment ready for supervisor shutdown."""
-        await asyncio.sleep(1)
-        self._begin_shutdown()
-        logger.info("Shutdown requested: draining scheduled Tinker server work before stopping")
-        await self._drain_pending_tasks()
-        await self._wait_for_engine_initialization()
-        await asyncio.to_thread(self._shutdown_current_engine, "shutdown")
-        await asyncio.to_thread(self._gpu_executor.shutdown, wait=True, cancel_futures=False)
-        self._status = ServerStatus.SHUTDOWN_COMPLETE
-        self._error = None
-        logger.info("Shutdown requested: cleanup complete; supervisor may stop Tinker server deployment")
-
-    def _shutdown_current_engine(self, reason: str) -> None:
-        teacher_backend = getattr(self, "_teacher_backend", None)
-        if teacher_backend is not None:
-            try:
-                teacher_backend.shutdown()
-            except Exception:
-                logger.exception("%s requested: teacher shutdown failed", reason.capitalize())
-            finally:
-                if self._teacher_backend is teacher_backend:
-                    self._teacher_backend = None
-
-        engine = self._engine
-        if engine is None:
-            logger.info("%s requested with no initialized engine to shut down", reason.capitalize())
-            return
-
-        logger.info(
-            "%s requested: shutting down current engine before supervisor lifecycle action", reason.capitalize()
-        )
-        try:
-            engine.shutdown()
-        except Exception:
-            logger.exception(
-                "%s requested: engine.shutdown() failed; proceeding with supervisor lifecycle action",
-                reason.capitalize(),
-            )
-        else:
-            logger.info("%s requested: engine.shutdown() completed", reason.capitalize())
-        finally:
-            if self._engine is engine:
-                self._engine = None
 
     def _stash(self, payload: dict) -> str:
         request_id = uuid.uuid4().hex
@@ -550,9 +482,9 @@ class TinkerServer:
     @app.post("/api/v1/shutdown")
     async def shutdown(self, request: Request) -> StatusResponse:
         """Compatibility shutdown endpoint for existing launch helpers."""
-        self._begin_shutdown()
-        if self._shutdown_task is None or self._shutdown_task.done():
-            self._shutdown_task = asyncio.create_task(self._shutdown_process())
+        self._shutdown_started = True
+        self._status = ServerStatus.SHUTDOWN_COMPLETE
+        self._error = None
         return StatusResponse(status="accepted")
 
     @app.api_route("/api/v1/get_server_capabilities", methods=["GET", "POST"])

@@ -68,6 +68,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | dapo | [`recipe/dapo/REQUIRED_VERL.txt`](dapo/REQUIRED_VERL.txt) |
 | deepeyes | [`recipe/deepeyes/REQUIRED_VERL.txt`](deepeyes/REQUIRED_VERL.txt) |
 | dynamo | [`recipe/dynamo/REQUIRED_VERL.txt`](dynamo/REQUIRED_VERL.txt) |
+| echo | [`recipe/echo/REQUIRED_VERL.txt`](echo/REQUIRED_VERL.txt) |
 | entropy | [`recipe/entropy/REQUIRED_VERL.txt`](entropy/REQUIRED_VERL.txt) |
 | fapo | [`recipe/fapo/REQUIRED_VERL.txt`](fapo/REQUIRED_VERL.txt) |
 | fault_recover | [`recipe/fault_recover/REQUIRED_VERL.txt`](fault_recover/REQUIRED_VERL.txt) |
@@ -89,10 +90,12 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 | rep_exp | [`recipe/rep_exp/REQUIRED_VERL.txt`](rep_exp/REQUIRED_VERL.txt) |
 | retool | [`recipe/retool/REQUIRED_VERL.txt`](retool/REQUIRED_VERL.txt) |
 | specRL/histoSpec | [`recipe/specRL/histoSpec/REQUIRED_VERL.txt`](specRL/histoSpec/REQUIRED_VERL.txt) |
+| specRL/rl_spec | [`recipe/specRL/rl_spec/REQUIRED_VERL.txt`](specRL/rl_spec/REQUIRED_VERL.txt) |
 | spin | [`recipe/spin/REQUIRED_VERL.txt`](spin/REQUIRED_VERL.txt) |
 | spo | [`recipe/spo/REQUIRED_VERL.txt`](spo/REQUIRED_VERL.txt) |
 | sppo | [`recipe/sppo/REQUIRED_VERL.txt`](sppo/REQUIRED_VERL.txt) |
 | swe_agent | [`recipe/swe_agent/REQUIRED_VERL.txt`](swe_agent/REQUIRED_VERL.txt) |
+| tmax | [`recipe/tmax/REQUIRED_VERL.txt`](tmax/REQUIRED_VERL.txt) |
 | verl_tinker | [`recipe/verl_tinker/REQUIRED_VERL.txt`](verl_tinker/REQUIRED_VERL.txt) |
 
 ## Available Recipes (high level)
@@ -102,6 +105,7 @@ The script requires only `bash`, `git`, `awk`, and `pip`/`pip3` on `PATH`. It do
 - [spo](https://github.com/verl-project/verl-recipe/tree/main/spo): [Single-stream Policy Optimization](https://arxiv.org/abs/2509.13232).
 - [partial_rollout](./partial_rollout/): synchronous RL with cross-step rollout interruption + resume to reclaim long-tail GPU bubbles ([APRIL](https://arxiv.org/pdf/2509.18521)-style).
 - [verl_tinker](./verl_tinker/): Tinker-compatible HTTP server backed by VeRL actors, with separate Tinker cookbook client examples.
+- [specRL/rl_spec](./specRL/rl_spec/): accelerating RL rollout with a co-adapted diffusion drafter ([DFlash](https://github.com/z-lab/dflash)), via Split-KV context parallelism for drafter training and entropy-boosted anchor sampling.
 - TBA...
 
 ## Contribution

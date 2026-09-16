@@ -7,10 +7,8 @@
 from __future__ import annotations
 
 import copy
-import logging
 from dataclasses import dataclass
 
-import ray
 from omegaconf import DictConfig
 
 from verl.experimental.teacher_loop.teacher_model import TeacherModelManager
@@ -20,9 +18,6 @@ from verl.workers.config import DistillationConfig
 from verl.workers.rollout.llm_server import LLMServerClient
 
 from ..config_utils import _normalize_teacher_model_identifiers, _to_verl_distillation_config
-from .backend_utils import kill_ray_actors_and_wait, remove_placement_groups_and_wait
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -71,11 +66,7 @@ class TeacherInferenceBackend:
         self._managers: dict[str, TeacherModelManager] = {}
         self._clients: dict[str, TeacherClient] = {}
 
-        try:
-            self._initialize()
-        except BaseException:
-            self.shutdown()
-            raise
+        self._initialize()
 
     @staticmethod
     def is_enabled(config: DictConfig) -> bool:
@@ -183,34 +174,3 @@ class TeacherInferenceBackend:
 
     def get_client(self, model_path: str) -> TeacherClient:
         return self._clients[model_path]
-
-    def shutdown(self) -> None:
-        actors = []
-        for manager in self._managers.values():
-            actors.append(getattr(manager, "load_balancer_handle", None))
-            for replica in getattr(manager, "rollout_replicas", []) or []:
-                actors.extend(getattr(replica, "servers", []) or [])
-                actors.append(getattr(replica, "_server_handle", None))
-                workers = getattr(replica, "workers", None)
-                if workers is not None:
-                    actors.extend(workers)
-
-        placement_groups = [
-            placement_group
-            for resource_pool in self._resource_pools
-            for placement_group in (getattr(resource_pool, "pgs", None) or [])
-        ]
-        try:
-            kill_ray_actors_and_wait(actors, logger=logger, description="teacher backend", ray_module=ray)
-        finally:
-            try:
-                remove_placement_groups_and_wait(
-                    placement_groups,
-                    logger=logger,
-                    description="teacher backend",
-                    ray_module=ray,
-                )
-            finally:
-                self._clients.clear()
-                self._managers.clear()
-                self._resource_pools.clear()

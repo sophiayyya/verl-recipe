@@ -56,6 +56,9 @@ actor_rollout_ref:
     free_cache_engine: true
     enforce_eager: false
     load_format: safetensors
+    engine_kwargs:
+      vllm:
+        disable_custom_all_reduce: true
     # The current per-unit collector checks leaf-local names (usually just
     # "weight") for "lora_", so it misses FSDP-wrapped LoRA leaf modules.
     # With use_orig_params=true, the root summon below preserves matrix shapes.

@@ -5,7 +5,7 @@ as a first-class **async rollout backend**, alongside the built-in `vllm`,
 `sglang` backends. Turning it on is a one-line config change
 (`actor_rollout_ref.rollout.name=dynamo`); everything Dynamo-specific
 is driven from `rollout.engine_kwargs.dynamo.*`. The backend can front **either inference engine**: `dynamo.vllm` (the default)
-or `dynamo.sglang` (`engine_kwargs.dynamo.engine=sglang`). 
+or `dynamo.sglang` (`engine_kwargs.dynamo.engine=sglang`).
 
 Dynamo owns request routing behind a single logical frontend, so its
 **KV-cache-aware router** can raise the prefix-cache hit rate across a rollout
@@ -607,7 +607,3 @@ sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
 | `skip_tokenizer_init` | `false`                                        | Token-in/token-out.                                                                                                                                                                                                                                                                                                                          |
 | `attention_backend`   | `flashinfer`                                   | `--attention-backend`. sglang's Hopper default (fa3) decodes ~8% slower with the router page size; an explicit value or an `--attention-backend` in `extra_args` wins. |
 | `extra_args`          | `[]`                                           | Forwarded verbatim; `dynamo.sglang` exposes the whole `ServerArgs` CLI.                                                                                                                                                                                                                                                                      |
-
-
-
-

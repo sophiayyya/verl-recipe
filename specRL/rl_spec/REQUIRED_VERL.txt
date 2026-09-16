@@ -1,0 +1,5 @@
+# rl_spec — code lives in the zxgx/verl fork, branch rl_spec_release
+UPSTREAM=https://github.com/zxgx/verl.git
+MODE=pinned_commit
+COMMIT=300c431de72ef52c338ab738d13efea2d19f410e
+PIP_INSTALL=pip install verl@git+https://github.com/zxgx/verl.git@300c431de72ef52c338ab738d13efea2d19f410e

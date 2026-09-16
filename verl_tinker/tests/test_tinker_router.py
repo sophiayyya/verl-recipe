@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import asyncio
-import threading
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
@@ -93,7 +92,7 @@ def test_tinker_loss_schema_accepts_native_modes_and_custom_from_config_only():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
-    [ServerStatus.INITIALIZING, ServerStatus.ERROR, ServerStatus.SHUTTING_DOWN, ServerStatus.SHUTDOWN_COMPLETE],
+    [ServerStatus.INITIALIZING, ServerStatus.ERROR, ServerStatus.SHUTDOWN_COMPLETE],
 )
 async def test_normal_endpoints_require_fully_initialized_server(status):
     server = object.__new__(_router_class())
@@ -105,6 +104,20 @@ async def test_normal_endpoints_require_fully_initialized_server(status):
 
     assert exc_info.value.status_code == HTTPStatus.SERVICE_UNAVAILABLE
     assert status.value in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_shutdown_immediately_marks_router_complete():
+    server = object.__new__(_router_class())
+    server._status = ServerStatus.INITIALIZED
+    server._error = None
+    server._shutdown_started = False
+
+    response = await server.shutdown(None)
+
+    assert response.status == "accepted"
+    assert server._shutdown_started is True
+    assert await server.healthz() == {"status": ServerStatus.SHUTDOWN_COMPLETE.value}
 
 
 @pytest.mark.asyncio
@@ -898,96 +911,6 @@ async def test_scheduled_writer_blocks_later_samples_without_blocking_earlier_sa
         "start:later",
         "end:later",
     ]
-
-
-@pytest.mark.asyncio
-async def test_shutdown_rejects_new_work_and_drains_existing_tasks_before_engine_teardown():
-    server = object.__new__(_router_class())
-    server._status = ServerStatus.INITIALIZED
-    server._error = None
-    server._op_gate = FifoReadWriteGate()
-    _init_future_tracking(server)
-    server._shutdown_started = False
-    server._init_future = asyncio.get_running_loop().create_future()
-    server._init_future.set_result(None)
-    server._gpu_executor = MagicMock()
-
-    events = []
-    release_task = asyncio.Event()
-
-    class DummyEngine:
-        def shutdown(self):
-            events.append("engine:shutdown")
-
-    server._engine = DummyEngine()
-
-    async def existing_task():
-        events.append("task:start")
-        await release_task.wait()
-        events.append("task:end")
-        return {"type": "done"}
-
-    async def rejected_task():
-        events.append("new:start")
-
-    server._schedule("existing", existing_task())
-    await asyncio.sleep(0)
-
-    server._begin_shutdown()
-
-    with pytest.raises(HTTPException) as exc_info:
-        server._schedule("new", rejected_task())
-    assert exc_info.value.status_code == HTTPStatus.SERVICE_UNAVAILABLE
-
-    shutdown_task = asyncio.create_task(server._shutdown_process())
-    await asyncio.sleep(0.2)
-
-    assert events == ["task:start"]
-    assert server._engine is not None
-
-    release_task.set()
-    await shutdown_task
-
-    assert events == ["task:start", "task:end", "engine:shutdown"]
-    assert server._futures == {"existing": {"type": "done"}}
-    assert server._engine is None
-    server._gpu_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=False)
-
-
-@pytest.mark.asyncio
-async def test_healthz_responds_while_shutdown_cleanup_is_blocked():
-    server = object.__new__(_router_class())
-    server._status = ServerStatus.INITIALIZED
-    server._error = None
-    _init_future_tracking(server)
-    server._shutdown_started = False
-    server._init_future = asyncio.get_running_loop().create_future()
-    server._init_future.set_result(None)
-    server._gpu_executor = MagicMock()
-
-    shutdown_started = threading.Event()
-    release_shutdown = threading.Event()
-
-    class BlockingEngine:
-        def shutdown(self):
-            shutdown_started.set()
-            assert release_shutdown.wait(timeout=5)
-
-    server._engine = BlockingEngine()
-    server._begin_shutdown()
-
-    shutdown_task = asyncio.create_task(server._shutdown_process())
-    assert await asyncio.to_thread(shutdown_started.wait, 2)
-
-    assert await server.healthz() == {"status": ServerStatus.SHUTTING_DOWN.value}
-    assert not shutdown_task.done()
-
-    release_shutdown.set()
-    await shutdown_task
-
-    assert await server.healthz() == {"status": ServerStatus.SHUTDOWN_COMPLETE.value}
-    assert server._engine is None
-    server._gpu_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=False)
 
 
 @pytest.mark.asyncio

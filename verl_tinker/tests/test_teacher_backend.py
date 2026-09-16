@@ -51,8 +51,6 @@ def test_teacher_backend_partitions_pool_and_builds_one_manager_per_teacher():
         patch("verl_tinker.backends.teacher.split_resource_pool", return_value=["pool-a", "pool-b"]) as mock_split,
         patch("verl_tinker.backends.teacher.TeacherModelManager", FakeManager),
         patch("verl_tinker.backends.teacher.LLMServerClient"),
-        patch("verl_tinker.backends.teacher.kill_ray_actors_and_wait"),
-        patch("verl_tinker.backends.teacher.remove_placement_groups_and_wait"),
     ):
         backend = TeacherInferenceBackend(config)
 
@@ -110,8 +108,6 @@ def test_teacher_backend_dedicated_pools_allocate_largest_teacher_first():
         patch("verl_tinker.backends.teacher.split_resource_pool") as mock_split,
         patch("verl_tinker.backends.teacher.TeacherModelManager", FakeManager),
         patch("verl_tinker.backends.teacher.LLMServerClient"),
-        patch("verl_tinker.backends.teacher.kill_ray_actors_and_wait"),
-        patch("verl_tinker.backends.teacher.remove_placement_groups_and_wait"),
     ):
         backend = TeacherInferenceBackend(config)
 
@@ -137,47 +133,6 @@ def test_teacher_backend_dedicated_pools_allocate_largest_teacher_first():
     ) in backend.sampling_targets
 
 
-def test_dedicated_pool_startup_failure_cleans_all_created_pools():
-    teachers = {
-        "small": _teacher("small", "/models/small", world_size=4),
-        "large": _teacher("large", "/models/large", world_size=8),
-    }
-    distillation = SimpleNamespace(nnodes=2, n_gpus_per_node=6, teacher_models=teachers)
-    config = OmegaConf.create(
-        {
-            "distillation": {
-                "enabled": True,
-                "dedicated_resource_pools": True,
-                "teacher_models": {
-                    "small": {"key": "small", "model_name": "small", "model_path": "/models/small"},
-                    "large": {"key": "large", "model_name": "large", "model_path": "/models/large"},
-                },
-            }
-        }
-    )
-    placement_group = MagicMock()
-    pools = [SimpleNamespace(pgs=[placement_group]), SimpleNamespace(pgs=None)]
-
-    class FailingManager:
-        def __init__(self, *_args):
-            self.load_balancer_handle = MagicMock()
-            self.rollout_replicas = []
-            raise RuntimeError("teacher failed to start")
-
-    with (
-        patch("verl_tinker.config_utils.omega_conf_to_dataclass", return_value=distillation),
-        patch("verl_tinker.backends.teacher.RayResourcePool", side_effect=pools),
-        patch("verl_tinker.backends.teacher.TeacherModelManager", FailingManager),
-        patch("verl_tinker.backends.teacher.kill_ray_actors_and_wait") as mock_kill,
-        patch("verl_tinker.backends.teacher.remove_placement_groups_and_wait") as mock_remove,
-    ):
-        with pytest.raises(RuntimeError, match="teacher failed to start"):
-            TeacherInferenceBackend(config)
-
-    mock_kill.assert_called_once()
-    assert mock_remove.call_args.args[0] == [placement_group]
-
-
 @pytest.mark.asyncio
 async def test_teacher_client_rejects_topk_above_vllm_boot_limit():
     client = TeacherClient(MagicMock(), model_path="teacher", max_prompt_logprobs=8)
@@ -188,32 +143,3 @@ async def test_teacher_client_rejects_topk_above_vllm_boot_limit():
             prompt_ids=[1, 2],
             sampling_params={"max_tokens": 1, "prompt_logprobs": 9},
         )
-
-
-def test_teacher_backend_shutdown_releases_server_workers_and_pools():
-    backend = object.__new__(TeacherInferenceBackend)
-    server = MagicMock()
-    worker = MagicMock()
-    load_balancer = MagicMock()
-    replica = SimpleNamespace(servers=[server], _server_handle=server, workers=[worker])
-    backend._managers = {"teacher": SimpleNamespace(load_balancer_handle=load_balancer, rollout_replicas=[replica])}
-    backend._clients = {"teacher": MagicMock()}
-    placement_groups = [MagicMock(), MagicMock()]
-    backend._resource_pools = [
-        SimpleNamespace(pgs=[placement_groups[0]]),
-        SimpleNamespace(pgs=[placement_groups[1]]),
-    ]
-
-    with (
-        patch("verl_tinker.backends.teacher.kill_ray_actors_and_wait") as mock_kill,
-        patch("verl_tinker.backends.teacher.remove_placement_groups_and_wait") as mock_remove,
-    ):
-        backend.shutdown()
-
-    killed = mock_kill.call_args.args[0]
-    assert load_balancer in killed
-    assert server in killed
-    assert worker in killed
-    mock_remove.assert_called_once()
-    assert mock_remove.call_args.args[0] == placement_groups
-    assert backend._resource_pools == []

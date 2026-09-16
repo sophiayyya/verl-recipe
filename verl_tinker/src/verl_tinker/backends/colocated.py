@@ -50,7 +50,6 @@ from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 from ..config_utils import is_no_rollout_deployment, needs_reference_policy
 from ..schemas import ServerCapabilities
 from ._loss import is_ref_in_actor, make_branching_loss
-from .backend_utils import kill_ray_actors_and_wait, remove_placement_groups_and_wait
 from .model_lifecycle import ModelLifecycle, ModelRole
 
 logger = logging.getLogger("ray")
@@ -653,51 +652,3 @@ class ColocatedBackend:
             self.actor_rollout_wg.load_checkpoint(checkpoint_path)
             if zero_optimizer_grad:
                 self.actor_rollout_wg.optimizer_zero_grad()
-
-    # ==================== Lifecycle ====================
-
-    def shutdown(self):
-        """Kill all Ray worker actors and remove placement groups to release GPU resources.
-
-        Order matters: rollout server actors come down first so vLLM
-        releases its GPUs before we drop the placement group, and so
-        ``/v1/reset`` can actually re-init in the same Ray cluster.
-        Without this the colocated path leaks ``replica._server_handle``
-        + the LLMServerManager's load-balancer actor.
-        """
-        actors_to_kill = []
-
-        # 1. Rollout-side: vLLM replica server actors + the optional load
-        #    balancer the LLMServerManager spawns in front of them.
-        for replica in self.rollout_replicas:
-            actors_to_kill.extend(getattr(replica, "servers", []) or [])
-            actors_to_kill.append(getattr(replica, "_server_handle", None))
-        if self._server_manager is not None:
-            load_balancer = getattr(self._server_manager, "_load_balancer", None)
-            if load_balancer is not None:
-                actors_to_kill.append(load_balancer)
-
-        # 2. Training worker groups.
-        for wg in [self.actor_rollout_wg]:
-            if wg is not None:
-                actors_to_kill.extend(wg.workers)
-
-        kill_ray_actors_and_wait(actors_to_kill, logger=logger, description="colocated backend", ray_module=ray)
-
-        placement_groups = list(getattr(self._resource_pool, "pgs", None) or [])
-        self.actor_rollout_wg = None
-        self.ref_policy_wg = None
-        self.checkpoint_manager = None
-        self.rollout_replicas = []
-        self._server_manager = None
-
-        # Remove placement groups so the name can be reused on reinit.
-        remove_placement_groups_and_wait(
-            placement_groups,
-            logger=logger,
-            description="colocated backend",
-            ray_module=ray,
-        )
-        self._resource_pool = None
-
-        logger.info("All worker actors killed and placement groups removed")

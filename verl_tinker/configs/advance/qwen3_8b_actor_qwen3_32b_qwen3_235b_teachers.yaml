@@ -88,9 +88,12 @@ distillation:
         data_parallel_size: 1
         expert_parallel_size: 8
         pipeline_model_parallel_size: 1
-        # Leave H100 headroom for the temporary full-vocabulary FP32
-        # prompt-logprob buffer.
-        gpu_memory_utilization: 0.85
+        # Avoid the vLLM CuMem sleep allocator for this large MoE teacher: its
+        # private pool can retain transient allocations and OOM during startup.
+        enable_sleep_mode: false
+        # Leave H100 headroom for startup allocations and the temporary
+        # full-vocabulary FP32 prompt-logprob buffer.
+        gpu_memory_utilization: 0.80
         prompt_length: 1024
         response_length: 2048
         max_model_len: 4096

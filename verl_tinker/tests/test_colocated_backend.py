@@ -777,37 +777,6 @@ class TestSynchronousEngineLock:
         backend.actor_rollout_wg.save_checkpoint.assert_called_once_with("/tmp/ckpt", global_step=5, max_ckpt_to_keep=3)
 
 
-class TestShutdownTeardown:
-    """Regression: shutdown must kill rollout replica server actors + the
-    LLMServerManager's load balancer, not just the training worker groups.
-    Without this colocated pods leak vLLM server actors + pgs on /v1/reset.
-    """
-
-    def test_shutdown_kills_rollout_replicas_and_load_balancer(self):
-        backend = _make_backend(_make_config())
-        # Populate the rollout-side fields shutdown() must walk.
-        server0 = MagicMock(name="server0")
-        server1 = MagicMock(name="server1")
-        replica = MagicMock(name="replica0", _server_handle=server0, servers=[server0, server1])
-        backend.rollout_replicas = [replica]
-        server_mgr = MagicMock(name="server_mgr")
-        server_mgr._load_balancer = MagicMock(name="load_balancer")
-        backend._server_manager = server_mgr
-        backend.ref_policy_wg = None
-        backend.checkpoint_manager = None
-        backend._resource_pool = None
-        actor_workers = list(backend.actor_rollout_wg.workers)
-
-        with patch("verl_tinker.backends.colocated.ray") as mock_ray:
-            backend.shutdown()
-            mock_ray.kill.assert_any_call(replica._server_handle, no_restart=True)
-            for server in replica.servers:
-                mock_ray.kill.assert_any_call(server, no_restart=True)
-            mock_ray.kill.assert_any_call(server_mgr._load_balancer, no_restart=True)
-            for worker in actor_workers:
-                mock_ray.kill.assert_any_call(worker, no_restart=True)
-
-
 class TestBackendOffloadConfig:
     """Tests for backend-owned model lifecycle config resolution."""
 
