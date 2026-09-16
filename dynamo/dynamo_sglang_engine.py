@@ -21,14 +21,15 @@ ZMQ REP sidecar, because bare ``dynamo.vllm`` exposes no hook onto its AsyncLLM)
 registers, unconditionally::
 
     control/start_profile              control/stop_profile
-    control/release_memory_occupation  control/resume_memory_occupation
+    pause_generation                  continue_generation
+    release_memory_occupation         resume_memory_occupation
     control/update_weights_from_disk   control/update_weights_from_tensor
     control/update_weights_from_distributed
     control/update_weights_from_ipc    control/update_weight_version
 
-and, when the worker is started with ``--enable-rl``, additionally::
+The recipe also explicitly registers this tokenizer-manager route::
 
-    call_tokenizer_manager    # generic passthrough to any tokenizer_manager method
+    flush_cache    # --engine-route flush_cache:tm
 
 Those land on the worker's system-status server, which mounts ``/engine/{*path}``
 (``lib/runtime/src/system_status_server.rs``) on ``$DYN_SYSTEM_PORT``. So the whole
@@ -40,15 +41,13 @@ Two consequences drive the design here:
 1. ``DYN_SYSTEM_PORT`` is **mandatory** for the sglang backend (it is merely a
    metrics nicety for vLLM). Dynamo's Rust runtime parses it as i16, so the port
    must stay below 32768 — see ``_allocate_stable_node_port`` on the actor side.
-2. There is **no** ``control/flush_cache`` route. ``clear_kv_blocks`` exists on the
-   handler but is not registered as an engine route, so flushing the radix cache
-   after a weight update has to go through ``call_tokenizer_manager``, which means
-   ``--enable-rl`` is effectively required for RL use. See :meth:`flush_cache`.
+2. Dynamo PR #13951 removed ``call_tokenizer_manager`` and separated discovery
+   pause/resume from memory release/restore. Pause before releasing memory and
+   continue only after restoring it; readiness uses the configured native flush.
 
-All of the above verified against dynamo 1.3.0 (94accc7389) + sglang 0.5.14 on an
-H100 (M0b, job 16214273): ``call_tokenizer_manager``, ``release_memory_occupation``,
-``resume_memory_occupation`` and ``update_weight_version`` all answer 200, while
-``control/flush_cache`` answers 404 ``"Route not found"``.
+The native lifecycle is validated with Dynamo 8c5a73723109 and SGLang 0.5.19.
+Older Dynamo workers exposing only the legacy control routes are not supported
+by this version of the client.
 
 **Robustness note.** A ``serialized_named_tensors`` payload that fails to
 deserialize does not come back as an error — it kills the worker process outright
@@ -69,8 +68,10 @@ logger.setLevel(logging.INFO)
 
 # Registered engine-route keys. Mirrors handler_base.register_engine_routes;
 # kept as constants so a dynamo-side rename fails loudly in one place.
-ROUTE_RELEASE_MEMORY = "control/release_memory_occupation"
-ROUTE_RESUME_MEMORY = "control/resume_memory_occupation"
+ROUTE_PAUSE_GENERATION = "pause_generation"
+ROUTE_CONTINUE_GENERATION = "continue_generation"
+ROUTE_RELEASE_MEMORY = "release_memory_occupation"
+ROUTE_RESUME_MEMORY = "resume_memory_occupation"
 ROUTE_UPDATE_WEIGHTS_FROM_TENSOR = "control/update_weights_from_tensor"
 ROUTE_UPDATE_WEIGHTS_FROM_IPC = "control/update_weights_from_ipc"
 ROUTE_UPDATE_WEIGHT_VERSION = "control/update_weight_version"
@@ -166,19 +167,28 @@ class DynamoSGLangControlClient:
 
         Requires the worker to have been started with ``--enable-memory-saver``;
         without it SGLang's torch_memory_saver is inactive and this is a no-op at
-        best. The handler also *unregisters the worker from discovery* first, so a
-        released worker leaves the routing pool until ``resume_memory_occupation``.
+        best. Dynamo PR #13951 separates native pause and memory control. Pause
+        first to drain requests and remove the worker from discovery, then free
+        memory. A failed release leaves the worker paused.
         """
         body: dict[str, Any] = {}
         if tags is not None:
             body["tags"] = list(tags)
+        await self.pause_generation(mode="abort")
         return await self.post(ROUTE_RELEASE_MEMORY, body)
 
     async def resume_memory_occupation(self, tags: Optional[list[str]] = None) -> dict:
+        """Restore every released tag, then resume generation and discovery.
+
+        The node actor widens resumes to its complete per-shard released-tag set.
+        Keep that contract: generation must remain paused until all memory is live.
+        """
         body: dict[str, Any] = {}
         if tags is not None:
             body["tags"] = list(tags)
-        return await self.post(ROUTE_RESUME_MEMORY, body)
+        result = await self.post(ROUTE_RESUME_MEMORY, body)
+        await self.continue_generation()
+        return result
 
     # ------------------------------------------------------------------ #
     # weight sync
@@ -216,7 +226,7 @@ class DynamoSGLangControlClient:
         )
 
     # ------------------------------------------------------------------ #
-    # tokenizer_manager passthrough (needs --enable-rl)
+    # legacy tokenizer_manager passthrough and explicit native routes
     # ------------------------------------------------------------------ #
 
     async def call_tokenizer_manager(
@@ -226,11 +236,11 @@ class DynamoSGLangControlClient:
         kwargs: Optional[dict] = None,
         timeout_s: Optional[float] = None,
     ) -> dict:
-        """Invoke an arbitrary ``tokenizer_manager`` method.
+        """Legacy-only passthrough, unavailable after Dynamo PR #13951.
 
-        Only registered when the worker runs with ``--enable-rl``. Args/kwargs are
-        plain JSON values, or ``{"io_struct.ClassName": {...}}`` for a typed
-        ``sglang.srt.managers.io_struct`` constructor.
+        Retained for callers of the old optional weight-readback diagnostic.
+        New control operations must use explicitly registered engine routes.
+        The standard readiness, refit and generation lifecycle do not call it.
         """
         return await self.post(
             ROUTE_CALL_TOKENIZER_MANAGER,
@@ -238,16 +248,13 @@ class DynamoSGLangControlClient:
             timeout_s=timeout_s,
         )
 
-    async def flush_cache(self) -> dict:
-        """Drop the radix/prefix cache.
+    async def flush_cache(self, timeout_s: Optional[float] = None) -> dict:
+        """Flush the explicitly registered ``--engine-route flush_cache:tm``.
 
-        There is no ``control/flush_cache`` engine route — ``clear_kv_blocks``
-        exists on the handler but is never registered — so this goes through
-        ``call_tokenizer_manager``. **A stale prefix cache after a weight update
-        silently serves tokens from the old policy**, so this is not optional in
-        RL; it is the main reason the recipe forces ``--enable-rl``.
+        PR13951 removed the generic call_tokenizer_manager route. The same
+        native flush is required before weight updates and for readiness.
         """
-        return await self.call_tokenizer_manager("flush_cache")
+        return await self.post("flush_cache", {}, timeout_s=timeout_s)
 
     async def abort_request(self, rid: str = "", abort_all: bool = False) -> dict:
         """DO NOT use for abort-all: tokenizer_manager.abort_request is a SYNC
@@ -261,22 +268,12 @@ class DynamoSGLangControlClient:
         return await self.call_tokenizer_manager("abort_request", kwargs={"rid": rid, "abort_all": bool(abort_all)})
 
     async def pause_generation(self, mode: str = "abort") -> dict:
-        """Abort in-flight requests and pause intake, via sglang's native
-        async tokenizer_manager.pause_generation — the same call verl's
-        native V1 sglang server uses for partial rollout. Being async, it
-        survives dynamo's unconditional-await passthrough.
-        """
-        return await self.call_tokenizer_manager(
-            "pause_generation",
-            args=[{"io_struct.PauseGenerationReqInput": {"mode": mode}}],
-        )
+        """Pause native SGLang generation and synchronize Dynamo discovery."""
+        return await self.post(ROUTE_PAUSE_GENERATION, {"mode": mode})
 
     async def continue_generation(self) -> dict:
         """Counterpart to pause_generation; reopens engine intake."""
-        return await self.call_tokenizer_manager(
-            "continue_generation",
-            args=[{"io_struct.ContinueGenerationReqInput": {}}],
-        )
+        return await self.post(ROUTE_CONTINUE_GENERATION, {})
 
     # ------------------------------------------------------------------ #
     # profiling
@@ -306,8 +303,8 @@ class DynamoSGLangControlClient:
         2. A 404 is a perfectly good HTTP response, so any check that only asks
            "did I get a reply" passes during that window.
 
-        So gate on a **200** from ``call_tokenizer_manager``: it proves the engine
-        routes are registered, the tokenizer_manager is alive, and ``--enable-rl``
+        So gate on a **200** from the configured ``flush_cache`` route: it proves the engine
+        routes are registered, the tokenizer_manager is alive, and ``--engine-route flush_cache:tm``
         actually took — all three of which the weight-sync path needs.
         """
         import asyncio
@@ -317,7 +314,7 @@ class DynamoSGLangControlClient:
         last: str = "no attempt made"
         while loop.time() < deadline:
             try:
-                await self.call_tokenizer_manager("flush_cache", timeout_s=15.0)
+                await self.flush_cache(timeout_s=15.0)
                 return True
             except Exception as e:  # noqa: BLE001 - 404/transport both mean not-ready-yet
                 last = f"{type(e).__name__}: {str(e)[:200]}"
@@ -325,7 +322,7 @@ class DynamoSGLangControlClient:
         raise DynamoSGLangControlError(
             f"dynamo.sglang engine routes at {self.base_url} not serving after {timeout_s}s. "
             f"Last: {last}. If this is a 404 the worker is up but never finished loading the "
-            f"model; if it mentions call_tokenizer_manager the worker is missing --enable-rl."
+            f"model; check --engine-route flush_cache:tm and the native tokenizer-manager result."
         )
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid

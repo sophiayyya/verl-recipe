@@ -54,8 +54,8 @@
 #     agent-loop path this run was validated on (the V1 path uses main_dynamo.py with
 #     the dynamo_trainer_v1_* presets). hydra resolves --config-path relative to
 #     verl/trainer/, not to CWD.
-#   * sglang.enable_rl=true registers call_tokenizer_manager, the only way to flush the
-#     radix cache on this path (control/flush_cache returns 404).
+#   * The recipe registers --engine-route flush_cache:tm for the radix cache;
+#     the legacy call_tokenizer_manager endpoint was removed in Dynamo PR #13951.
 #   * transformers 5.x stores Qwen3-MoE experts as one fused 3D tensor and picks
 #     grouped_mm, roughly doubling the actor update's peak memory versus 4.x. It fits
 #     on 4x8 H100; EAGER_EXPERTS=1 trades that for a much slower update.

@@ -368,7 +368,7 @@ class SGLangServerAdapter(_SGLangServerAdapter):
         """
         import torch.distributed as dist
         from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
-        from sglang.srt.model_executor.model_runner import LocalSerializedTensor
+        from sglang.srt.model_executor.model_runner_components.weight_updater import LocalSerializedTensor
         from sglang.srt.utils import MultiprocessingSerializer
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
         from sglang.srt.weight_sync.utils import _preprocess_tensor_for_update_weights

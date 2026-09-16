@@ -534,6 +534,19 @@ concurrency 384, ThunderAgent reaches **1.94× rollout-phase speedup** and
 
 ## SGLang engine (`engine_kwargs.dynamo.engine=sglang`)
 
+The SGLang control client now requires Dynamo after
+[ai-dynamo/dynamo#13951](https://github.com/ai-dynamo/dynamo/pull/13951)
+(tested commit `8c5a73723109058f96c15fff3fc912231d65ad6e`, SGLang 0.5.19).
+It pauses generation before releasing memory and continues only after restoring
+all released tags. The worker command registers `--engine-route flush_cache:tm`
+for readiness and refit; existing explicit registrations in `extra_args` are
+preserved. The legacy `call_tokenizer_manager` endpoint is no longer used by the
+standard lifecycle. The optional legacy parameter-readback diagnostic still
+requires its old endpoint and is not part of this validation.
+
+See [the 8×H100 ReTool validation](benchmarks/retool_h100_20260916.md) for all four
+50-step runs, software pins, metric definitions and experiment limitations.
+
 The Dynamo backend can front **either** `dynamo.vllm` (default, everything
 above) or `dynamo.sglang`. Engine selection is a single switch —
 `rollout.name=dynamo` stays fixed for both engines, and
@@ -558,7 +571,7 @@ actor_rollout_ref.rollout.name=dynamo \
 | Weight sync    | `BucketedWeightSender` → ZMQ-IPC socket → `update_weights_from_ipc` | `MultiprocessingSerializer` CUDA-IPC handles → `control/update_weights_from_tensor` |
 | Sleep / wake   | `engine.sleep(level=…)`                                             | `release_memory_occupation(tags=…)` / `resume_memory_occupation`                    |
 | KV events      | `--kv-events-config <json>`                                         | same JSON, passed by default (`enable_kv_events`); sglang's ZMQ publisher plus `DynamoSglangPublisher` re-publish on the event plane |
-| Cache flush    | `reset_prefix_cache`                                                | `call_tokenizer_manager("flush_cache")` (**needs** `--enable-rl`)                   |
+| Cache flush    | `reset_prefix_cache`                                                | `/engine/flush_cache` (registered with `--engine-route flush_cache:tm`)                   |
 
 
 `dynamo.sglang` registers its RL control routes itself
@@ -588,7 +601,7 @@ sbatch recipe/dynamo/train_qwen3_30b_sglang.sh
 
 | Key                   | Default                                        | Purpose                                                                                                                                                                                                                                                                                                                                      |
 | --------------------- | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `enable_rl`           | `true`                                         | Adds `--enable-rl`; registers `call_tokenizer_manager`, the only route that can flush the radix cache after a weight update.                                                                                                                                                                                                                 |
+| `enable_rl`           | `true`                                         | Forwards `--enable-rl`. Native lifecycle routes are built in; the recipe separately registers `flush_cache:tm`, including when this flag is disabled.                                                                                                                                                                                                                 |
 | `verify_weight_sync`  | `false`                                        | Best-effort probe: reads one synced parameter back via `get_weights_by_name` after each sync (snapshot refreshed every sync) and raises on mismatch. That API is model-specific and **unimplemented for Qwen2/Qwen3**, so on those models the probe logs `INCONCLUSIVE` at ERROR and verifies nothing — a passing run is not a verified one. |
 | `page_size`           | falls back to `thunderagent.router_block_size` | KV-router block size (`--page-size`).                                                                                                                                                                                                                                                                                                        |
 | `skip_tokenizer_init` | `false`                                        | Token-in/token-out.                                                                                                                                                                                                                                                                                                                          |

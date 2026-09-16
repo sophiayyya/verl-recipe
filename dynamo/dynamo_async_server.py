@@ -960,9 +960,7 @@ class DynamoHttpServer:
             # round-robin, where the events are pure overhead).
             publish_kv_events = self._kv_events_enabled()
             kv_event_port = self._allocate_kv_event_port(spec_idx) if publish_kv_events else None
-            kv_events_config_json = (
-                self._build_kv_events_config_json(kv_event_port) if publish_kv_events else None
-            )
+            kv_events_config_json = self._build_kv_events_config_json(kv_event_port) if publish_kv_events else None
             system_metrics_port = (
                 self._allocate_stable_node_port(_SYSTEM_METRICS_PORT_BASE, spec_idx, window=8)
                 if enable_worker_metrics
@@ -1332,11 +1330,8 @@ class DynamoHttpServer:
             # release_memory_occupation silently frees nothing.
             cmd += ["--enable-memory-saver"]
 
-        # --enable-rl unlocks call_tokenizer_manager, which is the ONLY way to
-        # flush the radix cache after a weight update (there is no
-        # control/flush_cache engine route). A stale prefix cache serves tokens
-        # from the previous policy, so this defaults on and is not silently
-        # skippable.
+        # Preserve the worker's RL flag. After Dynamo PR #13951 it no longer
+        # registers call_tokenizer_manager; cache flush is configured below.
         if self._sglang_cfg().get("enable_rl", True):
             cmd += ["--enable-rl"]
 
@@ -1364,6 +1359,13 @@ class DynamoHttpServer:
 
         extra = self._sglang_cfg().get("extra_args") or self._dynamo_cfg().get("extra_args") or []
         extra = [str(x) for x in extra] if isinstance(extra, list) else []
+
+        # Readiness and weight refit both need a native cache-flush endpoint.
+        # Honor an explicit public-path override without registering it twice.
+        routes = [extra[i + 1] for i, arg in enumerate(extra[:-1]) if arg == "--engine-route"]
+        routes += [arg.split("=", 1)[1] for arg in extra if arg.startswith("--engine-route=")]
+        if not any(route.split(":", 1)[0].split("=", 1)[0] == "flush_cache" for route in routes):
+            cmd += ["--engine-route", "flush_cache:tm"]
 
         # Attention backend: default to flashinfer, mirroring verl's native sglang
         # server (async_sglang_server.py). SGLang's own default on Hopper is fa3,
@@ -2732,10 +2734,8 @@ class DynamoHttpServer:
     async def _self_test_sglang_control_plane(self):
         """Prove every local sglang shard answers on /engine/* before training starts.
 
-        Also verifies ``--enable-rl`` actually took: without it
-        ``call_tokenizer_manager`` is unregistered, which would only surface later
-        as a failed cache flush after the first weight update — i.e. as silently
-        stale rollouts rather than as an error.
+        Also verifies that the explicit ``flush_cache:tm`` engine route is
+        registered, so missing cache-flush support fails before weight refit.
         """
         clients = self._sglang_control_clients()
         if not clients:
@@ -2747,14 +2747,14 @@ class DynamoHttpServer:
 
         if self._sglang_cfg().get("enable_rl", True):
             probe = await asyncio.gather(
-                *[c.call_tokenizer_manager("flush_cache") for c in clients],
+                *[c.flush_cache() for c in clients],
                 return_exceptions=True,
             )
             bad = [(c.base_url, r) for c, r in zip(clients, probe, strict=True) if isinstance(r, Exception)]
             if bad:
                 raise RuntimeError(
-                    "dynamo.sglang call_tokenizer_manager is not reachable on "
-                    f"{bad}. That route only exists with --enable-rl; without it the "
+                    "dynamo.sglang explicit flush_cache route is not reachable on "
+                    f"{bad}. Register --engine-route flush_cache:tm; without it the "
                     "prefix cache cannot be flushed after a weight update and rollouts "
                     "will silently use stale weights."
                 )
