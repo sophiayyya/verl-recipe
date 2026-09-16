@@ -127,9 +127,34 @@ def test_sleep_mode_maps_to_memory_saver():
 
 
 def test_enable_rl_on_by_default():
-    """--enable-rl is what registers call_tokenizer_manager, the only cache-flush route."""
+    """Keep forwarding the worker's RL flag independently of native routes."""
     assert "--enable-rl" in _cmd()
     assert "--enable-rl" not in _cmd({"sglang": {"enable_rl": False}})
+
+
+def test_cache_flush_route_is_registered_without_extra_args():
+    for enable_rl in [True, False]:
+        cmd = _cmd({"sglang": {"enable_rl": enable_rl}})
+        assert cmd[cmd.index("--engine-route") + 1] == "flush_cache:tm"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--engine-route", "flush_cache:tm"],
+        ["--engine-route=flush_cache:tm"],
+        ["--engine-route", "flush_cache=custom_flush:tm"],
+    ],
+)
+def test_cache_flush_route_preserves_explicit_registration(extra):
+    cmd = _cmd({"sglang": {"extra_args": extra}})
+    assert sum(arg.startswith("--engine-route") for arg in cmd) == 1
+    assert cmd[-len(extra) :] == extra
+
+
+def test_other_engine_routes_do_not_disable_cache_flush():
+    cmd = _cmd({"sglang": {"extra_args": ["--engine-route", "get_load:tm"]}})
+    assert "flush_cache:tm" in cmd and "get_load:tm" in cmd
 
 
 def test_page_size_falls_back_to_thunderagent_block_size():
@@ -323,9 +348,7 @@ def _client(session, **kwargs):
 
 def test_route_url_shape():
     client = DynamoSGLangControlClient("http://worker:11000/")
-    assert client.route_url("control/release_memory_occupation") == (
-        "http://worker:11000/engine/control/release_memory_occupation"
-    )
+    assert client.route_url("release_memory_occupation") == ("http://worker:11000/engine/release_memory_occupation")
 
 
 @pytest.mark.asyncio
@@ -383,14 +406,14 @@ async def test_http_error_raises():
 
 
 @pytest.mark.asyncio
-async def test_flush_cache_goes_through_tokenizer_manager():
-    """There is no control/flush_cache engine route; it must use the RL passthrough."""
+async def test_flush_cache_uses_explicit_native_route():
+    """PR13951 requires an explicitly configured native flush route."""
     session = _FakeSession()
     client = _client(session)
     await client.flush_cache()
     url, body = session.calls[0]
-    assert url.endswith("/engine/call_tokenizer_manager")
-    assert body["method"] == "flush_cache"
+    assert url.endswith("/engine/flush_cache")
+    assert body == {}
 
 
 @pytest.mark.asyncio
@@ -398,8 +421,47 @@ async def test_memory_occupation_tags_passed_through():
     session = _FakeSession()
     client = _client(session)
     await client.release_memory_occupation(tags=["kv_cache", "weights"])
-    _, body = session.calls[0]
-    assert body["tags"] == ["kv_cache", "weights"]
+    assert session.calls == [
+        ("http://worker:11000/engine/pause_generation", {"mode": "abort"}),
+        ("http://worker:11000/engine/release_memory_occupation", {"tags": ["kv_cache", "weights"]}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_memory_restore_precedes_generation_and_discovery_resume():
+    session = _FakeSession()
+    client = _client(session)
+    await client.resume_memory_occupation(tags=["kv_cache", "weights"])
+    assert session.calls == [
+        ("http://worker:11000/engine/resume_memory_occupation", {"tags": ["kv_cache", "weights"]}),
+        ("http://worker:11000/engine/continue_generation", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_failed_memory_restore_keeps_generation_paused():
+    session = _FakeSession(payload={"success": False, "message": "restore failed"})
+    client = _client(session)
+    with pytest.raises(DynamoSGLangControlError, match="restore failed"):
+        await client.resume_memory_occupation(tags=["kv_cache", "weights"])
+    assert [url for url, _ in session.calls] == ["http://worker:11000/engine/resume_memory_occupation"]
+
+
+@pytest.mark.asyncio
+async def test_failed_pause_prevents_memory_release():
+    session = _FakeSession(status=500, payload={"error": "pause failed"})
+    client = _client(session)
+    with pytest.raises(DynamoSGLangControlError, match="HTTP 500"):
+        await client.release_memory_occupation(tags=["kv_cache"])
+    assert [url for url, _ in session.calls] == ["http://worker:11000/engine/pause_generation"]
+
+
+@pytest.mark.asyncio
+async def test_ready_probes_the_native_flush_route():
+    session = _FakeSession()
+    client = _client(session)
+    assert await client.wait_ready(timeout_s=1, poll_s=0)
+    assert session.calls == [("http://worker:11000/engine/flush_cache", {})]
 
 
 # --------------------------------------------------------------------------- #
