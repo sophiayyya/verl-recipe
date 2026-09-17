@@ -53,28 +53,29 @@ Use separate environments for the two inference engines. The tested versions are
 
 ### Install Dynamo
 
-The DFW runs used existing verl `.sqsh` images, a separate `uv` environment per
-engine, and **two local Dynamo wheels built from `8c5a737`**. Python components
-were loaded from the same source checkout through `PYTHONPATH`.
-
-Inside the prepared experiment container, the Dynamo installation was:
+Run in an activated Linux Python 3.12 environment with verl and the selected
+engine installed. Rust/system libraries, `uv` and `maturin` must be available;
+see the [installation guide](INSTALL.md) for prerequisites.
 
 ```bash
-BENCH_ENGINE=sglang  # or vllm
-DYNAMO_PYTHON="/experiment/engines/$BENCH_ENGINE/venv/bin/python"
-uv pip install --python "$DYNAMO_PYTHON" \
-    /experiment/runtime/wheels/ai_dynamo_runtime-1.5.0-cp310-abi3-manylinux_2_39_x86_64.whl \
-    /experiment/runtime/wheels/ai_dynamo-1.5.0-py3-none-any.whl \
-    'aisimulate==0.12.0.dev2' 'protobuf>=6.33.5,<7'
-export PATH="/experiment/engines/$BENCH_ENGINE/venv/bin:/experiment/bin:$PATH"
-export PYTHONPATH="/dynamo/components/src:/experiment/src/verl:/experiment/setup"
+export DYNAMO_SRC=/path/to/dynamo
+cd "$DYNAMO_SRC"
+git checkout 8c5a73723109058f96c15fff3fc912231d65ad6e
+python3 -m uv build --wheel
+cd "$DYNAMO_SRC/lib/bindings/python"
+python3 -m maturin build --release --locked --features kv-indexer --out "$DYNAMO_SRC/dist"
+python3 -m uv pip install --python "$(command -v python3)" \
+    --reinstall-package ai-dynamo --reinstall-package ai-dynamo-runtime \
+    "$DYNAMO_SRC"/dist/ai_dynamo*.whl 'protobuf>=6.33.5,<7'
+export PYTHONPATH="$DYNAMO_SRC/components/src${PYTHONPATH:+:$PYTHONPATH}"
 ```
 
-The runtime wheel supplies `dynamo._core`; the mounted checkout supplies the
-frontend and engine Python code. See the [installation guide](INSTALL.md) for
-the actual wheel-build commands, image/mount layout, environment preparation
-and verification. `/experiment` and `/dynamo` above are paths inside the job's
-container; the staged experiment files and wheels must already be present.
+This builds both wheels into `dist/`, installs them into the active interpreter,
+and loads Python components from the matching checkout. Keep only the two
+wheels from this build in `dist/`. For this text-only recipe, the reduced feature
+set keeps Cargo defaults and adds `kv-indexer`; KV routing is enabled at runtime
+with `router_mode=kv`. The [DFW build details](INSTALL.md#dfw-benchmark-build)
+record the additional features used for the published results.
 
 Run training from the verl checkout with this repository at `recipe/`. Keep
 `etcd` and `nats-server` on `PATH`; for SGLang, unset `PYTORCH_CUDA_ALLOC_CONF`
