@@ -1,14 +1,16 @@
 import glob
 import os
 import sys
+from pathlib import Path
 
 # A line ending in "\" splices the NEXT line onto it. If that next line is a
 # comment, bash swallows the rest of the command: every argument below is
 # silently dropped. Same class of bug found in train_qwen3_30b_sglang.sh.
-pats = sys.argv[1:] or ["*.sh", "*.sbatch"]
+RECIPE_ROOT = Path(__file__).resolve().parents[1]
+pats = sys.argv[1:] or [str(RECIPE_ROOT / "**" / "*.sh"), str(RECIPE_ROOT / "**" / "*.sbatch")]
 files = []
 for p in pats:
-    files.extend(glob.glob(p))
+    files.extend(glob.glob(p, recursive=True))
 
 bad = 0
 for f in sorted(set(files)):

@@ -108,11 +108,11 @@ choose one launcher. Colocate defaults to 1 GPU; separate needs at least 2:
 
 | Placement | vLLM | SGLang |
 | --- | --- | --- |
-| Shared GPUs | [Colocate smoke](smoke_dynamo_v1_colocate.sh) | [Colocate smoke](smoke_dynamo_v1_colocate_sglang.sh) |
-| Separate pools | [Separate smoke](smoke_dynamo_v1_separate.sh) | [Separate smoke](smoke_dynamo_v1_separate_sglang.sh) |
+| Shared GPUs | [Colocate smoke](tests/smoke/smoke_dynamo_v1_colocate.sh) | [Colocate smoke](tests/smoke/smoke_dynamo_v1_colocate_sglang.sh) |
+| Separate pools | [Separate smoke](tests/smoke/smoke_dynamo_v1_separate.sh) | [Separate smoke](tests/smoke/smoke_dynamo_v1_separate_sglang.sh) |
 
 ```bash
-TOTAL_STEPS=2 bash recipe/dynamo/smoke_dynamo_v1_colocate_sglang.sh
+TOTAL_STEPS=2 bash recipe/dynamo/tests/smoke/smoke_dynamo_v1_colocate_sglang.sh
 ```
 
 The SGLang launchers include its required engine and sleep-mode settings.
@@ -142,15 +142,15 @@ The shared defaults are in [dynamo_base.yaml](config/dynamo_base.yaml).
   scripts also forward extra modules from the driver. Set paths and engine
   environment variables on every node before starting Ray.
 - **Optional extensions:** [UniAgent variants](run_uniagent_variant.sh) cover
-  ThunderAgent and native baselines; [NIXL smoke](run_nixl_smoke.sh) and
-  [bandwidth probe](nixl_bench.py) cover checkpoint-engine weight transfer.
+  ThunderAgent and native baselines; [NIXL smoke](tests/smoke/run_nixl_smoke.sh) and
+  [bandwidth probe](benchmarks/nixl_bench.py) cover checkpoint-engine weight transfer.
 
 ### Enable ThunderAgent
 
 Set `thunderagent.enabled=true` on a Dynamo launcher. For a vLLM V1 smoke:
 
 ```bash
-bash recipe/dynamo/smoke_dynamo_v1_colocate.sh \
+bash recipe/dynamo/tests/smoke/smoke_dynamo_v1_colocate.sh \
     ++actor_rollout_ref.rollout.engine_kwargs.dynamo.thunderagent.enabled=true
 ```
 
@@ -218,3 +218,4 @@ and **6 native CLI configuration checks**. GPU training was not repeated for tha
 | [dynamo_async_server.py](dynamo_async_server.py) | Shared frontend, worker pool and lifecycle |
 | [dynamo_rollout.py](dynamo_rollout.py) | Select the vLLM or SGLang adapter |
 | [dynamo_agent_loop.py](dynamo_agent_loop.py) | Agent-loop clients and async integration |
+| [tests/](tests/) | CPU regression tests, GPU smokes and validation scripts |

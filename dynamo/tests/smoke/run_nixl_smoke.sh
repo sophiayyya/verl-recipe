@@ -2,8 +2,8 @@
 # NIXL refit smoke for the dynamo rollout backend — real training steps so
 # update_weights exercises the CheckpointEngineWorker chain each step.
 # Run from a verl checkout containing this repository at recipe/.
-#   NNODES=1 NGPUS_PER_NODE=8 bash recipe/dynamo/run_nixl_smoke.sh   # single-node
-#   NNODES=2 NGPUS_PER_NODE=8 bash recipe/dynamo/run_nixl_smoke.sh   # multi-node
+#   NNODES=1 NGPUS_PER_NODE=8 bash recipe/dynamo/tests/smoke/run_nixl_smoke.sh   # single-node
+#   NNODES=2 NGPUS_PER_NODE=8 bash recipe/dynamo/tests/smoke/run_nixl_smoke.sh   # multi-node
 set -xuo pipefail
 
 NNODES=${NNODES:-1}

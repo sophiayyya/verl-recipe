@@ -1,7 +1,7 @@
 """Cross-pod NIXL point-to-point bandwidth microbenchmark.
 
-Target (pod B):    python nixl_bench.py target /workspace/bench_meta.bin
-Initiator (pod A): python nixl_bench.py init /workspace/bench_meta.bin
+Target (pod B):    python recipe/dynamo/benchmarks/nixl_bench.py target /workspace/bench_meta.bin
+Initiator (pod A): python recipe/dynamo/benchmarks/nixl_bench.py init /workspace/bench_meta.bin
 Metadata file moves A<-B via kubectl cp; target stays alive while the
 initiator times READ transfers of its 1 GiB CUDA buffer.
 """
