@@ -40,7 +40,12 @@ _THUNDERAGENT_BACKEND_MODEL_SUFFIX = "--verl-thunderagent-backend"
 
 
 class DynamoThunderAgentHttpServer(DynamoHttpServer):
-    """Add program-aware routing while preserving PR #110's server stack."""
+    """Add program-aware routing while preserving PR #110's server stack.
+
+    The frontend selects the ThunderAgent endpoint. ThunderAgent then selects
+    a complete engine (worker, DP rank) pair; never pre-pin a bare engine rank
+    in the frontend request, where session affinity requires an explicit worker.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -87,7 +92,6 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             str(self.model_config.local_path),
             "--router-block-size",
             str(self._thunderagent_router_block_size()),
-            "--router-reset-states",
             *self._thunderagent_extra_args(),
         ]
 
@@ -147,12 +151,6 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         worker_model_name = f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}"
         return super()._build_sglang_cmd(worker_model_name, tp, nccl_port=nccl_port, **kwargs)
 
-    def _frontend_router_args(self) -> list[str]:
-        args = super()._frontend_router_args()
-        if self._thunderagent_enabled() and "--router-reset-states" not in args:
-            args.append("--router-reset-states")
-        return args
-
     def _start_thunderagent(self) -> None:
         if not self._thunderagent_enabled() or self._thunderagent_process is not None:
             return
@@ -197,19 +195,6 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             if is_final:
                 headers["X-Dynamo-Session-Final"] = "true"
         return headers
-
-    def _build_frontend_completion_payload(self, *args, **kwargs) -> dict[str, Any]:
-        payload = super()._build_frontend_completion_payload(*args, **kwargs)
-        if not self._thunderagent_enabled():
-            return payload
-
-        nvext = payload.setdefault("nvext", {})
-        if not isinstance(nvext, dict):
-            raise TypeError("Dynamo nvext must be a mapping")
-        # The launcher runs one DP=1 engine process per shard (both engines). Supplying its rank
-        # avoids a startup race when ThunderAgent pins a newly discovered worker.
-        nvext.setdefault("dp_rank", 0)
-        return payload
 
     async def generate(self, *args, thunderagent_session_id: Optional[str] = None, **kwargs):
         if not self._thunderagent_enabled():

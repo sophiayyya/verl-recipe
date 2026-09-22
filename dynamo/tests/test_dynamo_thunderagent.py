@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import asyncio
+import importlib.metadata
 import inspect
 import json
+import subprocess
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -279,8 +281,30 @@ def test_thunderagent_command_derives_endpoint_model_and_block_size() -> None:
         "/models/test-model",
         "--router-block-size",
         "16",
-        "--router-reset-states",
     ]
+
+
+def _check_installed_dynamo_parser(module: str, args: list[str]) -> None:
+    try:
+        importlib.metadata.version("ai-dynamo-runtime")
+    except importlib.metadata.PackageNotFoundError:
+        pytest.skip("Dynamo runtime is not installed")
+    # Pytest can import this recipe directory as `dynamo`, shadowing the
+    # installed namespace package. Validate the real CLI in a fresh process.
+    script = "import importlib,sys; module=sys.argv.pop(1); importlib.import_module(module).parse_args()"
+    result = subprocess.run([sys.executable, "-c", script, module, *args], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_thunderagent_command_is_accepted_by_dynamo_parser() -> None:
+    _check_installed_dynamo_parser("dynamo.thunderagent_router.args", _make_http_server()._build_thunderagent_cmd()[3:])
+
+
+def test_thunderagent_frontend_options_are_accepted_by_dynamo_parser() -> None:
+    server = _make_http_server()
+    _check_installed_dynamo_parser(
+        "dynamo.frontend.main", ["--router-mode", "round-robin", *server._frontend_router_args()]
+    )
 
 
 def test_thunderagent_command_passes_configured_router_options() -> None:
@@ -341,21 +365,19 @@ def test_thunderagent_backend_workers_use_internal_model_name(monkeypatch) -> No
     assert server._served_model_name == "test-model"
 
 
-def test_thunderagent_payload_supplies_worker_dp_rank(monkeypatch) -> None:
+def test_thunderagent_frontend_payload_leaves_replica_selection_to_router() -> None:
     server = _make_http_server()
-    monkeypatch.setattr(
-        DynamoHttpServer,
-        "_build_frontend_completion_payload",
-        lambda _self, _prompt, _sampling, _request_id: {
-            "model": _self._served_model_name,
-            "nvext": {"extra_fields": ["engine_data"]},
-        },
-    )
+    server.model_config.tokenizer = SimpleNamespace(eos_token_id=2)
+    server.config.prompt_length = 64
+    server.config.response_length = 64
 
-    payload = server._build_frontend_completion_payload([1], {}, "request-a")
+    payload = server._build_frontend_completion_payload([1], {"max_tokens": 1, "logprobs": True}, "request-a")
 
     assert payload["model"] == "test-model"
-    assert payload["nvext"] == {"extra_fields": ["engine_data"], "dp_rank": 0}
+    assert "dp_rank" not in payload["nvext"]
+    assert "backend_instance_id" not in payload["nvext"]
+    assert "detailed_finish_reason" in payload["nvext"]["extra_fields"]
+    assert payload["logprobs"] == 0
 
 
 def test_frontend_start_starts_thunderagent_first(monkeypatch) -> None:
@@ -696,10 +718,11 @@ def _make_bare_server() -> DynamoHttpServer:
 
 
 @pytest.mark.asyncio
-async def test_generation_gate_returns_untagged_aborted_empty() -> None:
+@pytest.mark.parametrize("abort_kwargs", [{}, {"reject_request": False}, {"reject_request": True}])
+async def test_generation_gate_returns_untagged_aborted_empty(abort_kwargs) -> None:
     server = _make_bare_server()
 
-    aborted = await server.abort_all_requests()
+    aborted = await server.abort_all_requests(**abort_kwargs)
     assert aborted["paused"] is False  # no sidecars in this bare setup
     assert not server._generation_resumed.is_set()
 
@@ -900,6 +923,8 @@ class _SwitchingLoadBalancer:
         self.acquire_keys: list[str] = []
         self.acquire_server = _RemoteMethod(self._acquire)
         self.release_server = SimpleNamespace(remote=lambda **_kwargs: None)
+        self.require_acquire_fields = _RemoteMethod(lambda: [])
+        self.require_release_fields = _RemoteMethod(lambda: [])
 
     def _acquire(self, request_id: str):
         self.acquire_keys.append(request_id)
@@ -1010,7 +1035,8 @@ async def test_probe_deadline_caps_hung_requests() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sglang_abort_closes_gate_then_aborts_and_flushes() -> None:
+@pytest.mark.parametrize("reject_request", [False, True])
+async def test_sglang_abort_closes_gate_then_aborts_and_flushes(reject_request) -> None:
     # V1 partial rollout on sglang: pause-equivalent semantics = close the
     # engine-agnostic gate FIRST (nothing slips in between abort and weight
     # sync), then abort in-flight via tokenizer_manager, then flush the radix
@@ -1026,7 +1052,7 @@ async def test_sglang_abort_closes_gate_then_aborts_and_flushes() -> None:
 
     server._sglang_control_all = control_all
 
-    result = await server.abort_all_requests()
+    result = await server.abort_all_requests(reject_request=reject_request)
 
     assert result["paused"] is True
     # pause_generation, NOT abort_request: sglang's abort_request is sync and

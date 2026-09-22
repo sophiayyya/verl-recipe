@@ -215,13 +215,13 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         self._session_servers.pop(session_id, None)
         self._session_routing_keys.pop(session_id, None)
 
-    async def _acquire_server(self, request_id):
+    async def _acquire_server(self, request_id, **extra):
         # Every retry attempt of the parent FullyAsync loop acquires here with
         # the same outer routing key. Recording each acquisition (a superset
         # of "actually admitted" — a finalize for a session unknown to a
         # frontend is a cheap no-op) is what lets finalize reach frontends the
         # LB has since removed or re-routed away from.
-        server_id, handle = await super()._acquire_server(request_id)
+        server_id, handle = await super()._acquire_server(request_id, **extra)
         session_id = self._inflight_routing_sessions.get(str(request_id))
         if session_id is not None:
             self._record_served_server(session_id, server_id, handle)

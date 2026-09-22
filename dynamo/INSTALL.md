@@ -1,5 +1,9 @@
 # Installation
 
+For **vLLM 0.24 with ThunderAgent and V1 async**, follow the
+[dedicated guide](THUNDERAGENT_VLLM024.md), which preserves the 0.24 engine stack
+and includes the required compatibility patch.
+
 ## Source install
 
 Use an activated **Python 3.12** environment on Linux with verl and either
@@ -44,66 +48,10 @@ Keep `etcd` and `nats-server` on `PATH`, then use the [README launch commands](R
 
 `--features kv-indexer` keeps Cargo's default features and adds the standalone
 indexer. This recipe's text-only frontend KV routing does not use the other
-optional services below. Enable routing at runtime with `router_mode=kv` and
+optional services in the full build. Enable routing at runtime with `router_mode=kv` and
 `enable_kv_events=true`; the build flag alone does not configure the router.
 
 The reduced feature selection is based on the pinned source and recipe's launch
-path. Published benchmark results used the fuller build below; the reduced build
-has not been rerun through the H100 comparison.
-
-## DFW benchmark build
-
-The actual `build_dynamo.sh` used the same commit and wheel-build sequence. To
-match its feature selection, replace the `maturin` command above with:
-
-```bash
-cd "$DYNAMO_SRC/lib/bindings/python"
-python3 -m maturin build --release --locked \
-    --features 'kv-indexer,slot-tracker,select-service,mm-routing,aic-forward-pass,request-trace-s3' \
-    --out "$DYNAMO_SRC/dist"
-```
-
-These add standalone slot tracking/selection, multimodal routing, the AIC
-performance model and S3 request traces. The original build reused an existing
-build environment, Cargo cache and Clang paths. Its two **1.5.0** wheels were
-copied to the DFW experiment's `runtime/wheels/` before environment preparation.
-
-| Engine | Existing base image | Installed engine |
-| --- | --- | --- |
-| vLLM | `verl_vllm024.dev2.sqsh` | 0.28.0 |
-| SGLang | `verl_sgl0512.dev4.sqsh` | 0.5.19 |
-
-`prepare.sbatch` mounted the experiment at `/experiment`, the pinned Dynamo
-components at `/dynamo/components:ro`, and the model at `/model:ro`.
-`setup/prepare_environment.py` created `/experiment/engines/<engine>/venv`
-without inheriting image packages. It prepared the engine/training dependencies
-with Torch **2.13.0**, Transformers **5.12.1**, Ray **2.56.1**, CuPy **14.0.1**
-(`cupy-cuda13x`), NIXL **1.3.2** for vLLM / **1.4.0** for SGLang, and TransferQueue
-commit `434f8c476b4be24bc087e6e95070e64efcc739f9`.
-
-`setup/prepare_cpu.py` verified wheel hashes, installed a compatible local
-FlashAttention **2.8.3** wheel, then installed Dynamo and the prepared verl snapshot:
-
-```bash
-BENCH_ENGINE=sglang  # or vllm
-DYNAMO_PYTHON="/experiment/engines/$BENCH_ENGINE/venv/bin/python"
-uv pip install --python "$DYNAMO_PYTHON" \
-    /experiment/runtime/wheels/ai_dynamo_runtime-1.5.0-cp310-abi3-manylinux_2_39_x86_64.whl \
-    /experiment/runtime/wheels/ai_dynamo-1.5.0-py3-none-any.whl \
-    'aisimulate==0.12.0.dev2' 'protobuf>=6.33.5,<7'
-uv pip install --python "$DYNAMO_PYTHON" --no-deps -e /experiment/src/verl
-export PATH="/experiment/engines/$BENCH_ENGINE/venv/bin:/experiment/bin:$PATH"
-export PYTHONPATH="/dynamo/components/src:/experiment/src/verl:/experiment/setup"
-unset PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF
-```
-
-The four formal runs reused those prepared environments and launched
-`verl.trainer.main_ppo`. The experiment scripts/artifacts are archived separately
-from this recipe. See the [benchmark prerequisites](benchmarks/retool_h100_20260916.md#experiment-prerequisites-and-limitations)
-for the ReTool data, tool service and training compatibility changes.
-
-The repository's [SGLang Slurm launcher](train_qwen3_30b_sglang.sh) also installs
-local wheels and loads source through `PYTHONPATH`, but uses
-`pip install --force-reinstall --no-deps` in its prepared environment. Override
-its historical `DYNAMO_WHEELHOUSE` default with your build's `dist/` directory
-and set `DYNAMO_SRC` to the matching checkout, both visible inside the container.
+path. Published benchmark results used the
+[full build recorded with the benchmark](https://github.com/verl-project/verl-recipe/blob/5451026758c3f1dc3ebc2a46a0e52b14406f0f72/dynamo/INSTALL.md#dfw-benchmark-build);
+the reduced build has not been rerun through the H100 comparison.

@@ -51,6 +51,11 @@ Use separate environments for the two inference engines. The tested versions are
 | Inference engine | vLLM 0.28.0 **or** SGLang 0.5.19 |
 | V1 trainer | TransferQueue 0.1.9; CuPy matching CUDA for the separate-pool NCCL backend |
 
+For **Uni-Agent + vLLM 0.24 + ThunderAgent + V1 async**, use the dedicated
+[usage guide](THUNDERAGENT_VLLM024.md) and its pinned versions and launcher.
+Its [fully async launcher](run_uniagent_thunderagent_vllm024_fully_async.sh)
+uses separate 8-GPU training and 8-GPU rollout pools.
+
 ### Install Dynamo
 
 Run in an activated Linux Python 3.12 environment with verl and the selected
@@ -74,7 +79,7 @@ This builds both wheels into `dist/`, installs them into the active interpreter,
 and loads Python components from the matching checkout. Keep only the two
 wheels from this build in `dist/`. For this text-only recipe, the reduced feature
 set keeps Cargo defaults and adds `kv-indexer`; KV routing is enabled at runtime
-with `router_mode=kv`. The [DFW build details](INSTALL.md#dfw-benchmark-build)
+with `router_mode=kv`. The [DFW build details](https://github.com/verl-project/verl-recipe/blob/5451026758c3f1dc3ebc2a46a0e52b14406f0f72/dynamo/INSTALL.md#dfw-benchmark-build)
 record the additional features used for the published results.
 
 Run training from the verl checkout with this repository at `recipe/`. Keep
@@ -136,6 +141,7 @@ The shared defaults are in [dynamo_base.yaml](config/dynamo_base.yaml).
 | `free_engine_on_train` | Must match `rollout.free_cache_engine` |
 
 - **V1:** keep `agent.agent_loop_manager_class=null` to use TransferQueue.
+  Current Uni-Agent instead uses the [Gateway adapter](uniagent_gateway.py).
   The legacy `DynamoAgentLoopManager` only supports V0.
 - **Rewards:** use `reward.custom_reward_function.*` with either trainer.
 - **Multiple nodes:** presets forward the registry through Ray's runtime environment;
@@ -165,6 +171,13 @@ for native verl vLLM. V1 supports ThunderAgent in `colocate_async` and
 `separate_async`. ThunderAgent GPU validation covers vLLM; SGLang routing
 validation is still pending.
 
+For current multi-turn Uni-Agent, use the
+[dedicated launcher](run_uniagent_thunderagent_vllm024.sh). Its recipe Gateway
+adapter releases ThunderAgent programs on session completion or abort, with
+bounded retries and timeouts. Uni-Agent source changes are unnecessary. Keep
+model calls serial within a session; independent sessions run concurrently.
+See the [guide](THUNDERAGENT_VLLM024.md) for the version pins and cleanup scope.
+
 ## Results
 
 ### Qwen3-30B-A3B-Base · ReTool · 8×H100
@@ -185,7 +198,7 @@ Lower is better. These are all 30 raw logged steps, including step 1.
 Means are in ms/token, with equal weight per step and no W&B smoothing.
 This metric includes tool-return context tokens. These runs used additional
 verl/data/tool preparations; evolving policies and sparse tool use limit
-conclusions about KV routing alone. See the [benchmark report](benchmarks/retool_h100_20260916.md)
+conclusions about KV routing alone. See the [benchmark report](https://github.com/verl-project/verl-recipe/blob/5451026758c3f1dc3ebc2a46a0e52b14406f0f72/dynamo/benchmarks/retool_h100_20260916.md)
 for the setup, W&B links, metric definitions and full 50-step results.
 
 ### ThunderAgent · UniAgent · 8×H20-3e
@@ -218,4 +231,5 @@ and **6 native CLI configuration checks**. GPU training was not repeated for tha
 | [dynamo_async_server.py](dynamo_async_server.py) | Shared frontend, worker pool and lifecycle |
 | [dynamo_rollout.py](dynamo_rollout.py) | Select the vLLM or SGLang adapter |
 | [dynamo_agent_loop.py](dynamo_agent_loop.py) | Agent-loop clients and async integration |
+| [uniagent_gateway.py](uniagent_gateway.py) | Current Uni-Agent Gateway and ThunderAgent program lifecycle |
 | [tests/](tests/) | CPU regression tests, GPU smokes and validation scripts |

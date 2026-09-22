@@ -1856,7 +1856,9 @@ class DynamoHttpServer:
             "max_tokens": int(max_tokens),
             "stream": False,
         }
-        nvext_fields = []
+        # OpenAI maps engine cancellation to "stop". Request the lossless
+        # reason so async clients resume partial rollouts after weight updates.
+        nvext_fields = ["detailed_finish_reason"]
         if self._request_engine_data():
             nvext_fields.append("engine_data")
         if self._request_completion_token_ids():
@@ -2043,7 +2045,7 @@ class DynamoHttpServer:
         if tokenizer is None:
             raise RuntimeError("model_config.tokenizer is required for Dynamo frontend generation")
         self._log_engine_data_token_ids_status(choice, data)
-        finish_reason = choice.get("finish_reason")
+        finish_reason = self._completion_finish_reason(choice, data)
         is_aborted = self._map_finish_reason(finish_reason) == "aborted"
 
         token_ids = self._extract_completion_token_ids(
@@ -2051,6 +2053,10 @@ class DynamoHttpServer:
         )
         used_text_fallback = token_ids is None
         if token_ids is None:
+            if is_aborted:
+                # Cancellation before the first token can omit the token-ID
+                # extension entirely. There is no sampled text to reconstruct.
+                return self._aborted_output(include_log_probs)
             if self._request_completion_token_ids():
                 # Token ids were explicitly requested and the frontend still returned
                 # none: re-encoding the text would make the trainer score tokens the
@@ -2188,13 +2194,23 @@ class DynamoHttpServer:
         )
 
     @staticmethod
+    def _completion_finish_reason(choice: dict[str, Any], response: dict[str, Any]) -> Optional[str]:
+        """Prefer Dynamo's engine reason over OpenAI's lossy stop mapping."""
+        for extension in (choice.get("nvext"), response.get("nvext")):
+            if isinstance(extension, dict):
+                reason = extension.get("detailed_finish_reason")
+                if isinstance(reason, str) and reason:
+                    return reason
+        return choice.get("finish_reason")
+
+    @staticmethod
     def _map_finish_reason(finish_reason: Optional[str]) -> Optional[str]:
         """OpenAI finish_reason -> verl stop_reason; one rule for both engines and both
         dispatch paths (frontend and direct).
 
         ai-dynamo's handlers normalize vLLM's "abort" to "cancelled"
         (dynamo.common.utils.engine_response.normalize_finish_reason) before the Rust
-        frontend serializes the response; both mean the request was cut short, so
+        frontend exposes it in nvext.detailed_finish_reason; both mean the request was cut short, so
         partial-rollout resume triggers instead of a truncated trajectory silently
         entering training as completed. Unknown reasons pass through unchanged.
         """
@@ -2812,13 +2828,18 @@ class DynamoHttpServer:
             await finalize(probe_id)
         logger.info("[DynamoHttpServer] logprob channel probe OK")
 
-    async def abort_all_requests(self, reset_prefix_cache: bool = True):
+    async def abort_all_requests(self, reset_prefix_cache: bool = True, reject_request: bool = False):
         """Abort every in-flight request on this node's engine shards and leave them paused.
 
         sglang: native ``tokenizer_manager.pause_generation(mode="abort")`` over the
         /engine/control plane. vLLM: ``AsyncLLM.pause_generation`` bridged through each
         shard's control sidecar. On both engines the resume gate closes first, so new and
         client-retried generate() calls answer aborted-empty until resume_generation().
+
+        ``reject_request`` is accepted for current verl's replica API. Dynamo
+        always rejects paused admissions with an aborted TokenOutput, for both
+        flag values, so waiting requests cannot exhaust the actor's concurrency
+        slots and prevent the resume RPC from running.
         """
         # sglang: native pause for V1 partial rollout. The engine-agnostic
         # resume gate closes FIRST (new and client-retried generate() calls
