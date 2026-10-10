@@ -137,6 +137,12 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
     caller-side changes: when the kwarg is absent we key the program by
     request_id.
 
+    A trajectory that dispatches subagents is a tree of programs: Claude Code
+    gives every subagent its own identity, which the gateway passes as
+    ``program_id`` with the dispatcher in ``parent_program_id``. The request_id
+    stays the routing key, so the whole tree reaches the one frontend whose
+    ThunderAgent can schedule it as a tree; sibling turns run concurrently.
+
     Program lifecycle: the router's ProgramTable only frees an entry on an
     explicit session-final request — there is NO passive expiry, so an
     unfinalized program leaks router capacity for the whole training run and
@@ -187,10 +193,11 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend. ProgramTables are frontend-local; cleanup must reach each
         # server that ever admitted the session.
         self._session_servers: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # OUTER routing key -> session for requests currently inside
-        # generate(), so the per-attempt _acquire_server hook can attribute
-        # each acquired server to its session.
-        self._inflight_routing_sessions: dict[str, str] = {}
+        # OUTER routing key -> sessions (programs) currently inside generate()
+        # under it, so the per-attempt _acquire_server hook can attribute each
+        # acquired server to its session. Concurrent subagent turns share one
+        # routing key, so every program in flight under it is credited.
+        self._inflight_routing_sessions: dict[str, list[str]] = {}
 
     _SESSION_ROUTING_CACHE_MAX = 65536
 
@@ -222,23 +229,27 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend is a cheap no-op) is what lets finalize reach frontends the
         # LB has since removed or re-routed away from.
         server_id, handle = await super()._acquire_server(request_id, **extra)
-        session_id = self._inflight_routing_sessions.get(str(request_id))
-        if session_id is not None:
+        for session_id in self._inflight_routing_sessions.get(str(request_id), ()):
             self._record_served_server(session_id, server_id, handle)
         return server_id, handle
 
-    async def generate(self, request_id, **kwargs):
-        session_id = str(kwargs.setdefault("thunderagent_session_id", str(request_id)))
+    async def generate(self, request_id, *, program_id=None, parent_program_id=None, **kwargs):
+        session_id = str(kwargs.setdefault("thunderagent_session_id", program_id or str(request_id)))
+        if parent_program_id is not None:
+            kwargs["thunderagent_parent_session_id"] = str(parent_program_id)
         # The LB sticky cache is keyed by the OUTER request_id (the routing
         # key every generate attempt used), which may differ from an
         # explicitly passed session_id — remember it so both auto and manual
         # finalize route with the key the requests actually used.
         self._remember_routing_key(session_id, str(request_id))
-        self._inflight_routing_sessions[str(request_id)] = session_id
+        inflight = self._inflight_routing_sessions.setdefault(str(request_id), [])
+        inflight.append(session_id)
         try:
             return await super().generate(request_id, **kwargs)
         finally:
-            self._inflight_routing_sessions.pop(str(request_id), None)
+            inflight.remove(session_id)
+            if not inflight:
+                self._inflight_routing_sessions.pop(str(request_id), None)
             if self._auto_finalize:
                 await self._finalize_with_recovery(session_id, routing_key=str(request_id))
 

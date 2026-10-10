@@ -32,7 +32,8 @@ from .dynamo_async_server import DynamoHttpServer, DynamoReplica
 
 logger = logging.getLogger(__file__)
 
-_REQUEST_PROGRAM: ContextVar[tuple[str, bool] | None] = ContextVar(
+# (program_id, parent_program_id, is_final) of the request being dispatched.
+_REQUEST_PROGRAM: ContextVar[tuple[str, Optional[str], bool] | None] = ContextVar(
     "dynamo_thunderagent_request_program",
     default=None,
 )
@@ -189,22 +190,34 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         headers = super()._frontend_headers(request_id)
         request_program = _REQUEST_PROGRAM.get()
         if request_program is not None:
-            session_id, is_final = request_program
+            session_id, parent_session_id, is_final = request_program
             headers.pop("x-dynamo-session-id", None)
             headers["X-Dynamo-Session-ID"] = session_id
+            if parent_session_id:
+                # The frontend normalizes this into agent_context.parent_session_id,
+                # which lets a subagent-aware scheduler rebuild the program tree.
+                headers["X-Dynamo-Parent-Session-ID"] = parent_session_id
             if is_final:
                 headers["X-Dynamo-Session-Final"] = "true"
         return headers
 
-    async def generate(self, *args, thunderagent_session_id: Optional[str] = None, **kwargs):
+    async def generate(
+        self,
+        *args,
+        thunderagent_session_id: Optional[str] = None,
+        thunderagent_parent_session_id: Optional[str] = None,
+        **kwargs,
+    ):
         if not self._thunderagent_enabled():
             return await super().generate(*args, **kwargs)
         if not thunderagent_session_id:
             raise RuntimeError("ThunderAgent generation requires a non-empty session ID")
+        if thunderagent_parent_session_id == thunderagent_session_id:
+            raise ValueError("ThunderAgent parent session ID must differ from the session ID")
         if self._use_direct_generate():
             raise RuntimeError("direct_generate bypasses ThunderAgent and cannot be enabled")
 
-        token = _REQUEST_PROGRAM.set((thunderagent_session_id, False))
+        token = _REQUEST_PROGRAM.set((thunderagent_session_id, thunderagent_parent_session_id, False))
         try:
             return await super().generate(*args, **kwargs)
         finally:
@@ -245,7 +258,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             "max_tokens": 1,
             "stream": False,
         }
-        token = _REQUEST_PROGRAM.set((session_id, True))
+        token = _REQUEST_PROGRAM.set((session_id, None, True))
         try:
             last_error = None
             attempts = self._finalize_max_attempts()

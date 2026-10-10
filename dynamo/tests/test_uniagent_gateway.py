@@ -7,6 +7,7 @@ import asyncio
 import json
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 pytest.importorskip("uni_agent.gateway.gateway")
@@ -40,10 +41,12 @@ class Backend:
 
     def __init__(self):
         self.ids = []
+        self.programs = []
         self.finalize_program = AsyncMock()
 
     async def generate(self, request_id, **kwargs):
         self.ids.append(request_id)
+        self.programs.append((kwargs.get("program_id"), kwargs.get("parent_program_id")))
         return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason="completed")
 
 
@@ -264,6 +267,112 @@ async def test_independent_sessions_run_concurrently_but_same_session_is_rejecte
     assert backend.finalize_program.await_count == 2
 
 
+async def post(actor, session, headers, content="question"):
+    """Drive the real HTTP route, so identity headers pass through the middleware."""
+    transport = httpx.ASGITransport(app=actor._app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+        return await client.post(
+            f"/sessions/{session}/v1/chat/completions",
+            json={"model": "test", "messages": [{"role": "user", "content": content}]},
+            headers=headers,
+        )
+
+
+ROOT = {"x-claude-code-session-id": "run-1"}
+
+
+def subagent(agent_id):
+    return {"x-claude-code-session-id": "run-1", "x-claude-code-agent-id": agent_id}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_without_identity_headers_is_the_sessions_own_program(make_actor):
+    actor, backend = make_actor()
+    await create(actor)
+    assert (await post(actor, "session", {})).status_code == 200
+    assert backend.programs == [("session", None)]
+
+
+@pytest.mark.asyncio
+async def test_claude_code_subagents_are_programs_of_their_own_and_run_in_parallel(make_actor):
+    # Claude Code names the run in x-claude-code-session-id and each subagent in
+    # x-claude-code-agent-id; the recipe derives the same tree Dynamo's frontend
+    # would. Two subagents of one session overlap, a second turn of the SAME
+    # program is still rejected, and the request id stays the routing key.
+    actor, backend = make_actor()
+    await create(actor)
+    await post(actor, "session", ROOT)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = backend.generate
+
+    async def pending(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original(*args, **kwargs)
+
+    backend.generate = pending
+    first = asyncio.create_task(post(actor, "session", subagent("sub-a"), "task a"))
+    await started.wait()
+    second = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b"))
+    await asyncio.sleep(0)
+    assert set(actor._requests["session"]) == {"sub-a", "sub-b"}
+    assert (await post(actor, "session", subagent("sub-a"), "task a")).status_code == 409
+    release.set()
+    assert {r.status_code for r in await asyncio.gather(first, second)} == {200}
+    assert backend.ids == ["session"] * 3
+    assert backend.programs[0] == ("run-1", None)
+    assert sorted(backend.programs[1:]) == [("sub-a", "run-1"), ("sub-b", "run-1")]
+
+
+@pytest.mark.asyncio
+async def test_the_dispatchers_next_turn_releases_its_idle_subagents(make_actor):
+    # The dispatcher blocks until a subagent returns, so its next turn means the
+    # idle children are done; resident until the session closes they would keep
+    # charging the router's capacity.
+    actor, backend = make_actor()
+    await create(actor)
+    await post(actor, "session", ROOT)
+    await post(actor, "session", subagent("sub-a"), "task a")
+    await post(actor, "session", subagent("sub-b"), "task b")
+    backend.finalize_program.assert_not_awaited()
+
+    await post(actor, "session", ROOT)
+
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b"]
+    await actor.finalize_session("session")
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+    assert "session" not in actor._programs
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_still_running_survives_the_dispatchers_turn_and_goes_at_close(make_actor):
+    actor, backend = make_actor()
+    await create(actor)
+    await post(actor, "session", ROOT)
+    started, release = asyncio.Event(), asyncio.Event()
+    original = backend.generate
+
+    async def pending(*args, **kwargs):
+        if kwargs.get("program_id") == "sub-b":
+            started.set()
+            await release.wait()
+        return await original(*args, **kwargs)
+
+    backend.generate = pending
+    await post(actor, "session", subagent("sub-a"), "task a")
+    background = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b"))
+    await started.wait()
+
+    await post(actor, "session", ROOT)  # sub-a returned, sub-b is mid-request
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
+
+    release.set()
+    await background
+    await actor.finalize_session("session")
+    # Children before the root that dispatched them.
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+
+
 @pytest.mark.asyncio
 async def test_shutdown_attempts_all_sessions_even_if_one_cleanup_fails(make_actor):
     actor, backend = make_actor()
@@ -310,7 +419,7 @@ async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     monkeypatch.setattr(FullyAsyncLLMServerClient, "_acquire_server", acquire)
     client = object.__new__(DynamoFullyAsyncLLMServerClient)
     client._session_servers = OrderedDict()
-    client._inflight_routing_sessions = {"request": "session"}
+    client._inflight_routing_sessions = {"request": ["session"]}
     assert await client._acquire_server("request", prompt_ids=[1, 2]) == ("worker", handle)
     acquire.assert_awaited_once_with("request", prompt_ids=[1, 2])
     assert client._session_servers["session"]["worker"] is handle

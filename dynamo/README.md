@@ -174,9 +174,32 @@ validation is still pending.
 For current multi-turn Uni-Agent, use the
 [dedicated launcher](run_uniagent_thunderagent_vllm024.sh). Its recipe Gateway
 adapter releases ThunderAgent programs on session completion or abort, with
-bounded retries and timeouts. Uni-Agent source changes are unnecessary. Keep
-model calls serial within a session; independent sessions run concurrently.
+bounded retries and timeouts. Keep model calls serial within a program;
+independent programs and sessions run concurrently.
 See the [guide](THUNDERAGENT_VLLM024.md) for the version pins and cleanup scope.
+
+### Subagent programs (Claude Code)
+
+A Claude Code rollout that dispatches subagents is a tree of programs, not one:
+every subagent turn carries its own `x-claude-code-agent-id`, and Dynamo's
+frontend normalizes it into a distinct `agent_context.session_id` with the root
+as `parent_session_id`. The Gateway terminates those headers, so the recipe's
+adapter ([uniagent_gateway.py](uniagent_gateway.py)) applies the same rules
+([agent_identity.py](agent_identity.py)) itself, with Uni-Agent unmodified. It
+
+- names each turn's ThunderAgent program after the agent that sent it and
+  passes the dispatcher as `X-Dynamo-Parent-Session-ID`, so a router that
+  understands the link can place siblings together;
+- keeps the trajectory's request id as the routing key, so the whole tree
+  reaches one frontend, and serializes turns per program rather than per
+  session, so parallel subagents are not rejected;
+- releases a dispatcher's idle subagents when the dispatcher takes its next
+  turn (it blocks until they return), and the rest of the tree, children
+  first, when the session closes. Check with the router's
+  `programs_created_total - programs_ended_total`.
+
+Subagents are off by default in the Uni-Agent Claude Code recipe; enable them
+in the Task Config with `agent.enable_subagents: true`.
 
 ## Results
 

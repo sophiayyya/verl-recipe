@@ -1,9 +1,16 @@
-"""ThunderAgent session cleanup for the unmodified Uni-Agent Gateway API.
+"""ThunderAgent program lifecycle for the unmodified Uni-Agent Gateway API.
 
 Integration baseline: Uni-Agent 0825e1ea and its verl submodule 3efe38c7.
 Select DynamoAgentFrameworkRolloutAdapter through agent_loop_manager_class.
-Only serial model calls within a session are supported; separate sessions run
-concurrently. Backend state stays in the gateway actor that owns the client.
+
+A gateway session is one trajectory, but not necessarily one program: a Claude
+Code run that dispatches subagents is a tree of them. The agent announces that
+tree in its request headers, which the Gateway terminates, so this module reads
+them here (``agent_identity``), names every turn's program for the client, and
+releases the tree -- subagents first, then the root -- when the session closes.
+Model calls are serial within a program; programs run concurrently, whether they
+are the subagents of one session or separate sessions. Backend state stays in
+the gateway actor that owns the client.
 """
 
 from __future__ import annotations
@@ -11,11 +18,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import replace
 
 import ray
 from fastapi import HTTPException
 from omegaconf import OmegaConf
+from starlette.datastructures import Headers
 from uni_agent.framework.entry import AgentFrameworkRolloutAdapter, AgentFrameworkWorker
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import _GatewayActor
@@ -23,7 +32,63 @@ from uni_agent.gateway.manager import GatewayManager
 
 from verl.utils.config import omega_conf_to_dataclass
 
+from .agent_identity import AgentIdentity, agent_identity_from_headers
+
 logger = logging.getLogger(__name__)
+
+# The identity the current HTTP request announced, bound for the request's task
+# and every task it spawns, down to the backend call.
+_REQUEST_IDENTITY: ContextVar[AgentIdentity | None] = ContextVar("dynamo_gateway_agent_identity", default=None)
+
+
+class _AgentIdentityMiddleware:
+    """Bind each request's coding-agent identity headers to its task.
+
+    A pure ASGI middleware runs the route in the same task, so a ``ContextVar``
+    set here is visible to the handler, to the task it spawns, and to the client
+    call at the bottom.
+    """
+
+    def __init__(self, app):
+        self._app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self._app(scope, receive, send)
+        token = _REQUEST_IDENTITY.set(agent_identity_from_headers(Headers(scope=scope)))
+        try:
+            return await self._app(scope, receive, send)
+        finally:
+            _REQUEST_IDENTITY.reset(token)
+
+
+def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, str | None]:
+    """The program a turn belongs to and its parent; a turn without identity headers is the session."""
+    if identity is None:
+        return session_id, None
+    return identity.session_id, identity.parent_session_id
+
+
+class _ProgramClient:
+    """The session's view of the ThunderAgent client: a program per agent identity.
+
+    Uni-Agent's session calls ``generate`` with its session id as the request id
+    and knows nothing about programs. The request id stays the routing key, so a
+    whole tree reaches one frontend; the program named here is what the router
+    schedules and what the actor later releases.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    async def generate(self, request_id, **kwargs):
+        program_id, parent_program_id = _program_of(request_id, _REQUEST_IDENTITY.get())
+        return await self._client.generate(
+            request_id, program_id=program_id, parent_program_id=parent_program_id, **kwargs
+        )
+
+    async def finalize_program(self, program_id):
+        await self._client.finalize_program(program_id)
 
 
 async def _wait_for_cleanup(task):
@@ -41,7 +106,7 @@ async def _wait_for_cleanup(task):
 
 
 class _DynamoGatewayActor(_GatewayActor):
-    """Close the gateway session and the matching ThunderAgent program together."""
+    """Close the gateway session and every ThunderAgent program it created together."""
 
     _finalize_attempts = 3
     _finalize_timeout = 60.0
@@ -54,8 +119,11 @@ class _DynamoGatewayActor(_GatewayActor):
         if getattr(backend, "_auto_finalize", True):
             raise ValueError("Dynamo Gateway requires thunderagent.auto_finalize=false")
         # Dynamo uses vLLM tool parsers behind its own rollout registry name.
-        super().__init__(replace(config, rollout_backend="vllm"), backend)
+        super().__init__(replace(config, rollout_backend="vllm"), _ProgramClient(backend))
+        self._app.add_middleware(_AgentIdentityMiddleware)
         self._requests = {}
+        # session -> {program: parent}, in creation order; a child is created after its parent.
+        self._programs = {}
         self._closing = {}
         self._closed = OrderedDict()
 
@@ -67,17 +135,23 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _handle_request(self, handler, session_id, payload):
         if session_id in self._closing or session_id in self._closed:
             raise HTTPException(status_code=409, detail="Session is closing")
-        if session_id in self._requests:
-            raise HTTPException(status_code=409, detail="Dynamo Gateway requires serial calls within one session")
-        self._requests[session_id] = asyncio.current_task()
+        program_id, parent_program_id = _program_of(session_id, _REQUEST_IDENTITY.get())
+        inflight = self._requests.setdefault(session_id, {})
+        if program_id in inflight:
+            raise HTTPException(status_code=409, detail="Dynamo Gateway requires serial calls within one program")
+        inflight[program_id] = asyncio.current_task()
         try:
+            self._programs.setdefault(session_id, {}).setdefault(program_id, parent_program_id)
+            await self._release_returned_children(session_id, program_id)
             # Cancelling an HTTP waiter does not necessarily cancel its Ray
             # backend RPC. Keep the complete handler alive until that RPC and
             # token collection finish, so cleanup cannot release a live program.
             request = asyncio.create_task(handler(session_id=session_id, payload=payload))
             return await _wait_for_cleanup(request)
         finally:
-            self._requests.pop(session_id, None)
+            inflight.pop(program_id, None)
+            if not inflight:
+                self._requests.pop(session_id, None)
 
     async def _handle_openai_chat_completions(self, *, session_id, payload):
         return await self._handle_request(super()._handle_openai_chat_completions, session_id, payload)
@@ -85,31 +159,56 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _handle_anthropic_messages(self, *, session_id, payload):
         return await self._handle_request(super()._handle_anthropic_messages, session_id, payload)
 
-    async def _release_program(self, session_id):
+    async def _release_program(self, program_id):
         for attempt in range(self._finalize_attempts):
             try:
-                await asyncio.wait_for(self._backend.finalize_program(session_id), self._finalize_timeout)
-                logger.info("ThunderAgent program finalized: session=%s", session_id)
+                await asyncio.wait_for(self._backend.finalize_program(program_id), self._finalize_timeout)
+                logger.info("ThunderAgent program finalized: program=%s", program_id)
                 return
             except Exception:
                 if attempt + 1 == self._finalize_attempts:
-                    logger.exception("ThunderAgent program cleanup failed: session=%s", session_id)
+                    logger.exception("ThunderAgent program cleanup failed: program=%s", program_id)
                     raise
                 await asyncio.sleep(self._retry_delay * 2**attempt)
 
+    async def _release_returned_children(self, session_id, program_id):
+        """Release the idle subagents of a program that is taking a new turn.
+
+        Nothing marks a subagent final, and the agent that dispatched it blocks
+        until it returns, so the dispatcher's next turn is the signal that its
+        idle children are done. Left resident until the session closes they keep
+        charging the router's capacity, and under pressure can pin the whole
+        tree: the root is paused for lack of room that only its own release
+        could make. A child still mid-request (a background subagent) is kept.
+        """
+        tree = self._programs.get(session_id, {})
+        inflight = self._requests.get(session_id, {})
+        for child in [child for child, parent in tree.items() if parent == program_id and child not in inflight]:
+            await self._release_returned_children(session_id, child)
+            await self._release_program(child)
+            tree.pop(child, None)
+
+    def _session_programs(self, session_id):
+        """Every program the session created, children before the root that dispatched them."""
+        programs = list(self._programs.get(session_id, {}))
+        return list(reversed(programs)) if programs else [session_id]
+
     async def _close_session(self, session_id, abort):
-        request = self._requests.get(session_id)
-        if request is not None:
+        requests = list(self._requests.get(session_id, {}).values())
+        if requests:
             if abort:
-                request.cancel()
-            # Await the complete HTTP handler, including token collection.
+                for request in requests:
+                    request.cancel()
+            # Await the complete HTTP handlers, including token collection.
             # On timeout retain the closing state and surface failure.
-            _, pending = await asyncio.wait({request}, timeout=self._drain_timeout)
+            _, pending = await asyncio.wait(requests, timeout=self._drain_timeout)
             if pending:
                 raise TimeoutError(f"Session {session_id} still has an active generation; program was not released")
         # The same actor owns the client's served-frontend records. A driver
         # copy of the client would not know every frontend visited on retries.
-        await self._release_program(session_id)
+        for program_id in self._session_programs(session_id):
+            await self._release_program(program_id)
+        self._programs.pop(session_id, None)
         if abort:
             await super().abort_session(session_id)
             result = None
