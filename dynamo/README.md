@@ -193,10 +193,14 @@ adapter ([uniagent_gateway.py](uniagent_gateway.py)) applies the same rules
 - keeps the trajectory's request id as the routing key, so the whole tree
   reaches one frontend, and serializes turns per program rather than per
   session, so parallel subagents are not rejected;
-- releases a dispatcher's idle subagents when the dispatcher takes its next
-  turn (it blocks until they return), and the rest of the tree, children
-  first, when the session closes. Check with the router's
-  `programs_created_total - programs_ended_total`.
+- releases a subagent the moment its final answer is produced (a turn that
+  ends without a tool call is the Agent tool returning), releases a
+  dispatcher's remaining idle subagents when the dispatcher takes its next
+  turn, and the rest of the tree, children first, when the session closes.
+  Finished subagents would otherwise hold admission and resident KV while
+  their siblings finish, and a tree moves at the pace of its slowest admitted
+  member. Check with the router's `programs_created_total -
+  programs_ended_total`.
 
 Subagents are off by default in the Uni-Agent Claude Code recipe; enable them
 in the Task Config with `agent.enable_subagents: true`.

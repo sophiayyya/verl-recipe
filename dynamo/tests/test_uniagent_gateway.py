@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("uni_agent.gateway.gateway")
 
 from fastapi import HTTPException
-from recipe.dynamo.uniagent_gateway import _DynamoGatewayActor
+from recipe.dynamo.uniagent_gateway import _DynamoGatewayActor, _turn_returned
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import _GatewayActor
 
@@ -43,11 +43,13 @@ class Backend:
         self.ids = []
         self.programs = []
         self.finalize_program = AsyncMock()
+        # "tool_calls" keeps the agent's chain running; "completed" is its final answer.
+        self.stop_reason = "completed"
 
     async def generate(self, request_id, **kwargs):
         self.ids.append(request_id)
         self.programs.append((kwargs.get("program_id"), kwargs.get("parent_program_id")))
-        return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason="completed")
+        return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason=self.stop_reason)
 
 
 @pytest.fixture
@@ -267,15 +269,21 @@ async def test_independent_sessions_run_concurrently_but_same_session_is_rejecte
     assert backend.finalize_program.await_count == 2
 
 
-async def post(actor, session, headers, content="question"):
+async def post(actor, session, headers, content="question", stream=False):
     """Drive the real HTTP route, so identity headers pass through the middleware."""
     transport = httpx.ASGITransport(app=actor._app)
     async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
         return await client.post(
             f"/sessions/{session}/v1/chat/completions",
-            json={"model": "test", "messages": [{"role": "user", "content": content}]},
+            json={"model": "test", "messages": [{"role": "user", "content": content}], "stream": stream},
             headers=headers,
         )
+
+
+async def settled(actor):
+    """Let background releases of returned subagents finish."""
+    while any(actor._releases.values()):
+        await asyncio.sleep(0)
 
 
 ROOT = {"x-claude-code-session-id": "run-1"}
@@ -300,6 +308,7 @@ async def test_claude_code_subagents_are_programs_of_their_own_and_run_in_parall
     # would. Two subagents of one session overlap, a second turn of the SAME
     # program is still rejected, and the request id stays the routing key.
     actor, backend = make_actor()
+    backend.stop_reason = "tool_calls"
     await create(actor)
     await post(actor, "session", ROOT)
     started, release = asyncio.Event(), asyncio.Event()
@@ -330,6 +339,7 @@ async def test_the_dispatchers_next_turn_releases_its_idle_subagents(make_actor)
     # idle children are done; resident until the session closes they would keep
     # charging the router's capacity.
     actor, backend = make_actor()
+    backend.stop_reason = "tool_calls"
     await create(actor)
     await post(actor, "session", ROOT)
     await post(actor, "session", subagent("sub-a"), "task a")
@@ -347,6 +357,7 @@ async def test_the_dispatchers_next_turn_releases_its_idle_subagents(make_actor)
 @pytest.mark.asyncio
 async def test_a_subagent_still_running_survives_the_dispatchers_turn_and_goes_at_close(make_actor):
     actor, backend = make_actor()
+    backend.stop_reason = "tool_calls"
     await create(actor)
     await post(actor, "session", ROOT)
     started, release = asyncio.Event(), asyncio.Event()
@@ -370,6 +381,50 @@ async def test_a_subagent_still_running_survives_the_dispatchers_turn_and_goes_a
     await background
     await actor.finalize_session("session")
     # Children before the root that dispatched them.
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+
+
+def test_turn_returned_reads_the_last_finish_reason_in_either_dialect():
+    openai_json = b'{"choices":[{"index":0,"finish_reason":"tool_calls"}]}'
+    anthropic_json = b'{"stop_reason": "end_turn", "stop_sequence": null}'
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n'
+        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
+    )
+    assert _turn_returned(openai_json) is False
+    assert _turn_returned(anthropic_json) is True
+    assert _turn_returned(sse) is True
+    assert _turn_returned(b'{"choices":[{"finish_reason":"length"}]}') is False
+    assert _turn_returned(b"{}") is False
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_is_released_the_moment_its_final_answer_is_produced(make_actor):
+    # The dispatcher only continues once every subagent has returned; a subagent
+    # that already stopped calling tools would otherwise hold admission and
+    # resident KV while its siblings finish.
+    actor, backend = make_actor()
+    await create(actor)
+    backend.stop_reason = "tool_calls"
+    await post(actor, "session", ROOT)
+    await post(actor, "session", subagent("sub-a"), "task a")
+    await settled(actor)
+    backend.finalize_program.assert_not_awaited()
+
+    backend.stop_reason = "completed"
+    await post(actor, "session", subagent("sub-a"), "task a, done")
+    await settled(actor)
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
+    assert "sub-a" not in actor._programs["session"]
+
+    # The streaming dialect carries the finish reason in its last chunk.
+    response = await post(actor, "session", subagent("sub-b"), "task b", stream=True)
+    assert response.status_code == 200 and b"[DONE]" in response.content
+    await settled(actor)
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b"]
+
+    await post(actor, "session", ROOT)
+    await actor.finalize_session("session")
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
 
 

@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import replace
 
 import ray
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 from omegaconf import OmegaConf
 from starlette.datastructures import Headers
 from uni_agent.framework.entry import AgentFrameworkRolloutAdapter, AgentFrameworkWorker
@@ -60,6 +62,39 @@ class _AgentIdentityMiddleware:
             return await self._app(scope, receive, send)
         finally:
             _REQUEST_IDENTITY.reset(token)
+
+
+# The last finish reason a response carries, in either dialect; streams repeat it per chunk.
+_FINISH_REASON = re.compile(r'"(?:finish_reason|stop_reason)":\s*"([a-z_]+)"')
+
+
+def _turn_returned(body: bytes) -> bool:
+    """True when the response ends the agent's chain: it stopped without calling a tool.
+
+    An agent keeps running while its turns end in tool calls (``tool_calls`` /
+    ``tool_use``); a turn that ends with ``stop`` / ``end_turn`` is its final
+    answer, and for a subagent that is the moment the Agent tool returns it to
+    its dispatcher. Truncation and unknown reasons are not treated as a return.
+    """
+    reasons = _FINISH_REASON.findall(body.decode("utf-8", "replace"))
+    return bool(reasons) and reasons[-1] in ("stop", "end_turn")
+
+
+def _observe_body(response, on_complete):
+    """Call ``on_complete(body)`` with the response body once it has been produced."""
+    if isinstance(response, StreamingResponse):
+        inner = response.body_iterator
+
+        async def tee():
+            chunks = []
+            async for chunk in inner:
+                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
+                yield chunk
+            on_complete(b"".join(chunks))
+
+        response.body_iterator = tee()
+    else:
+        on_complete(response.body)
 
 
 def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, str | None]:
@@ -124,6 +159,8 @@ class _DynamoGatewayActor(_GatewayActor):
         self._requests = {}
         # session -> {program: parent}, in creation order; a child is created after its parent.
         self._programs = {}
+        # session -> releases of returned subagents still in flight.
+        self._releases = {}
         self._closing = {}
         self._closed = OrderedDict()
 
@@ -147,7 +184,10 @@ class _DynamoGatewayActor(_GatewayActor):
             # backend RPC. Keep the complete handler alive until that RPC and
             # token collection finish, so cleanup cannot release a live program.
             request = asyncio.create_task(handler(session_id=session_id, payload=payload))
-            return await _wait_for_cleanup(request)
+            response = await _wait_for_cleanup(request)
+            if parent_program_id is not None:
+                _observe_body(response, lambda body: self._release_if_returned(session_id, program_id, body))
+            return response
         finally:
             inflight.pop(program_id, None)
             if not inflight:
@@ -188,6 +228,33 @@ class _DynamoGatewayActor(_GatewayActor):
             await self._release_program(child)
             tree.pop(child, None)
 
+    def _release_if_returned(self, session_id, program_id, body):
+        """Release a subagent the moment its final answer has been produced.
+
+        A subagent that stops calling tools has returned to its dispatcher, yet
+        the dispatcher takes its next turn only once every sibling has returned.
+        Under pressure the finished siblings would otherwise hold admission and
+        resident KV while they wait, and a tree moves at the pace of its slowest
+        admitted member. Releasing on return hands that room to the siblings.
+        """
+        if not _turn_returned(body):
+            return
+        task = asyncio.create_task(self._release_subagent(session_id, program_id))
+        pending = self._releases.setdefault(session_id, set())
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+    async def _release_subagent(self, session_id, program_id):
+        tree = self._programs.get(session_id, {})
+        if program_id not in tree or program_id in self._requests.get(session_id, {}):
+            return
+        try:
+            await self._release_returned_children(session_id, program_id)
+            await self._release_program(program_id)
+        except Exception:
+            return  # logged by _release_program; the close path retries it
+        tree.pop(program_id, None)
+
     def _session_programs(self, session_id):
         """Every program the session created, children before the root that dispatched them."""
         programs = list(self._programs.get(session_id, {}))
@@ -204,6 +271,8 @@ class _DynamoGatewayActor(_GatewayActor):
             _, pending = await asyncio.wait(requests, timeout=self._drain_timeout)
             if pending:
                 raise TimeoutError(f"Session {session_id} still has an active generation; program was not released")
+        if pending := self._releases.pop(session_id, None):
+            await asyncio.gather(*pending, return_exceptions=True)
         # The same actor owns the client's served-frontend records. A driver
         # copy of the client would not know every frontend visited on retries.
         for program_id in self._session_programs(session_id):
