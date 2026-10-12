@@ -1421,3 +1421,37 @@ def test_native_thunderagent_frontend_options_are_accepted_by_dynamo_parser(monk
     monkeypatch.setenv("VERL_DYNAMO_LOG_DIR", str(tmp_path))
     server = _make_native_server()
     _check_installed_dynamo_parser("dynamo.frontend.main", ["--router-mode", "kv", *server._frontend_router_args()])
+
+
+@pytest.mark.asyncio
+async def test_health_probe_waits_for_the_completions_route(monkeypatch) -> None:
+    server = _make_native_server()
+    attempts = []
+
+    async def finalize(session_id):
+        attempts.append(session_id)
+        if len(attempts) < 3:
+            raise RuntimeError("ThunderAgent final request failed status=404 body=''")
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(server, "finalize_program", finalize)
+    monkeypatch.setattr(dynamo_thunderagent.asyncio, "sleep", no_sleep)
+
+    await server._probe_final_request()
+
+    assert len(attempts) == 3
+
+
+@pytest.mark.asyncio
+async def test_health_probe_raises_other_errors_at_once(monkeypatch) -> None:
+    server = _make_native_server()
+
+    async def finalize(_session_id):
+        raise RuntimeError("ThunderAgent final request failed status=503 body=''")
+
+    monkeypatch.setattr(server, "finalize_program", finalize)
+
+    with pytest.raises(RuntimeError, match="status=503"):
+        await server._probe_final_request()

@@ -340,12 +340,35 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         finally:
             _REQUEST_PROGRAM.reset(token)
 
+    def _health_probe_timeout(self) -> float:
+        timeout = float(self._thunderagent_config().get("health_probe_timeout_s", 60.0))
+        if timeout <= 0:
+            raise ValueError("thunderagent.health_probe_timeout_s must be positive")
+        return timeout
+
+    async def _probe_final_request(self) -> None:
+        """Release a throwaway program to prove the session-final path works.
+
+        ``/health`` lists the workers as soon as they register, but the frontend commits
+        the model's completions route a moment later; until then the probe is answered
+        with 404. Wait that out within a bound instead of failing startup.
+        """
+        deadline = time.monotonic() + self._health_probe_timeout()
+        while True:
+            try:
+                await self.finalize_program(f"thunderagent-health-{time.time_ns()}")
+                return
+            except RuntimeError as error:
+                if "status=404" not in str(error) or time.monotonic() >= deadline:
+                    raise
+            await asyncio.sleep(1.0)
+
     async def _healthcheck_frontend(self, expected_workers: int) -> None:
         await super()._healthcheck_frontend(
             expected_workers + int(self._thunderagent_enabled() and not self._thunderagent_native())
         )
         if self._thunderagent_enabled():
-            await self.finalize_program(f"thunderagent-health-{time.time_ns()}")
+            await self._probe_final_request()
 
     async def shutdown(self) -> None:
         frontend = self._frontend_process
