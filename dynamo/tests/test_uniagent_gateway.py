@@ -13,7 +13,14 @@ import pytest
 pytest.importorskip("uni_agent.gateway.gateway")
 
 from fastapi import HTTPException
-from recipe.dynamo.uniagent_gateway import _DynamoGatewayActor, _turn_returned
+from recipe.dynamo.uniagent_gateway import (
+    DynamoAgentFrameworkRolloutAdapter,
+    DynamoGatewayActor,
+    _DynamoGatewayActor,
+    _gateway_actor_class,
+    _turn_returned,
+)
+from uni_agent.gateway.gateway import GatewayActor
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import _GatewayActor
 
@@ -478,3 +485,37 @@ async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     assert await client._acquire_server("request", prompt_ids=[1, 2]) == ("worker", handle)
     acquire.assert_awaited_once_with("request", prompt_ids=[1, 2])
     assert client._session_servers["session"]["worker"] is handle
+
+
+def test_gateway_actor_class_follows_thunderagent_setting() -> None:
+    assert _gateway_actor_class(True) is DynamoGatewayActor
+    assert _gateway_actor_class(False) is GatewayActor
+
+
+def _adapter_config(enabled: bool, auto_finalize: bool):
+    from omegaconf import OmegaConf
+
+    return OmegaConf.create(
+        {"actor_rollout_ref": {"rollout": {"engine_kwargs": {"dynamo": {"engine": "vllm", "thunderagent": {"enabled": enabled, "auto_finalize": auto_finalize}}}}}}
+    )
+
+
+def test_adapter_builds_plain_gateways_without_thunderagent(monkeypatch) -> None:
+    built = {}
+
+    def build(config, llm_client, *, thunderagent):
+        built["thunderagent"] = thunderagent
+        return "manager"
+
+    monkeypatch.setattr("recipe.dynamo.uniagent_gateway._build_gateway_manager", build)
+    monkeypatch.setattr("recipe.dynamo.uniagent_gateway.AgentFrameworkWorker", type("W", (), {"remote": staticmethod(lambda **_: "worker")}))
+
+    adapter = DynamoAgentFrameworkRolloutAdapter.create(config=_adapter_config(False, True), llm_client=object())
+
+    assert built == {"thunderagent": False}
+    assert adapter.gateway_manager == "manager" and adapter.framework_worker == "worker"
+
+
+def test_adapter_requires_manual_finalize_with_thunderagent() -> None:
+    with pytest.raises(ValueError, match="auto_finalize=false"):
+        DynamoAgentFrameworkRolloutAdapter.create(config=_adapter_config(True, True), llm_client=object())

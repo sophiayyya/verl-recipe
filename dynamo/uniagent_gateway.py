@@ -29,7 +29,7 @@ from omegaconf import OmegaConf
 from starlette.datastructures import Headers
 from uni_agent.framework.entry import AgentFrameworkRolloutAdapter, AgentFrameworkWorker
 from uni_agent.gateway.config import GatewayActorConfig
-from uni_agent.gateway.gateway import _GatewayActor
+from uni_agent.gateway.gateway import GatewayActor, _GatewayActor
 from uni_agent.gateway.manager import GatewayManager
 
 from verl.utils.config import omega_conf_to_dataclass
@@ -325,17 +325,23 @@ class _DynamoGatewayActor(_GatewayActor):
 DynamoGatewayActor = ray.remote(_DynamoGatewayActor)
 
 
+def _gateway_actor_class(thunderagent: bool):
+    """The recipe actor owns ThunderAgent programs; without ThunderAgent the upstream actor suffices."""
+    return DynamoGatewayActor if thunderagent else GatewayActor
+
+
 class DynamoGatewayManager(GatewayManager):
     """Use the recipe actor while retaining upstream session routing methods."""
 
-    def __init__(self, llm_client, *, gateway_count, gateway_actor_config):
+    def __init__(self, llm_client, *, gateway_count, gateway_actor_config, actor_cls=None):
+        actor_cls = actor_cls or DynamoGatewayActor
         if gateway_count <= 0:
             raise ValueError("gateway_count must be positive")
         nodes = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         if not nodes:
             raise RuntimeError("No alive CPU nodes available for DynamoGatewayActor")
         self.gateways = [
-            DynamoGatewayActor.options(
+            actor_cls.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=nodes[i % len(nodes)], soft=True
                 )
@@ -348,8 +354,12 @@ class DynamoGatewayManager(GatewayManager):
         self._session_to_gateway_index = {}
 
 
-def _build_gateway_manager(config, llm_client):
-    """Mirror Uni-Agent's GatewayActorConfig wiring without replacing globals."""
+def _build_gateway_manager(config, llm_client, *, thunderagent=True):
+    """Mirror Uni-Agent's GatewayActorConfig wiring without replacing globals.
+
+    Dynamo serves vLLM engines behind its own rollout registry name, so the tool parser
+    backend is pinned to ``vllm`` whether or not ThunderAgent is on.
+    """
     af = config.actor_rollout_ref.rollout.custom.agent_framework
     model = omega_conf_to_dataclass(config.actor_rollout_ref.model)
     rollout = omega_conf_to_dataclass(config.actor_rollout_ref.rollout)
@@ -374,7 +384,12 @@ def _build_gateway_manager(config, llm_client):
         allowed_request_sampling_param_keys=None if allowed is None else set(allowed),
         coalesce_reserved_exact_requests=af.get("coalesce_reserved_exact_requests", True),
     )
-    return DynamoGatewayManager(llm_client, gateway_count=int(af["gateway_count"]), gateway_actor_config=actor_config)
+    return DynamoGatewayManager(
+        llm_client,
+        gateway_count=int(af["gateway_count"]),
+        gateway_actor_config=actor_config,
+        actor_cls=_gateway_actor_class(thunderagent),
+    )
 
 
 class DynamoAgentFrameworkRolloutAdapter(AgentFrameworkRolloutAdapter):
@@ -387,9 +402,10 @@ class DynamoAgentFrameworkRolloutAdapter(AgentFrameworkRolloutAdapter):
         dynamo = config.actor_rollout_ref.rollout.engine_kwargs.dynamo
         if dynamo.get("engine", "vllm") != "vllm":
             raise ValueError("Dynamo Uni-Agent Gateway currently supports only vLLM")
-        if not dynamo.thunderagent.enabled or dynamo.thunderagent.get("auto_finalize", True):
-            raise ValueError("Enable ThunderAgent with auto_finalize=false for the Uni-Agent Gateway")
-        gateway_manager = _build_gateway_manager(config, llm_client)
+        thunderagent = bool(dynamo.thunderagent.enabled)
+        if thunderagent and dynamo.thunderagent.get("auto_finalize", True):
+            raise ValueError("ThunderAgent with the Uni-Agent Gateway requires thunderagent.auto_finalize=false")
+        gateway_manager = _build_gateway_manager(config, llm_client, thunderagent=thunderagent)
         instance = cls()
         instance.gateway_manager = gateway_manager
         instance.framework_worker = AgentFrameworkWorker.remote(
