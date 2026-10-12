@@ -1358,3 +1358,66 @@ async def test_concurrent_sibling_turns_credit_every_program_in_flight() -> None
     await client.finalize_program("sub-b")
     await client.finalize_program("sub-a")
     assert server.finalize_calls == ["sub-b", "sub-a"]
+
+
+def _make_native_server(parameters: dict | None = None, router_mode: str = "kv") -> DynamoThunderAgentHttpServer:
+    config = {"enabled": True, "native": True}
+    if parameters is not None:
+        config["native_parameters"] = parameters
+    server = _make_http_server(config)
+    server._router_mode = router_mode
+    return server
+
+
+def test_native_thunderagent_configures_the_frontend_plugin_instead_of_a_router_process(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("VERL_DYNAMO_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(DynamoHttpServer, "_frontend_router_args", lambda _self: ["--kv-cache-block-size", "16"])
+    server = _make_native_server({"pause_threshold": 0.9, "scheduler_interval_seconds": 1})
+
+    args = server._frontend_router_args()
+    server._start_thunderagent()
+
+    assert args[:2] == ["--kv-cache-block-size", "16"]
+    assert args[args.index("--router-session-affinity-mode") + 1] == "soft"
+    policy = yaml.safe_load(Path(args[args.index("--router-policy-config") + 1]).read_text())
+    assert policy == {
+        "request_classifier": {"type": "thunderagent", "parameters": {"pause_threshold": 0.9, "scheduler_interval_seconds": 1}},
+        "worker_selection": {"aggregated": "thunderagent", "instances": [{"name": "thunderagent", "type": "thunderagent"}]},
+    }
+    assert server._thunderagent_process is None
+
+
+def test_native_thunderagent_requires_the_kv_router() -> None:
+    with pytest.raises(ValueError, match="router_mode=kv"):
+        _make_native_server(router_mode="round-robin")._validate_thunderagent_router_mode()
+    _make_native_server()._validate_thunderagent_router_mode()
+    _make_http_server()._validate_thunderagent_router_mode()
+
+
+def test_native_thunderagent_workers_keep_the_public_model_name(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        DynamoHttpServer,
+        "_build_vllm_cmd",
+        lambda _self, model, _tp, kv_events_config_json=None: calls.append(model) or ["python", "-m", "dynamo.vllm"],
+    )
+
+    command = _make_native_server()._build_vllm_cmd("test-model", 1, "{}")
+
+    assert calls == ["test-model"]
+    assert command[-2:] == ["--block-size", "16"]
+
+
+def test_native_thunderagent_final_request_may_complete_on_a_worker() -> None:
+    body = json.dumps({"choices": [{"text": "x"}]})
+    _make_native_server()._validate_final_response(200, body)
+    with pytest.raises(RuntimeError, match="reached a model worker"):
+        _make_http_server()._validate_final_response(200, body)
+    with pytest.raises(RuntimeError, match="status=503"):
+        _make_native_server()._validate_final_response(503, "")
+
+
+def test_native_thunderagent_frontend_options_are_accepted_by_dynamo_parser(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("VERL_DYNAMO_LOG_DIR", str(tmp_path))
+    server = _make_native_server()
+    _check_installed_dynamo_parser("dynamo.frontend.main", ["--router-mode", "kv", *server._frontend_router_args()])

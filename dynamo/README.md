@@ -171,6 +171,16 @@ for native verl vLLM. V1 supports ThunderAgent in `colocate_async` and
 `separate_async`. ThunderAgent GPU validation covers vLLM; SGLang routing
 validation is still pending.
 
+`thunderagent.enabled=true` launches Dynamo's Python ThunderAgent prototype as a
+separate router process behind a round-robin frontend. With a Dynamo that ships
+the builtin plugin (main since 2026-09-23), set `thunderagent.native=true` as
+well: the recipe keeps `router_mode=kv`, writes the plugin's policy file and
+passes it to the frontend as `--router-policy-config`, so programs are
+scheduled inside the KV router with no extra process. Plugin admission
+parameters (`pause_threshold`, `scheduler_interval_seconds`, ...) go under
+`thunderagent.native_parameters`; the same `X-Dynamo-Session-ID` /
+`X-Dynamo-Parent-Session-ID` / `X-Dynamo-Session-Final` headers drive both.
+
 For current multi-turn Uni-Agent, use the
 [dedicated launcher](run_uniagent_thunderagent_vllm024.sh). Its recipe Gateway
 adapter releases ThunderAgent programs on session completion or abort, with

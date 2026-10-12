@@ -27,6 +27,7 @@ from typing import Any, Optional
 from uuid import uuid4
 
 import ray
+import yaml
 
 from .dynamo_async_server import DynamoHttpServer, DynamoReplica
 
@@ -52,8 +53,9 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         super().__init__(*args, **kwargs)
         self._thunderagent_process: Optional[subprocess.Popen] = None
         self._thunderagent_log_fp = None
-        if self._thunderagent_enabled():
+        if self._thunderagent_enabled() and not self._thunderagent_native():
             self._router_mode = "round-robin"
+        self._validate_thunderagent_router_mode()
 
     def _thunderagent_config(self) -> dict[str, Any]:
         config = self._dynamo_cfg().get("thunderagent", {}) or {}
@@ -66,6 +68,63 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if not isinstance(value, bool):
             raise TypeError("rollout.engine_kwargs.dynamo.thunderagent.enabled must be a boolean")
         return value
+
+    def _thunderagent_native(self) -> bool:
+        """Schedule programs with Dynamo's builtin ThunderAgent plugin instead of the Python prototype.
+
+        The plugin runs inside the frontend's KV router (``--router-policy-config``), so
+        there is no router process to launch, workers keep the public model name and the
+        session-final request is an ordinary one-token completion.
+        """
+        if not self._thunderagent_enabled():
+            return False
+        value = self._thunderagent_config().get("native", False)
+        if not isinstance(value, bool):
+            raise TypeError("rollout.engine_kwargs.dynamo.thunderagent.native must be a boolean")
+        return value
+
+    def _thunderagent_native_parameters(self) -> dict[str, Any]:
+        value = self._thunderagent_config().get("native_parameters", {}) or {}
+        if not isinstance(value, dict):
+            raise TypeError("rollout.engine_kwargs.dynamo.thunderagent.native_parameters must be a mapping")
+        return dict(value)
+
+    def _validate_thunderagent_router_mode(self) -> None:
+        if self._thunderagent_native() and self._router_mode != "kv":
+            raise ValueError(
+                "thunderagent.native=true runs inside the KV router; set rollout.engine_kwargs.dynamo.router_mode=kv "
+                f"(got {self._router_mode!r})"
+            )
+
+    def _thunderagent_policy(self) -> dict[str, Any]:
+        """The frontend policy file selecting the plugin's classifier and worker selector."""
+        classifier: dict[str, Any] = {"type": "thunderagent"}
+        parameters = self._thunderagent_native_parameters()
+        if parameters:
+            classifier["parameters"] = parameters
+        return {
+            "request_classifier": classifier,
+            "worker_selection": {
+                "aggregated": "thunderagent",
+                "instances": [{"name": "thunderagent", "type": "thunderagent"}],
+            },
+        }
+
+    def _thunderagent_policy_path(self) -> str:
+        log_root = os.environ.get("VERL_DYNAMO_LOG_DIR", "/tmp")
+        os.makedirs(log_root, exist_ok=True)
+        path = os.path.join(log_root, f"verl_dynamo_replica{self.replica_rank}_thunderagent_policy.yaml")
+        with open(path, "w") as fp:
+            yaml.safe_dump(self._thunderagent_policy(), fp, sort_keys=False)
+        return path
+
+    def _frontend_router_args(self) -> list[str]:
+        args = super()._frontend_router_args()
+        if not self._thunderagent_native():
+            return args
+        # Soft affinity lets the plugin repack a session between turns; hard affinity
+        # would pin the request to a worker before the plugin's selector runs.
+        return [*args, "--router-policy-config", self._thunderagent_policy_path(), "--router-session-affinity-mode", "soft"]
 
     def _thunderagent_router_block_size(self) -> int:
         value = int(self._thunderagent_config().get("router_block_size", 16))
@@ -104,7 +163,9 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
     ) -> list[str]:
         thunderagent_enabled = self._thunderagent_enabled()
         worker_model_name = (
-            f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}" if thunderagent_enabled else served_model_name
+            f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}"
+            if thunderagent_enabled and not self._thunderagent_native()
+            else served_model_name
         )
         command = super()._build_vllm_cmd(worker_model_name, tp, kv_events_config_json=kv_events_config_json)
         if not thunderagent_enabled:
@@ -140,7 +201,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         contradicts the router block size fails fast here, same as the vLLM
         --block-size check.
         """
-        if not self._thunderagent_enabled():
+        if not self._thunderagent_enabled() or self._thunderagent_native():
             return super()._build_sglang_cmd(served_model_name, tp, nccl_port=nccl_port, **kwargs)
         explicit_page_size = self._sglang_cfg().get("page_size")
         router_block_size = self._thunderagent_router_block_size()
@@ -153,7 +214,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         return super()._build_sglang_cmd(worker_model_name, tp, nccl_port=nccl_port, **kwargs)
 
     def _start_thunderagent(self) -> None:
-        if not self._thunderagent_enabled() or self._thunderagent_process is not None:
+        if not self._thunderagent_enabled() or self._thunderagent_native() or self._thunderagent_process is not None:
             return
         env = os.environ.copy()
         env.update(self._dynamo_env_vars())
@@ -235,11 +296,12 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             raise ValueError("thunderagent.finalize_retry_delay_s must be non-negative")
         return delay
 
-    @staticmethod
-    def _validate_final_response(status: int, body: str) -> None:
+    def _validate_final_response(self, status: int, body: str) -> None:
         if not 200 <= status < 300:
             raise RuntimeError(f"ThunderAgent final request failed status={status} body={body[:2000]!r}")
-        if not body.strip():
+        if not body.strip() or self._thunderagent_native():
+            # The native plugin releases the program from inside the router and lets the
+            # one-token request complete on a worker; only the prototype answers it itself.
             return
         data = json.loads(body)
         if data.get("choices"):
@@ -279,7 +341,9 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             _REQUEST_PROGRAM.reset(token)
 
     async def _healthcheck_frontend(self, expected_workers: int) -> None:
-        await super()._healthcheck_frontend(expected_workers + int(self._thunderagent_enabled()))
+        await super()._healthcheck_frontend(
+            expected_workers + int(self._thunderagent_enabled() and not self._thunderagent_native())
+        )
         if self._thunderagent_enabled():
             await self.finalize_program(f"thunderagent-health-{time.time_ns()}")
 
