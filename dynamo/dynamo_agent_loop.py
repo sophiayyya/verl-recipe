@@ -42,6 +42,42 @@ from .thunderagent import program_scope as bind_program
 logger = logging.getLogger(__name__)
 
 
+async def _await_or_cancel(ref):
+    """Await an actor task; a cancelled awaiter cancels the task on the actor too."""
+    try:
+        return await ref
+    except asyncio.CancelledError:
+        ray.cancel(ref)
+        raise
+
+
+class _CancellingHandle:
+    """Actor handle whose ``generate`` is cancelled on the actor when its awaiter is.
+
+    A caller that gives up a turn (a gateway session closing mid-request) must take
+    the frontend request down with it; parked, the request would keep its program
+    charged against the router for the rest of the run.
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+    @property
+    def generate(self):
+        return _CancellingMethod(self._handle.generate)
+
+
+class _CancellingMethod:
+    def __init__(self, method):
+        self._method = method
+
+    def remote(self, *args, **kwargs):
+        return _await_or_cancel(self._method.remote(*args, **kwargs))
+
+
 class DynamoServerManager:
     """Direct manager for the shared Dynamo frontend actor.
 
@@ -97,16 +133,15 @@ class DynamoServerManager:
             **kwargs,
         )
         if not self.thunderagent_enabled:
-            output = await self.server.generate.remote(**generate_kwargs)
+            output = await _await_or_cancel(self.server.generate.remote(**generate_kwargs))
             return self._tag_weight_versions(output)
 
         scope = current_program()
         if scope is None:
             raise RuntimeError("Dynamo generation requires an active ThunderAgent program")
         async with scope.request():
-            output = await self.server.generate.remote(
-                **generate_kwargs,
-                thunderagent_session_id=scope.session_id,
+            output = await _await_or_cancel(
+                self.server.generate.remote(**generate_kwargs, thunderagent_session_id=scope.session_id)
             )
             return self._tag_weight_versions(output)
 
@@ -231,7 +266,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         server_id, handle = await super()._acquire_server(request_id, **extra)
         for session_id in self._inflight_routing_sessions.get(str(request_id), ()):
             self._record_served_server(session_id, server_id, handle)
-        return server_id, handle
+        return server_id, _CancellingHandle(handle)
 
     async def generate(self, request_id, *, program_id=None, parent_program_id=None, **kwargs):
         session_id = str(kwargs.setdefault("thunderagent_session_id", program_id or str(request_id)))

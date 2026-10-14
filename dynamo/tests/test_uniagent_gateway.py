@@ -223,29 +223,62 @@ async def test_close_drains_or_cancels_the_complete_request(make_actor, abort):
 
 
 @pytest.mark.asyncio
-async def test_drain_timeout_keeps_live_program_and_reports_failure(make_actor):
+async def test_finalize_cancels_a_parked_turn_and_releases_the_program(make_actor):
+    """A session whose agent exited mid-turn (timeout) must not leave its program behind."""
+    actor, backend = make_actor()
+    actor._drain_timeout = 0.01
+    await create(actor)
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def parked(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    backend.generate = parked
+    request = asyncio.create_task(generate(actor))
+    await started.wait()
+    await actor.finalize_session("session")
+    assert cancelled.is_set()
+    backend.finalize_program.assert_awaited_once_with("session")
+    assert "session" not in actor._sessions
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+
+@pytest.mark.asyncio
+async def test_close_reports_failure_when_a_turn_survives_cancellation(make_actor):
     actor, backend = make_actor()
     actor._drain_timeout = 0.01
     await create(actor)
     started, release = asyncio.Event(), asyncio.Event()
-    original = backend.generate
 
-    async def pending(*args, **kwargs):
+    async def unstoppable(*args, **kwargs):
         started.set()
-        await release.wait()
-        return await original(*args, **kwargs)
+        while True:
+            try:
+                await release.wait()
+                break
+            except asyncio.CancelledError:
+                pass
+        return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason="completed")
 
-    backend.generate = pending
+    backend.generate = unstoppable
     request = asyncio.create_task(generate(actor))
     await started.wait()
     with pytest.raises(TimeoutError, match="still has an active generation"):
         await actor.abort_session("session")
     backend.finalize_program.assert_not_awaited()
-    assert not request.done()
     assert "session" in actor._sessions
+    # Once the turn does finish, closing again releases the program.
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
+    await request
+    await actor.abort_session("session")
+    backend.finalize_program.assert_awaited_once_with("session")
+    assert "session" not in actor._sessions
 
 
 @pytest.mark.asyncio
@@ -482,38 +515,68 @@ async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     client = object.__new__(DynamoFullyAsyncLLMServerClient)
     client._session_servers = OrderedDict()
     client._inflight_routing_sessions = {"request": ["session"]}
-    assert await client._acquire_server("request", prompt_ids=[1, 2]) == ("worker", handle)
+    server_id, acquired = await client._acquire_server("request", prompt_ids=[1, 2])
+    assert server_id == "worker" and acquired._handle is handle
     acquire.assert_awaited_once_with("request", prompt_ids=[1, 2])
     assert client._session_servers["session"]["worker"] is handle
 
 
-def test_gateway_actor_class_follows_thunderagent_setting() -> None:
-    assert _gateway_actor_class(True) is DynamoGatewayActor
-    assert _gateway_actor_class(False) is GatewayActor
+@pytest.mark.asyncio
+async def test_cancelling_a_generate_awaiter_cancels_the_actor_task(monkeypatch):
+    from recipe.dynamo.dynamo_agent_loop import _CancellingHandle
+
+    ref = asyncio.get_running_loop().create_future()
+    cancelled = []
+    monkeypatch.setattr("recipe.dynamo.dynamo_agent_loop.ray.cancel", cancelled.append)
+
+    class Method:
+        def remote(self, **kwargs):
+            return ref
+
+    class Handle:
+        generate = Method()
+        finalize_program = "forwarded"
+
+    handle = _CancellingHandle(Handle())
+    assert handle.finalize_program == "forwarded"
+    waiter = asyncio.create_task(handle.generate.remote(prompt_ids=[1]))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    assert cancelled == [ref]
 
 
-def _adapter_config(enabled: bool, auto_finalize: bool):
+def _adapter_config(enabled: bool, auto_finalize: bool, engine: str = "vllm"):
     from omegaconf import OmegaConf
 
-    return OmegaConf.create(
-        {"actor_rollout_ref": {"rollout": {"engine_kwargs": {"dynamo": {"engine": "vllm", "thunderagent": {"enabled": enabled, "auto_finalize": auto_finalize}}}}}}
-    )
+    thunderagent = {"enabled": enabled, "auto_finalize": auto_finalize}
+    dynamo = {"engine": engine, "thunderagent": thunderagent}
+    return OmegaConf.create({"actor_rollout_ref": {"rollout": {"engine_kwargs": {"dynamo": dynamo}}}})
 
 
-def test_adapter_builds_plain_gateways_without_thunderagent(monkeypatch) -> None:
+@pytest.mark.parametrize("engine", ["vllm", "sglang"])
+def test_adapter_builds_plain_gateways_for_each_engine_without_thunderagent(monkeypatch, engine) -> None:
     built = {}
 
-    def build(config, llm_client, *, thunderagent):
-        built["thunderagent"] = thunderagent
+    def build(config, llm_client, *, thunderagent, engine):
+        built.update(thunderagent=thunderagent, engine=engine)
         return "manager"
 
+    worker = type("W", (), {"remote": staticmethod(lambda **_: "worker")})
     monkeypatch.setattr("recipe.dynamo.uniagent_gateway._build_gateway_manager", build)
-    monkeypatch.setattr("recipe.dynamo.uniagent_gateway.AgentFrameworkWorker", type("W", (), {"remote": staticmethod(lambda **_: "worker")}))
+    monkeypatch.setattr("recipe.dynamo.uniagent_gateway.AgentFrameworkWorker", worker)
 
-    adapter = DynamoAgentFrameworkRolloutAdapter.create(config=_adapter_config(False, True), llm_client=object())
+    config = _adapter_config(False, True, engine)
+    adapter = DynamoAgentFrameworkRolloutAdapter.create(config=config, llm_client=object())
 
-    assert built == {"thunderagent": False}
+    assert built == {"thunderagent": False, "engine": engine}
     assert adapter.gateway_manager == "manager" and adapter.framework_worker == "worker"
+
+
+def test_adapter_rejects_an_unknown_engine() -> None:
+    with pytest.raises(ValueError, match="vllm and sglang"):
+        DynamoAgentFrameworkRolloutAdapter.create(config=_adapter_config(False, True, "trtllm"), llm_client=object())
 
 
 def test_adapter_requires_manual_finalize_with_thunderagent() -> None:

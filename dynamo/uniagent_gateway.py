@@ -180,10 +180,10 @@ class _DynamoGatewayActor(_GatewayActor):
         try:
             self._programs.setdefault(session_id, {}).setdefault(program_id, parent_program_id)
             await self._release_returned_children(session_id, program_id)
-            # Cancelling an HTTP waiter does not necessarily cancel its Ray
-            # backend RPC. Keep the complete handler alive until that RPC and
-            # token collection finish, so cleanup cannot release a live program.
+            # The backend call runs in its own task: a cancelled HTTP waiter must
+            # not abandon it half-way, and closing the session cancels it directly.
             request = asyncio.create_task(handler(session_id=session_id, payload=payload))
+            inflight[program_id] = request
             response = await _wait_for_cleanup(request)
             if parent_program_id is not None:
                 _observe_body(response, lambda body: self._release_if_returned(session_id, program_id, body))
@@ -263,13 +263,20 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _close_session(self, session_id, abort):
         requests = list(self._requests.get(session_id, {}).values())
         if requests:
-            if abort:
-                for request in requests:
-                    request.cancel()
-            # Await the complete HTTP handlers, including token collection.
-            # On timeout retain the closing state and surface failure.
-            _, pending = await asyncio.wait(requests, timeout=self._drain_timeout)
+            pending = set(requests)
+            if not abort:
+                # The agent has exited; a turn that is still finishing is drained briefly.
+                _, pending = await asyncio.wait(requests, timeout=self._drain_timeout)
             if pending:
+                # Nobody is left to consume these turns. Cancelling the backend call
+                # reaches the frontend, which rolls the request back; parked, it
+                # would keep its program charged against the router for the whole run.
+                for request in pending:
+                    request.cancel()
+                logger.warning("Session %s closed with %d turn(s) in flight; cancelled", session_id, len(pending))
+                _, pending = await asyncio.wait(pending, timeout=self._drain_timeout)
+            if pending:
+                self._closing.pop(session_id, None)  # a later close retries once the turn has ended
                 raise TimeoutError(f"Session {session_id} still has an active generation; program was not released")
         if pending := self._releases.pop(session_id, None):
             await asyncio.gather(*pending, return_exceptions=True)

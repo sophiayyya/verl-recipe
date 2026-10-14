@@ -206,33 +206,33 @@ adapter ([uniagent_gateway.py](uniagent_gateway.py)) applies the same rules
 - releases a subagent the moment its final answer is produced (a turn that
   ends without a tool call is the Agent tool returning), releases a
   dispatcher's remaining idle subagents when the dispatcher takes its next
-  turn, and the rest of the tree, children first, when the session closes.
-  Finished subagents would otherwise hold admission and resident KV while
-  their siblings finish, and a tree moves at the pace of its slowest admitted
-  member. Check with the router's `programs_created_total -
-  programs_ended_total`.
+  turn, and the rest of the tree, children first, when the session closes. A
+  session that closes with a turn still in flight (the agent timed out) has
+  that turn cancelled through to the frontend before its programs are
+  released, so nothing stays charged against the router.
 
 Subagents are off by default in the Uni-Agent Claude Code recipe; enable them
 in the Task Config with `agent.enable_subagents: true`.
 
-### Scoring a subagent run
+### Scoring a subagent run (prototype router)
 
-`benchmarks/thunderagent_subagent_bench.py` reduces captures of the router's
-`metrics` endpoint to the numbers subagents actually move: leaked programs,
-unpinned-turn rate (turns that reached a replica without a pin, each one a
-re-prefill), pause/forced-resume counts, and vLLM's prefix-cache hit rate as an
-independent cross-check.
+`benchmarks/thunderagent_subagent_bench.py` reduces captures of the Python
+prototype router's `/metrics` endpoint (`programs_created_total`,
+`programs_ended_total`, pause and forced-resume counters, unpinned turns) to
+leaked programs, unpinned-turn rate and pause counts, with vLLM's prefix-cache
+hit rate as an independent cross-check. The native plugin exports none of these
+counters; for `thunderagent.native=true` read the frontend log
+(`thunderagent=debug`) and the engines' prefix-cache statistics instead.
 
 ```bash
-# capture the router metrics endpoint before and after a rollout, then:
+# capture the prototype router's /metrics before and after a rollout, then:
 python -m recipe.dynamo.benchmarks.thunderagent_subagent_bench \
     --before before.json --after after.json --label ta
 ```
 
-Run the same capture for `VARIANT=dynamo` and `VARIANT=global` to get a matched
-comparison. A correct subagent run reports `leaked_programs = 0`; a non-zero
-value means subagent programs outlived their trajectory and inflated the working
-set that pause/resume decisions are computed from.
+A correct subagent run reports `leaked_programs = 0`; a non-zero value means
+subagent programs outlived their trajectory and inflated the working set that
+pause/resume decisions are computed from.
 
 ## Results
 
