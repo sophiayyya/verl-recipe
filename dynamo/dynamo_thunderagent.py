@@ -316,11 +316,20 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if data.get("choices"):
             raise RuntimeError("ThunderAgent final request was bypassed and reached a model worker")
 
-    async def finalize_program(self, session_id: str) -> None:
+    async def finalize_program(self, session_id: str) -> bool:
+        """Release a ThunderAgent program with the session-final request.
+
+        Returns False, without posting, while abort_all_requests has the engines paused
+        in native mode: the plugin releases the program inside the router, but the
+        one-token request still completes on a worker and would park until
+        resume_generation. The Python prototype answers the request itself.
+        """
         if not self._thunderagent_enabled():
-            return
+            return True
         if not session_id:
             raise ValueError("session_id must be non-empty")
+        if self._thunderagent_native() and not self._generation_resumed.is_set():
+            return False
 
         request_id = f"thunderagent-final-{uuid4().hex}"
         payload = {
@@ -341,7 +350,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
                 else:
                     if status not in {408, 429} and status < 500:
                         self._validate_final_response(status, body)
-                        return
+                        return True
                     last_error = FinalRequestError(status, body)
                 if attempt < attempts:
                     await asyncio.sleep(self._finalize_retry_delay())

@@ -30,6 +30,7 @@ from recipe.dynamo.dynamo_agent_loop import (
     DynamoFullyAsyncLLMServerClient,
     DynamoLLMServerManager,
     DynamoServerManager,
+    GenerationPaused,
 )
 from recipe.dynamo.dynamo_async_server import DynamoHttpServer
 from recipe.dynamo.dynamo_thunderagent import (
@@ -56,6 +57,8 @@ def _make_http_server(thunderagent: dict | None = None) -> DynamoThunderAgentHtt
     server._frontend_process = None
     server._thunderagent_process = None
     server._thunderagent_log_fp = None
+    server._generation_resumed = asyncio.Event()
+    server._generation_resumed.set()
     return server
 
 
@@ -493,6 +496,25 @@ async def test_finalize_retries_and_accepts_empty_choices(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_finalize_does_not_post_while_generation_is_paused(monkeypatch) -> None:
+    server = _make_http_server({"enabled": True, "native": True, "finalize_max_attempts": 1})
+    calls = []
+
+    async def frontend_post(_payload, request_id):
+        calls.append(request_id)
+        return 200, ""
+
+    monkeypatch.setattr(server, "_frontend_post", frontend_post)
+
+    server._generation_resumed.clear()
+    assert await server.finalize_program("program-a") is False
+    assert calls == []  # a one-token final would park on the paused workers
+    server._generation_resumed.set()
+    assert await server.finalize_program("program-a") is True
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_finalize_rejects_nonempty_choices_as_router_bypass(monkeypatch) -> None:
     server = _make_http_server({"enabled": True, "finalize_max_attempts": 1})
 
@@ -830,6 +852,38 @@ async def test_finalize_routes_by_request_id_not_session_id() -> None:
 
     assert lb.acquire_keys == ["request-B"]  # sticky lookup uses the routing key
     assert server.finalize_calls == ["session-A"]  # program key stays the session
+
+
+class _PausedServer(_FakeServer):
+    paused = True
+
+    def _finalize_program(self, session_id: str):
+        if self.paused:
+            return False
+        self.finalize_calls.append(session_id)
+        return True
+
+
+@pytest.mark.asyncio
+async def test_finalize_reports_a_pause_and_recovery_waits_it_out() -> None:
+    server = _PausedServer()
+    lb = _FakeLoadBalancer(server)
+    client = _make_fully_async_client(lb, [server])
+    client._pause_poll_s = 0.01
+
+    # The gateway is told at once so it can hand the trajectories back and release later.
+    with pytest.raises(GenerationPaused):
+        await client.finalize_program("session-A", routing_key="request-A")
+    assert server.finalize_calls == []
+
+    async def resume():
+        await asyncio.sleep(0.03)
+        server.paused = False
+
+    # auto_finalize polls through the pause instead of counting it as a leak.
+    await asyncio.gather(resume(), client._finalize_with_recovery("session-A", routing_key="session-A"))
+    assert server.finalize_calls == ["session-A"]
+    assert client._unresolved_finalize_leaks == 0
 
 
 @pytest.mark.asyncio

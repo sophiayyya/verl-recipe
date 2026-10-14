@@ -33,6 +33,7 @@ from uni_agent.gateway.manager import GatewayManager
 from verl.utils.config import omega_conf_to_dataclass
 
 from .agent_identity import AgentIdentity, agent_identity_from_headers
+from .dynamo_agent_loop import GenerationPaused
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ class _DynamoGatewayActor(_GatewayActor):
     _finalize_timeout = 60.0
     _retry_delay = 0.2
     _drain_timeout = 60.0
+    _deferred_poll = 1.0
 
     def __init__(self, config, backend):
         if not callable(getattr(backend, "finalize_program", None)):
@@ -158,6 +160,9 @@ class _DynamoGatewayActor(_GatewayActor):
         self._programs = {}
         # session -> releases of returned subagents still in flight.
         self._releases = {}
+        # programs whose release found the engines paused; released once generation resumes.
+        self._deferred = set()
+        self._deferred_flush = None
         self._closing = {}
         self._closed = OrderedDict()
 
@@ -201,12 +206,36 @@ class _DynamoGatewayActor(_GatewayActor):
             try:
                 await asyncio.wait_for(self._backend.finalize_program(program_id), self._finalize_timeout)
                 logger.info("ThunderAgent program finalized: program=%s", program_id)
-                return
+                return True
+            except GenerationPaused:
+                # abort_all_requests paused the engines; the final request would park until
+                # resume_generation. The trajectories are complete, so hand them back now
+                # and release the program once generation resumes.
+                self._defer_release(program_id)
+                return False
             except Exception:
                 if attempt + 1 == self._finalize_attempts:
                     logger.exception("ThunderAgent program cleanup failed: program=%s", program_id)
                     raise
                 await asyncio.sleep(self._retry_delay * 2**attempt)
+
+    def _defer_release(self, program_id):
+        if program_id not in self._deferred:
+            logger.info("ThunderAgent program release deferred until generation resumes: program=%s", program_id)
+            self._deferred.add(program_id)
+        if self._deferred_flush is None or self._deferred_flush.done():
+            self._deferred_flush = asyncio.create_task(self._flush_deferred())
+
+    async def _flush_deferred(self):
+        while self._deferred:
+            await asyncio.sleep(self._deferred_poll)
+            for program_id in list(self._deferred):
+                try:
+                    if not await self._release_program(program_id):
+                        break  # still paused
+                except Exception:
+                    pass  # logged by _release_program; the program leaks
+                self._deferred.discard(program_id)
 
     async def _release_returned_children(self, session_id, program_id):
         """Release the idle subagents of a program taking a new turn: its dispatcher
@@ -319,6 +348,10 @@ class _DynamoGatewayActor(_GatewayActor):
                 if isinstance(result, BaseException):
                     raise result
         finally:
+            if self._deferred_flush is not None:
+                self._deferred_flush.cancel()
+            if self._deferred:
+                logger.warning("%d ThunderAgent program release(s) still deferred at shutdown", len(self._deferred))
             await super().shutdown()
 
 

@@ -162,6 +162,10 @@ class DynamoServerManager:
         return output
 
 
+class GenerationPaused(RuntimeError):
+    """The engines are paused (abort_all_requests); the program is released after resume_generation."""
+
+
 class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
     """FullyAsyncLLMServerClient with ThunderAgent program affinity.
 
@@ -194,6 +198,8 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
     client therefore records every server acquired for a session and
     finalizes each of them; cleanup counts as confirmed only when all ack.
     """
+
+    _pause_poll_s = 1.0
 
     def __init__(
         self,
@@ -289,14 +295,26 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                 await self._finalize_with_recovery(session_id, routing_key=str(request_id))
 
     async def _finalize_on_handle(self, handle: Any, session_id: str) -> None:
-        # Bound each finalize RPC: the target frontend may be a hybrid server
-        # currently paused for the trainer phase — the router answers final
-        # requests without the engine, but a hung frontend must not park the
-        # trajectory for the full request_timeout_s (see the 8.4 probe fix).
-        await asyncio.wait_for(
+        # Bound each finalize RPC: a hung frontend must not park the trajectory for
+        # the full request_timeout_s (see the 8.4 probe fix). A paused frontend
+        # answers at once with False instead of parking the final request.
+        released = await asyncio.wait_for(
             handle.finalize_program.remote(session_id=session_id),
             timeout=self._finalize_timeout_s,
         )
+        if released is False:
+            raise GenerationPaused(session_id)
+
+    async def _through_pause(self, finalize):
+        """Run one finalize, polling through a generation pause for up to finalize_timeout_s."""
+        deadline = asyncio.get_running_loop().time() + self._finalize_timeout_s
+        while True:
+            try:
+                return await finalize()
+            except GenerationPaused:
+                if asyncio.get_running_loop().time() + self._pause_poll_s >= deadline:
+                    raise
+                await asyncio.sleep(self._pause_poll_s)
 
     async def finalize_program(self, session_id: str, routing_key: str = None) -> None:
         """Release the ThunderAgent program for one trajectory.
@@ -355,7 +373,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
             delay = 0.2
             for attempt in range(3):
                 try:
-                    await self._finalize_on_handle(handle, session_id)
+                    await self._through_pause(lambda: self._finalize_on_handle(handle, session_id))
                     return True
                 except Exception:
                     logger.warning(
@@ -406,7 +424,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         delay = 0.2
         for attempt in range(3):
             try:
-                await self.finalize_program(session_id, routing_key=routing_key)
+                await self._through_pause(lambda: self.finalize_program(session_id, routing_key=routing_key))
                 return  # confirmed: routed via the sticky entry the requests used
             except Exception:
                 logger.warning(

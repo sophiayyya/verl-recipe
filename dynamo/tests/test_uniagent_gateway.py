@@ -13,6 +13,7 @@ import pytest
 pytest.importorskip("uni_agent.gateway.gateway")
 
 from fastapi import HTTPException
+from recipe.dynamo.dynamo_agent_loop import GenerationPaused
 from recipe.dynamo.uniagent_gateway import DynamoAgentFrameworkRolloutAdapter, _DynamoGatewayActor, _turn_returned
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import _GatewayActor
@@ -137,6 +138,23 @@ async def test_exhausted_cleanup_is_visible_and_does_not_restart_retry_budget(ma
     with pytest.raises(HTTPException) as error:
         await generate(actor)
     assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_release_is_deferred_while_generation_is_paused(make_actor):
+    actor, backend = make_actor()
+    actor._deferred_poll = 0
+    await create(actor)
+    await generate(actor)
+    backend.finalize_program.side_effect = [GenerationPaused("session"), GenerationPaused("session"), None]
+    trajectories = await actor.finalize_session("session")
+    # The trajectories come back at once; the program waits for resume_generation.
+    assert len(trajectories) == 1
+    assert "session" not in actor._sessions
+    assert actor._deferred == {"session"}
+    await actor._deferred_flush
+    assert not actor._deferred
+    assert backend.finalize_program.await_count == 3
 
 
 @pytest.mark.asyncio
