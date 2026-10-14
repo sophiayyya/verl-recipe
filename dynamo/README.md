@@ -181,6 +181,9 @@ scheduled inside the KV router with no extra process. Plugin admission
 parameters (`pause_threshold`, `scheduler_interval_seconds`, ...) go under
 `thunderagent.native_parameters`; the same `X-Dynamo-Session-ID` /
 `X-Dynamo-Parent-Session-ID` / `X-Dynamo-Session-Final` headers drive both.
+At startup the server proves the session-final path with a throwaway program;
+the frontend may answer 404 for a moment after `/health` passes, which is
+retried for `thunderagent.health_probe_timeout_s` (default 60).
 
 For current multi-turn Uni-Agent, use the
 [dedicated launcher](run_uniagent_thunderagent_vllm024.sh). Its recipe Gateway

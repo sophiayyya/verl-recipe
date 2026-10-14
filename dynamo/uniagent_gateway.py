@@ -1,6 +1,5 @@
 """ThunderAgent program lifecycle for the unmodified Uni-Agent Gateway API.
 
-Integration baseline: Uni-Agent 0825e1ea and its verl submodule 3efe38c7.
 Select DynamoAgentFrameworkRolloutAdapter through agent_loop_manager_class.
 
 A gateway session is one trajectory, but not necessarily one program: a Claude
@@ -210,31 +209,17 @@ class _DynamoGatewayActor(_GatewayActor):
                 await asyncio.sleep(self._retry_delay * 2**attempt)
 
     async def _release_returned_children(self, session_id, program_id):
-        """Release the idle subagents of a program that is taking a new turn.
-
-        Nothing marks a subagent final, and the agent that dispatched it blocks
-        until it returns, so the dispatcher's next turn is the signal that its
-        idle children are done. Left resident until the session closes they keep
-        charging the router's capacity, and under pressure can pin the whole
-        tree: the root is paused for lack of room that only its own release
-        could make. A child still mid-request (a background subagent) is kept.
-        """
+        """Release the idle subagents of a program taking a new turn: its dispatcher
+        blocked until they returned, so that turn means they are done. A child still
+        mid-request (a background subagent) is kept."""
         tree = self._programs.get(session_id, {})
         inflight = self._requests.get(session_id, {})
         for child in [child for child, parent in tree.items() if parent == program_id and child not in inflight]:
-            await self._release_returned_children(session_id, child)
-            await self._release_program(child)
-            tree.pop(child, None)
+            await self._release_tree_member(session_id, child)
 
     def _release_if_returned(self, session_id, program_id, body):
-        """Release a subagent the moment its final answer has been produced.
-
-        A subagent that stops calling tools has returned to its dispatcher, yet
-        the dispatcher takes its next turn only once every sibling has returned.
-        Under pressure the finished siblings would otherwise hold admission and
-        resident KV while they wait, and a tree moves at the pace of its slowest
-        admitted member. Releasing on return hands that room to the siblings.
-        """
+        """Release a subagent as soon as its final answer is produced, so the room it
+        held goes to the siblings its dispatcher is still waiting for."""
         if not _turn_returned(body):
             return
         task = asyncio.create_task(self._release_subagent(session_id, program_id))
@@ -243,15 +228,25 @@ class _DynamoGatewayActor(_GatewayActor):
         task.add_done_callback(pending.discard)
 
     async def _release_subagent(self, session_id, program_id):
-        tree = self._programs.get(session_id, {})
-        if program_id not in tree or program_id in self._requests.get(session_id, {}):
+        if program_id not in self._programs.get(session_id, {}) or program_id in self._requests.get(session_id, {}):
             return
+        try:
+            await self._release_tree_member(session_id, program_id)
+        except Exception:
+            return  # logged by _release_program; the close path retries it
+
+    async def _release_tree_member(self, session_id, program_id):
+        """Release a program and its idle children. The program leaves the tree before
+        the release is awaited, so a concurrent release path cannot finalize it twice;
+        a failed release puts it back for the close path to retry."""
+        tree = self._programs.get(session_id, {})
+        parent = tree.pop(program_id)
         try:
             await self._release_returned_children(session_id, program_id)
             await self._release_program(program_id)
         except Exception:
-            return  # logged by _release_program; the close path retries it
-        tree.pop(program_id, None)
+            tree[program_id] = parent
+            raise
 
     def _session_programs(self, session_id):
         """Every program the session created, children before the root that dispatched them."""
@@ -330,16 +325,10 @@ class _DynamoGatewayActor(_GatewayActor):
 DynamoGatewayActor = ray.remote(_DynamoGatewayActor)
 
 
-def _gateway_actor_class(thunderagent: bool):
-    """The recipe actor owns ThunderAgent programs; without ThunderAgent the upstream actor suffices."""
-    return DynamoGatewayActor if thunderagent else GatewayActor
-
-
 class DynamoGatewayManager(GatewayManager):
     """Use the recipe actor while retaining upstream session routing methods."""
 
-    def __init__(self, llm_client, *, gateway_count, gateway_actor_config, actor_cls=None):
-        actor_cls = actor_cls or DynamoGatewayActor
+    def __init__(self, llm_client, *, gateway_count, gateway_actor_config, actor_cls=DynamoGatewayActor):
         if gateway_count <= 0:
             raise ValueError("gateway_count must be positive")
         nodes = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
@@ -393,7 +382,7 @@ def _build_gateway_manager(config, llm_client, *, thunderagent, engine):
         llm_client,
         gateway_count=int(af["gateway_count"]),
         gateway_actor_config=actor_config,
-        actor_cls=_gateway_actor_class(thunderagent),
+        actor_cls=DynamoGatewayActor if thunderagent else GatewayActor,
     )
 
 

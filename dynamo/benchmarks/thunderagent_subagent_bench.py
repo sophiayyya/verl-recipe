@@ -11,33 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Score a ThunderAgent rollout on the metrics that subagents actually move.
+"""Score a subagent rollout from the prototype ThunderAgent router's ``/metrics``.
 
-An agent that dispatches subagents turns one trajectory into a *tree* of
-programs. Three things go wrong when the scheduler cannot see that tree, and all
-three are visible in the router's own metrics:
-
-``leaked_programs``
-    The router drops a program only when a request marks it final. Nothing
-    marked a subagent final before this recipe released them, so every subagent
-    left a resident ``Program`` for the life of the run, inflating the working
-    set that pause/resume decisions are computed from. Should be 0.
-``unpinned_turn_rate``
-    Fraction of program turns that reached a replica without a pin — each one
-    re-prefills a context the scheduler meant to keep resident. This is the
-    metric ThunderAgent exists to lower.
-``prefix_hit_rate``
-    vLLM's own view of the same thing, as a cross-check that does not depend on
-    the router's bookkeeping being right.
-
-Usage::
+Reduces a before/after pair of metrics captures (plus an optional ``vllm`` block
+of Prometheus counters) to leaked programs, unpinned-turn rate, pause counts and
+prefix-cache hit rate::
 
     python -m recipe.dynamo.benchmarks.thunderagent_subagent_bench \\
         --before before.json --after after.json --label ta
-
-where the JSON files are captures of the router's ``metrics`` endpoint plus an
-optional ``vllm`` block of Prometheus counters. ``--before`` may be omitted when
-the router started with the run.
 """
 
 from __future__ import annotations
@@ -51,23 +32,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class BenchResult:
-    """One variant's score on a subagent rollout.
-
-    Attributes:
-        label: Variant name, e.g. ``ta`` or ``dynamo``.
-        programs_created: Programs the router admitted over the window.
-        programs_ended: Programs released over the window.
-        leaked_programs: Admitted minus released. Non-zero means subagent
-            programs stayed resident after their trajectory finished.
-        program_requests: Turns that carried a program id.
-        unpinned_turns: Program turns that reached a replica without a pin.
-        unpinned_turn_rate: ``unpinned_turns / program_requests``.
-        pauses: Tool-boundary pauses the scheduler performed.
-        forced_resumes: Resumes that fired on the starvation timer rather than
-            on headroom — a high count means the pause threshold is too tight.
-        prefix_hit_rate: vLLM prefix-cache hits over queries, when supplied.
-        wall_clock_s: Rollout wall-clock, when supplied.
-    """
+    """One variant's score: ``leaked_programs`` is admitted minus released programs,
+    ``unpinned_turn_rate`` the share of program turns that reached a replica without
+    a pin, ``forced_resumes`` the resumes fired by the starvation timer."""
 
     label: str
     programs_created: int
@@ -99,24 +66,10 @@ def summarize(
     label: str = "ta",
     wall_clock_s: float | None = None,
 ) -> BenchResult:
-    """Reduce a pair of router metric snapshots to one comparable row.
+    """Difference the ``before`` and ``after`` metrics captures into one row.
 
-    Counters are differenced so a router shared across variants still yields
-    per-run numbers.
-
-    :param after: Router ``metrics`` payload captured after the rollout.
-    :type after: dict[str, Any]
-    :param before: The same payload captured before it; omit if the router
-        started with the run.
-    :type before: dict[str, Any] | None
-    :param label: Variant name carried into the result.
-    :type label: str
-    :param wall_clock_s: Measured rollout duration, when available.
-    :type wall_clock_s: float | None
-    :return: The scored row.
-    :rtype: BenchResult
-    :raises ValueError: If a counter went backwards, which means the two
-        snapshots came from different router processes.
+    Raises ValueError when a counter went backwards, i.e. the two captures come
+    from different router processes.
     """
     before = before or {}
 

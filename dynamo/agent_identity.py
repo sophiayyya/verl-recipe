@@ -27,7 +27,6 @@ class _HeaderMapping:
 
 _DYNAMO_SESSION = "x-dynamo-session-id"
 _DYNAMO_PARENT = "x-dynamo-parent-session-id"
-_DYNAMO_FINAL = "x-dynamo-session-final"
 
 _AGENT_HEADERS = (
     _HeaderMapping("x-claude-code-session-id", "x-claude-code-agent-id", "x-claude-code-parent-agent-id", True),
@@ -47,7 +46,6 @@ class AgentIdentity:
 
     session_id: str
     parent_session_id: str | None = None
-    session_final: bool | None = None
 
 
 def _value(headers: Mapping[str, str], name: str) -> str | None:
@@ -66,13 +64,10 @@ def agent_identity_from_headers(headers: Mapping[str, str]) -> AgentIdentity | N
     dropped. Lookups use lower-case names, so ``headers`` must be
     case-insensitive, as Starlette's ``Headers`` is.
     """
-    final = _value(headers, _DYNAMO_FINAL)
-    session_final = None if final is None else final.lower() == "true"
-
     session_id = _value(headers, _DYNAMO_SESSION)
     if session_id is not None:
         parent = _value(headers, _DYNAMO_PARENT)
-        return AgentIdentity(session_id, parent if parent != session_id else None, session_final)
+        return AgentIdentity(session_id, parent if parent != session_id else None)
 
     for mapping in _AGENT_HEADERS:
         root = _value(headers, mapping.root_session)
@@ -88,7 +83,7 @@ def agent_identity_from_headers(headers: Mapping[str, str]) -> AgentIdentity | N
             parent = None  # a root turn has no parent; a stale header must not invent one
         if parent is None and mapping.infer_parent_for_child and is_child:
             parent = root
-        return AgentIdentity(session_id, parent, session_final)
+        return AgentIdentity(session_id, parent)
     return None
 
 

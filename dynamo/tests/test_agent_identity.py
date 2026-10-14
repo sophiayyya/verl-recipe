@@ -10,7 +10,7 @@ def test_no_recognized_headers_yields_none():
 
 def test_claude_code_root_turn_has_no_parent():
     identity = agent_identity_from_headers(Headers({"x-claude-code-session-id": "root-1"}))
-    assert identity == AgentIdentity("root-1", None, None)
+    assert identity == AgentIdentity("root-1", None)
 
 
 def test_claude_code_subagent_turn_infers_parent_from_session():
@@ -68,12 +68,6 @@ def test_canonical_dynamo_headers_take_precedence():
     assert (identity.session_id, identity.parent_session_id) == ("canonical", "canonical-parent")
 
 
-def test_session_final_header_is_parsed_as_bool():
-    final = agent_identity_from_headers(Headers({"x-dynamo-session-id": "s", "x-dynamo-session-final": "true"}))
-    assert final.session_final is True
-    assert agent_identity_from_headers(Headers({"x-dynamo-session-id": "s"})).session_final is None
-
-
 def test_header_lookup_is_case_insensitive_and_trims():
     assert agent_identity_from_headers(Headers({"X-Claude-Code-Session-Id": "  root-1  "})).session_id == "root-1"
 
@@ -93,15 +87,10 @@ def test_codex_and_opencode_mappings():
     assert (opencode.session_id, opencode.parent_session_id) == ("s1", "s0")
 
 
-def test_headers_captured_from_a_real_claude_code_subagent_run():
-    """Pins the shapes a live ``claude -p`` run sends (CLI 2.1.270).
-
-    Two facts the program tree depends on, neither guessable from code: a
-    subagent repeats its agent id on every turn, and a top-level subagent sends
-    no parent header at all, so the dispatcher is inferred from the session id.
-    """
+def test_claude_code_headers_as_sent_by_the_cli():
+    # A subagent repeats its agent id on every turn and sends no parent header.
     root = Headers({"x-claude-code-session-id": "c6602f61"})
     subagent = Headers({"x-claude-code-session-id": "c6602f61", "x-claude-code-agent-id": "a5a8b926f8"})
-    assert agent_identity_from_headers(root) == AgentIdentity("c6602f61", None, None)
+    assert agent_identity_from_headers(root) == AgentIdentity("c6602f61", None)
     for _turn in range(2):
-        assert agent_identity_from_headers(subagent) == AgentIdentity("a5a8b926f8", "c6602f61", None)
+        assert agent_identity_from_headers(subagent) == AgentIdentity("a5a8b926f8", "c6602f61")

@@ -41,6 +41,14 @@ _REQUEST_PROGRAM: ContextVar[tuple[str, Optional[str], bool] | None] = ContextVa
 _THUNDERAGENT_BACKEND_MODEL_SUFFIX = "--verl-thunderagent-backend"
 
 
+class FinalRequestError(RuntimeError):
+    """The frontend answered a ThunderAgent session-final request with a non-2xx status."""
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"ThunderAgent final request failed status={status} body={body[:2000]!r}")
+        self.status = status
+
+
 class DynamoThunderAgentHttpServer(DynamoHttpServer):
     """Add program-aware routing while preserving PR #110's server stack.
 
@@ -110,7 +118,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             },
         }
 
-    def _thunderagent_policy_path(self) -> str:
+    def _write_thunderagent_policy(self) -> str:
         log_root = os.environ.get("VERL_DYNAMO_LOG_DIR", "/tmp")
         os.makedirs(log_root, exist_ok=True)
         path = os.path.join(log_root, f"verl_dynamo_replica{self.replica_rank}_thunderagent_policy.yaml")
@@ -124,7 +132,8 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             return args
         # Soft affinity lets the plugin repack a session between turns; hard affinity
         # would pin the request to a worker before the plugin's selector runs.
-        return [*args, "--router-policy-config", self._thunderagent_policy_path(), "--router-session-affinity-mode", "soft"]
+        policy = self._write_thunderagent_policy()
+        return [*args, "--router-policy-config", policy, "--router-session-affinity-mode", "soft"]
 
     def _thunderagent_router_block_size(self) -> int:
         value = int(self._thunderagent_config().get("router_block_size", 16))
@@ -298,7 +307,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
 
     def _validate_final_response(self, status: int, body: str) -> None:
         if not 200 <= status < 300:
-            raise RuntimeError(f"ThunderAgent final request failed status={status} body={body[:2000]!r}")
+            raise FinalRequestError(status, body)
         if not body.strip() or self._thunderagent_native():
             # The native plugin releases the program from inside the router and lets the
             # one-token request complete on a worker; only the prototype answers it itself.
@@ -333,7 +342,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
                     if status not in {408, 429} and status < 500:
                         self._validate_final_response(status, body)
                         return
-                    last_error = RuntimeError(f"ThunderAgent final request failed status={status} body={body[:2000]!r}")
+                    last_error = FinalRequestError(status, body)
                 if attempt < attempts:
                     await asyncio.sleep(self._finalize_retry_delay())
             raise RuntimeError(f"ThunderAgent final request failed after {attempts} attempts") from last_error
@@ -358,8 +367,8 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             try:
                 await self.finalize_program(f"thunderagent-health-{time.time_ns()}")
                 return
-            except RuntimeError as error:
-                if "status=404" not in str(error) or time.monotonic() >= deadline:
+            except FinalRequestError as error:
+                if error.status != 404 or time.monotonic() >= deadline:
                     raise
             await asyncio.sleep(1.0)
 

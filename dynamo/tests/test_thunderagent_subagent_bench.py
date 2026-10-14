@@ -14,11 +14,7 @@
 """Scoring rules for the subagent ThunderAgent benchmark."""
 
 import pytest
-from recipe.dynamo.benchmarks.thunderagent_subagent_bench import (
-    BenchResult,
-    render_table,
-    summarize,
-)
+from recipe.dynamo.benchmarks.thunderagent_subagent_bench import render_table, summarize
 
 
 def _metrics(**counters):
@@ -83,7 +79,6 @@ def test_table_renders_one_row_per_variant_with_aligned_columns():
     lines = table.splitlines()
     assert lines[0].split()[0] == "label"
     assert len(lines) == 4  # header, rule, two rows
-    assert all(isinstance(row, BenchResult) for row in rows)
 
 
 def test_empty_result_set_renders_a_placeholder():

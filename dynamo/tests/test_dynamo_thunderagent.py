@@ -1381,8 +1381,14 @@ def test_native_thunderagent_configures_the_frontend_plugin_instead_of_a_router_
     assert args[args.index("--router-session-affinity-mode") + 1] == "soft"
     policy = yaml.safe_load(Path(args[args.index("--router-policy-config") + 1]).read_text())
     assert policy == {
-        "request_classifier": {"type": "thunderagent", "parameters": {"pause_threshold": 0.9, "scheduler_interval_seconds": 1}},
-        "worker_selection": {"aggregated": "thunderagent", "instances": [{"name": "thunderagent", "type": "thunderagent"}]},
+        "request_classifier": {
+            "type": "thunderagent",
+            "parameters": {"pause_threshold": 0.9, "scheduler_interval_seconds": 1},
+        },
+        "worker_selection": {
+            "aggregated": "thunderagent",
+            "instances": [{"name": "thunderagent", "type": "thunderagent"}],
+        },
     }
     assert server._thunderagent_process is None
 
@@ -1431,7 +1437,7 @@ async def test_health_probe_waits_for_the_completions_route(monkeypatch) -> None
     async def finalize(session_id):
         attempts.append(session_id)
         if len(attempts) < 3:
-            raise RuntimeError("ThunderAgent final request failed status=404 body=''")
+            raise dynamo_thunderagent.FinalRequestError(404, "")
 
     async def no_sleep(_seconds):
         pass
@@ -1449,9 +1455,9 @@ async def test_health_probe_raises_other_errors_at_once(monkeypatch) -> None:
     server = _make_native_server()
 
     async def finalize(_session_id):
-        raise RuntimeError("ThunderAgent final request failed status=503 body=''")
+        raise dynamo_thunderagent.FinalRequestError(503, "")
 
     monkeypatch.setattr(server, "finalize_program", finalize)
 
-    with pytest.raises(RuntimeError, match="status=503"):
+    with pytest.raises(dynamo_thunderagent.FinalRequestError, match="status=503"):
         await server._probe_final_request()

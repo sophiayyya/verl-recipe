@@ -1723,11 +1723,8 @@ class DynamoHttpServer:
 
         try:
             request_id = request_id or f"dynamo-{time.time_ns()}"
-            # verl reuses one request_id for every turn of a trajectory; it is the
-            # session-affinity key (_frontend_headers), not a per-request id. A
-            # trajectory running Claude Code subagents has several turns in flight
-            # at once, so the id the frontend tracks per request must be unique.
-            # The caller's id stays as a readable prefix.
+            # request_id is the trajectory's affinity key, reused by every turn; the
+            # frontend needs a unique id per request (subagent turns run concurrently).
             http_request_id = f"{request_id}-{uuid.uuid4().hex}"
             payload = self._build_frontend_completion_payload(prompt_ids, sampling_params, http_request_id)
             status, body_text = await self._frontend_post(payload, request_id, http_request_id)

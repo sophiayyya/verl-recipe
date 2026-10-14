@@ -1,6 +1,6 @@
 """Exercise the unmodified Uni-Agent Gateway with the recipe lifecycle adapter.
 
-Requires the optional Uni-Agent 0825e1ea checkout and its verl submodule.
+Requires a Uni-Agent checkout and its verl submodule.
 """
 
 import asyncio
@@ -13,14 +13,7 @@ import pytest
 pytest.importorskip("uni_agent.gateway.gateway")
 
 from fastapi import HTTPException
-from recipe.dynamo.uniagent_gateway import (
-    DynamoAgentFrameworkRolloutAdapter,
-    DynamoGatewayActor,
-    _DynamoGatewayActor,
-    _gateway_actor_class,
-    _turn_returned,
-)
-from uni_agent.gateway.gateway import GatewayActor
+from recipe.dynamo.uniagent_gateway import DynamoAgentFrameworkRolloutAdapter, _DynamoGatewayActor, _turn_returned
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import _GatewayActor
 
