@@ -20,7 +20,6 @@ import logging
 import re
 from collections import OrderedDict
 from contextvars import ContextVar
-from dataclasses import replace
 
 import ray
 from fastapi import HTTPException
@@ -153,8 +152,7 @@ class _DynamoGatewayActor(_GatewayActor):
             raise ValueError("Dynamo Gateway requires a client with finalize_program")
         if getattr(backend, "_auto_finalize", True):
             raise ValueError("Dynamo Gateway requires thunderagent.auto_finalize=false")
-        # Dynamo uses vLLM tool parsers behind its own rollout registry name.
-        super().__init__(replace(config, rollout_backend="vllm"), _ProgramClient(backend))
+        super().__init__(config, _ProgramClient(backend))
         self._app.add_middleware(_AgentIdentityMiddleware)
         self._requests = {}
         # session -> {program: parent}, in creation order; a child is created after its parent.
@@ -361,11 +359,11 @@ class DynamoGatewayManager(GatewayManager):
         self._session_to_gateway_index = {}
 
 
-def _build_gateway_manager(config, llm_client, *, thunderagent=True):
+def _build_gateway_manager(config, llm_client, *, thunderagent, engine):
     """Mirror Uni-Agent's GatewayActorConfig wiring without replacing globals.
 
-    Dynamo serves vLLM engines behind its own rollout registry name, so the tool parser
-    backend is pinned to ``vllm`` whether or not ThunderAgent is on.
+    Dynamo serves its engines behind its own rollout registry name, so the tool
+    parser backend is the engine behind the frontend, not ``rollout.name``.
     """
     af = config.actor_rollout_ref.rollout.custom.agent_framework
     model = omega_conf_to_dataclass(config.actor_rollout_ref.model)
@@ -380,7 +378,7 @@ def _build_gateway_manager(config, llm_client, *, thunderagent=True):
         tokenizer=model.tokenizer,
         processor=model.processor,
         tool_parser_name=rollout.multi_turn.format,
-        rollout_backend="vllm",
+        rollout_backend=engine,
         enable_tool_parser_cache=af.get("enable_tool_parser_cache", True),
         hf_model_type=getattr(model.hf_config, "model_type", None),
         apply_chat_template_kwargs=dict(config.data.get("apply_chat_template_kwargs", {})),
@@ -407,12 +405,13 @@ class DynamoAgentFrameworkRolloutAdapter(AgentFrameworkRolloutAdapter):
         if teacher_client is not None:
             raise ValueError("Dynamo Uni-Agent Gateway does not support teacher_client")
         dynamo = config.actor_rollout_ref.rollout.engine_kwargs.dynamo
-        if dynamo.get("engine", "vllm") != "vllm":
-            raise ValueError("Dynamo Uni-Agent Gateway currently supports only vLLM")
+        engine = dynamo.get("engine", "vllm")
+        if engine not in ("vllm", "sglang"):
+            raise ValueError(f"Dynamo Uni-Agent Gateway supports the vllm and sglang engines, got {engine!r}")
         thunderagent = bool(dynamo.thunderagent.enabled)
         if thunderagent and dynamo.thunderagent.get("auto_finalize", True):
             raise ValueError("ThunderAgent with the Uni-Agent Gateway requires thunderagent.auto_finalize=false")
-        gateway_manager = _build_gateway_manager(config, llm_client, thunderagent=thunderagent)
+        gateway_manager = _build_gateway_manager(config, llm_client, thunderagent=thunderagent, engine=engine)
         instance = cls()
         instance.gateway_manager = gateway_manager
         instance.framework_worker = AgentFrameworkWorker.remote(

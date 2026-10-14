@@ -168,8 +168,9 @@ VARIANT=ta RAY_DATA_HOME=/path/to/verl-data bash recipe/dynamo/run_uniagent_vari
 
 Use `VARIANT=dynamo` for the built-in KV-router baseline or `VARIANT=global`
 for native verl vLLM. V1 supports ThunderAgent in `colocate_async` and
-`separate_async`. ThunderAgent GPU validation covers vLLM; SGLang routing
-validation is still pending.
+`separate_async`. ThunderAgent GPU validation covers vLLM; the Uni-Agent Gateway
+adapter accepts `engine: sglang` (tool parsing follows the engine), but its
+SGLang GPU validation is still pending.
 
 `thunderagent.enabled=true` launches Dynamo's Python ThunderAgent prototype as a
 separate router process behind a round-robin frontend. With a Dynamo that ships
