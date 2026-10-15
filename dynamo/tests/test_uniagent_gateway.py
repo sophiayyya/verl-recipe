@@ -479,6 +479,123 @@ async def test_a_subagent_is_released_the_moment_its_final_answer_is_produced(ma
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
 
 
+async def session_with_two_subagents(actor, backend):
+    """A root turn and two subagent turns, all mid-chain (their last turn called a tool)."""
+    backend.stop_reason = "tool_calls"
+    await create(actor)
+    await post(actor, "session", ROOT)
+    await post(actor, "session", subagent("sub-a"), "task a")
+    await post(actor, "session", subagent("sub-b"), "task b")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_release_at_close_still_releases_the_rest_of_the_tree(make_actor):
+    # An agent that exits mid-chain leaves the whole tree to the close path; one
+    # program the router cannot release must not strand its siblings and the root.
+    actor, backend = make_actor()
+    await session_with_two_subagents(actor, backend)
+
+    async def finalize(program):
+        if program == "sub-b":
+            raise RuntimeError("unreachable")
+
+    backend.finalize_program.side_effect = finalize
+    for method in [actor.finalize_session, actor.abort_session]:
+        with pytest.raises(RuntimeError, match="unreachable"):
+            await method("session")
+    # Children before the root, every program attempted, the retry budget not restarted.
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-b"] * 3 + ["sub-a", "run-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_subagent_release_does_not_fail_the_dispatchers_turn(make_actor):
+    # The dispatcher's next turn releases its idle subagents first; one the router
+    # rejects stays in the tree for the close path instead of failing the turn.
+    actor, backend = make_actor()
+    await session_with_two_subagents(actor, backend)
+    unreachable = {"sub-a"}
+
+    async def finalize(program):
+        if program in unreachable:
+            raise RuntimeError("unreachable")
+
+    backend.finalize_program.side_effect = finalize
+    assert (await post(actor, "session", ROOT)).status_code == 200
+    assert backend.ids == ["session"] * 4
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"] * 3 + ["sub-b"]
+
+    unreachable.clear()
+    await actor.finalize_session("session")
+    assert [call.args[0] for call in backend.finalize_program.await_args_list][4:] == ["sub-a", "run-1"]
+
+
+@pytest.mark.asyncio
+async def test_a_subagent_release_cancelled_by_abort_is_retried_at_close(make_actor):
+    # Aborting the session cancels the dispatcher's turn while it is still releasing
+    # a subagent; that subagent must go back to the tree, or nothing releases it.
+    actor, backend = make_actor()
+    await session_with_two_subagents(actor, backend)
+    stalled = asyncio.Event()
+
+    async def finalize(program):
+        if program == "sub-a" and not stalled.is_set():
+            stalled.set()
+            await asyncio.Event().wait()  # the frontend has not answered yet
+
+    backend.finalize_program.side_effect = finalize
+    turn = asyncio.create_task(post(actor, "session", ROOT))
+    await stalled.wait()
+    await actor.abort_session("session")
+    await asyncio.gather(turn, return_exceptions=True)
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-a", "sub-b", "run-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sibling", ["resumed", "returned"])
+async def test_a_sibling_that_moves_on_during_a_release_is_left_to_its_own_path(make_actor, sibling):
+    # Idle subagents are released one at a time. While sub-a's release is pending,
+    # sub-b starts another turn (a background subagent) or returns and is released
+    # by its own path; the dispatcher must neither release a program mid-request
+    # nor fail on one that is already gone.
+    actor, backend = make_actor()
+    await session_with_two_subagents(actor, backend)
+    stalled, answer = asyncio.Event(), asyncio.Event()
+
+    async def finalize(program):
+        if program == "sub-a":
+            stalled.set()
+            await answer.wait()
+
+    backend.finalize_program.side_effect = finalize
+    turn = asyncio.create_task(post(actor, "session", ROOT))
+    await stalled.wait()
+    if sibling == "resumed":
+        started, release = asyncio.Event(), asyncio.Event()
+        original = backend.generate
+
+        async def pending(*args, **kwargs):
+            if kwargs.get("program_id") == "sub-b":
+                started.set()
+                await release.wait()
+            return await original(*args, **kwargs)
+
+        backend.generate = pending
+        background = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b, more"))
+        await started.wait()
+    else:
+        backend.stop_reason = "completed"
+        await post(actor, "session", subagent("sub-b"), "task b, done")
+        await settled(actor)
+    answer.set()
+    assert (await turn).status_code == 200
+    if sibling == "resumed":
+        assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
+        release.set()
+        assert (await background).status_code == 200
+    await actor.finalize_session("session")
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+
+
 @pytest.mark.asyncio
 async def test_shutdown_attempts_all_sessions_even_if_one_cleanup_fails(make_actor):
     actor, backend = make_actor()

@@ -181,7 +181,10 @@ class _DynamoGatewayActor(_GatewayActor):
         inflight[program_id] = asyncio.current_task()
         try:
             self._programs.setdefault(session_id, {}).setdefault(program_id, parent_program_id)
-            await self._release_returned_children(session_id, program_id)
+            try:
+                await self._release_returned_children(session_id, program_id)
+            except Exception:
+                pass  # logged by _release_program; the child stays in the tree for the close path
             # The backend call runs in its own task: a cancelled HTTP waiter must
             # not abandon it half-way, and closing the session cancels it directly.
             request = asyncio.create_task(handler(session_id=session_id, payload=payload))
@@ -240,11 +243,21 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _release_returned_children(self, session_id, program_id):
         """Release the idle subagents of a program taking a new turn: its dispatcher
         blocked until they returned, so that turn means they are done. A child still
-        mid-request (a background subagent) is kept."""
+        mid-request (a background subagent) is kept. Every child is attempted; the
+        first failure is raised after the rest."""
         tree = self._programs.get(session_id, {})
-        inflight = self._requests.get(session_id, {})
-        for child in [child for child, parent in tree.items() if parent == program_id and child not in inflight]:
-            await self._release_tree_member(session_id, child)
+        failures = []
+        for child in [child for child, parent in tree.items() if parent == program_id]:
+            # Checked per child: each release yields, and meanwhile a child may have
+            # started a turn or been released by another path.
+            if child not in tree or child in self._requests.get(session_id, {}):
+                continue
+            try:
+                await self._release_tree_member(session_id, child)
+            except Exception as error:
+                failures.append(error)
+        if failures:
+            raise failures[0]
 
     def _release_if_returned(self, session_id, program_id, body):
         """Release a subagent as soon as its final answer is produced, so the room it
@@ -267,13 +280,17 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _release_tree_member(self, session_id, program_id):
         """Release a program and its idle children. The program leaves the tree before
         the release is awaited, so a concurrent release path cannot finalize it twice;
-        a failed release puts it back for the close path to retry."""
+        a failed or cancelled release puts it back for the close path to retry (the
+        router accepts a session-final request for a program it no longer holds, as
+        the startup probe relies on)."""
         tree = self._programs.get(session_id, {})
+        if program_id not in tree:
+            return  # another release path took it out first and owns it
         parent = tree.pop(program_id)
         try:
             await self._release_returned_children(session_id, program_id)
             await self._release_program(program_id)
-        except Exception:
+        except BaseException:
             tree[program_id] = parent
             raise
 
@@ -304,8 +321,16 @@ class _DynamoGatewayActor(_GatewayActor):
             await asyncio.gather(*pending, return_exceptions=True)
         # The same actor owns the client's served-frontend records. A driver
         # copy of the client would not know every frontend visited on retries.
+        # One failed release must not strand the rest of the tree: attempt every
+        # program, then surface the first failure.
+        failures = []
         for program_id in self._session_programs(session_id):
-            await self._release_program(program_id)
+            try:
+                await self._release_program(program_id)
+            except Exception as error:
+                failures.append(error)  # logged by _release_program
+        if failures:
+            raise failures[0]
         self._programs.pop(session_id, None)
         if abort:
             await super().abort_session(session_id)
