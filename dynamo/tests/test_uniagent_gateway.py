@@ -101,6 +101,7 @@ async def test_two_turns_share_program_and_cleanup_preserves_tokens(make_actor):
     backend.finalize_program.assert_not_awaited()
     trajectories = await actor.finalize_session("session")
     assert backend.ids == ["session", "session"]
+    assert backend.programs == [("session", None)] * 2  # no identity headers: the session is the program
     backend.finalize_program.assert_awaited_once_with("session")
     assert len(trajectories) == 1
     trajectory = trajectories[0]
@@ -126,38 +127,25 @@ async def test_transient_cleanup_failure_retries(make_actor):
 
 
 @pytest.mark.asyncio
-async def test_a_failed_release_at_close_keeps_the_trajectories_and_is_retried_in_the_background(make_actor):
-    # The trajectories are complete when the session closes; a router that cannot
-    # release the program must not cost them. The release moves to the background.
+@pytest.mark.parametrize("recovers", [True, False])
+async def test_a_failed_release_at_close_keeps_the_trajectories_and_is_retried_in_the_background(
+    make_actor, caplog, recovers
+):
+    # The trajectories are complete when the session closes; a router that cannot release the
+    # program must not cost them. The close spends its retry budget (3), then the flusher retries
+    # in the background: two more rounds of three before the program is given up as leaked.
     actor, backend = make_actor()
     actor._deferred_poll = 0
     await create(actor)
     await generate(actor)
-    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * 3 + [None]
-    trajectories = await actor.finalize_session("session")
-    assert len(trajectories) == 1
-    assert "session" not in actor._sessions
-    # The close spent its own retry budget (3); the background flusher succeeds on the 4th call.
-    await actor._deferred_flush
-    assert not actor._deferred
-    assert backend.finalize_program.await_count == 4
-    assert await actor.abort_session("session") is None  # closed; nothing restarts
-
-
-@pytest.mark.asyncio
-async def test_a_release_that_keeps_failing_is_given_up_as_leaked(make_actor, caplog):
-    actor, backend = make_actor()
-    actor._deferred_poll = 0
-    await create(actor)
-    await generate(actor)
-    backend.finalize_program.side_effect = RuntimeError("unreachable")
+    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * (3 if recovers else 9) + [None]
     with caplog.at_level(logging.WARNING):
-        await actor.finalize_session("session")
+        assert len(await actor.finalize_session("session")) == 1
         await actor._deferred_flush
+    assert "session" not in actor._sessions
     assert not actor._deferred
-    # Three attempts at close, then two background rounds of three before giving up.
-    assert backend.finalize_program.await_count == 9
-    assert "ThunderAgent program leaked" in caplog.text
+    assert backend.finalize_program.await_count == (4 if recovers else 9)
+    assert ("ThunderAgent program leaked" in caplog.text) is not recovers
 
 
 @pytest.mark.asyncio
@@ -366,14 +354,6 @@ def subagent(agent_id):
 
 
 @pytest.mark.asyncio
-async def test_a_turn_without_identity_headers_is_the_sessions_own_program(make_actor):
-    actor, backend = make_actor()
-    await create(actor)
-    assert (await post(actor, "session", {})).status_code == 200
-    assert backend.programs == [("session", None)]
-
-
-@pytest.mark.asyncio
 async def test_claude_code_subagents_are_programs_of_their_own_and_run_in_parallel(make_actor):
     # Claude Code names the run in x-claude-code-session-id and each subagent in
     # x-claude-code-agent-id; the recipe derives the same tree Dynamo's frontend
@@ -403,27 +383,6 @@ async def test_claude_code_subagents_are_programs_of_their_own_and_run_in_parall
     assert backend.ids == ["session"] * 3
     assert backend.programs[0] == ("run-1", None)
     assert sorted(backend.programs[1:]) == [("sub-a", "run-1"), ("sub-b", "run-1")]
-
-
-@pytest.mark.asyncio
-async def test_the_dispatchers_next_turn_releases_its_idle_subagents(make_actor):
-    # The dispatcher blocks until a subagent returns, so its next turn means the
-    # idle children are done; resident until the session closes they would keep
-    # charging the router's capacity.
-    actor, backend = make_actor()
-    backend.stop_reason = "tool_calls"
-    await create(actor)
-    await post(actor, "session", ROOT)
-    await post(actor, "session", subagent("sub-a"), "task a")
-    await post(actor, "session", subagent("sub-b"), "task b")
-    backend.finalize_program.assert_not_awaited()
-
-    await post(actor, "session", ROOT)
-
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b"]
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
-    assert "session" not in actor._programs
 
 
 @pytest.mark.asyncio

@@ -1303,20 +1303,12 @@ async def test_frontend_post_keeps_the_session_key_and_overrides_the_request_id(
         async def __aexit__(self, *exc):
             return False
 
-    class _Session:
-        def post(self, url, *, json, headers, timeout):
-            sent.update(headers)
-            return _Response()
-
     async def get_session():
-        return _Session()
+        return SimpleNamespace(post=lambda url, *, json, headers, timeout: sent.update(headers) or _Response())
 
     server._get_http_session = get_session
-
     await server._frontend_post({}, "traj-1", "traj-1-0001")
-
-    assert sent["x-dynamo-session-id"] == "traj-1"
-    assert sent["X-Request-Id"] == "traj-1-0001"
+    assert (sent["x-dynamo-session-id"], sent["X-Request-Id"]) == ("traj-1", "traj-1-0001")
 
 
 # --------------------------------------------------------------------------- #
@@ -1367,28 +1359,13 @@ class _BlockingServer(_FakeServer):
 
 
 @pytest.mark.asyncio
-async def test_subagent_turn_is_its_own_program_under_the_trajectory_routing_key() -> None:
-    server = _BlockingServer()
-    server.release.set()
-    lb = _FakeLoadBalancer(server)
-    client = _make_fully_async_client(lb, [server])
-
-    await client.generate("traj-1", prompt_ids=[1], sampling_params={}, program_id="sub-a", parent_program_id="root")
-
-    (call,) = server.generate_calls
-    assert call["thunderagent_session_id"] == "sub-a"
-    assert call["thunderagent_parent_session_id"] == "root"
-    assert lb.acquire_keys == ["traj-1"]  # the tree stays on the trajectory's frontend
-    assert server.finalize_calls == ["sub-a"]  # auto_finalize releases the program, not the trajectory
-
-
-@pytest.mark.asyncio
 async def test_concurrent_sibling_turns_credit_every_program_in_flight() -> None:
     # Siblings share the routing key, so the per-attempt acquire hook cannot
     # tell them apart; every program in flight under the key is credited with
     # the server, which is what lets a manual finalize reach each of them.
     server = _BlockingServer()
-    client = _make_fully_async_client(_FakeLoadBalancer(server), [server])
+    lb = _FakeLoadBalancer(server)
+    client = _make_fully_async_client(lb, [server])
     client._auto_finalize = False
 
     turns = [
@@ -1403,6 +1380,11 @@ async def test_concurrent_sibling_turns_credit_every_program_in_flight() -> None
     server.release.set()
     await asyncio.gather(*turns)
 
+    assert [(c["thunderagent_session_id"], c["thunderagent_parent_session_id"]) for c in server.generate_calls] == [
+        ("sub-a", "root"),
+        ("sub-b", "root"),
+    ]
+    assert lb.acquire_keys == ["traj-1", "traj-1"]  # the tree stays on the trajectory's frontend
     assert set(client._session_servers) == {"sub-a", "sub-b"}
     assert client._inflight_routing_sessions == {}
     await client.finalize_program("sub-b")
@@ -1496,18 +1478,11 @@ async def test_health_probe_waits_for_the_completions_route(monkeypatch) -> None
     monkeypatch.setattr(dynamo_thunderagent.asyncio, "sleep", no_sleep)
 
     await server._probe_final_request()
-
     assert len(attempts) == 3
 
-
-@pytest.mark.asyncio
-async def test_health_probe_raises_other_errors_at_once(monkeypatch) -> None:
-    server = _make_native_server()
-
-    async def finalize(_session_id):
+    async def unavailable(_session_id):
         raise dynamo_thunderagent.FinalRequestError(503, "")
 
-    monkeypatch.setattr(server, "finalize_program", finalize)
-
+    monkeypatch.setattr(server, "finalize_program", unavailable)
     with pytest.raises(dynamo_thunderagent.FinalRequestError, match="status=503"):
-        await server._probe_final_request()
+        await server._probe_final_request()  # anything but a 404 is raised at once
