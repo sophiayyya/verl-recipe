@@ -35,9 +35,6 @@ retries, timeouts and cancellation. Install the Uni-Agent/verl versions in the
 [test_agent_identity.py](test_agent_identity.py) checks the coding-agent header
 precedence that names subagent programs; it needs only Starlette.
 
-[test_thunderagent_subagent_bench.py](test_thunderagent_subagent_bench.py)
-checks the prototype router metrics scorer.
-
 [check_continuations.py](check_continuations.py) checks all recipe shell/Slurm
 scripts recursively by default; optional arguments select file/glob paths:
 
