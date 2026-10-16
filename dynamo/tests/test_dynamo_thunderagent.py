@@ -1334,14 +1334,10 @@ def _headers_for(program, parent, final) -> dict[str, str]:
         _REQUEST_PROGRAM.reset(token)
 
 
-def test_subagent_turn_carries_the_parent_session_header() -> None:
+def test_parent_session_header_is_sent_only_on_subagent_turns() -> None:
     headers = _headers_for("sub-a", "root", False)
-    assert headers["X-Dynamo-Session-ID"] == "sub-a"
-    assert headers["X-Dynamo-Parent-Session-ID"] == "root"
+    assert (headers["X-Dynamo-Session-ID"], headers["X-Dynamo-Parent-Session-ID"]) == ("sub-a", "root")
     assert "X-Dynamo-Session-Final" not in headers
-
-
-def test_root_turn_and_final_request_send_no_parent_header() -> None:
     assert "X-Dynamo-Parent-Session-ID" not in _headers_for("root", None, False)
     final = _headers_for("sub-a", None, True)
     assert final["X-Dynamo-Session-Final"] == "true"

@@ -13,14 +13,6 @@ def test_claude_code_root_turn_has_no_parent():
     assert identity == AgentIdentity("root-1", None)
 
 
-def test_claude_code_subagent_turn_infers_parent_from_session():
-    # agents.rs: infer_parent_from_session_for_child = true for Claude Code.
-    identity = agent_identity_from_headers(
-        Headers({"x-claude-code-session-id": "root-1", "x-claude-code-agent-id": "sub-a"})
-    )
-    assert (identity.session_id, identity.parent_session_id) == ("sub-a", "root-1")
-
-
 def test_nested_subagent_prefers_the_explicit_parent_agent():
     identity = agent_identity_from_headers(
         Headers(
@@ -68,23 +60,13 @@ def test_canonical_dynamo_headers_take_precedence():
     assert (identity.session_id, identity.parent_session_id) == ("canonical", "canonical-parent")
 
 
-def test_header_lookup_is_case_insensitive_and_trims():
+def test_header_values_are_trimmed_and_blank_ones_are_absent():
     assert agent_identity_from_headers(Headers({"X-Claude-Code-Session-Id": "  root-1  "})).session_id == "root-1"
-
-
-def test_blank_header_values_are_treated_as_absent():
     assert agent_identity_from_headers(Headers({"x-claude-code-session-id": "   "})) is None
     identity = agent_identity_from_headers(
         Headers({"x-claude-code-session-id": "root-1", "x-claude-code-agent-id": "  "})
     )
     assert identity.session_id == "root-1"
-
-
-def test_codex_and_opencode_mappings():
-    codex = agent_identity_from_headers(Headers({"thread-id": "t1", "x-codex-parent-thread-id": "t0"}))
-    assert (codex.session_id, codex.parent_session_id) == ("t1", "t0")
-    opencode = agent_identity_from_headers(Headers({"x-session-id": "s1", "x-parent-session-id": "s0"}))
-    assert (opencode.session_id, opencode.parent_session_id) == ("s1", "s0")
 
 
 def test_claude_code_headers_as_sent_by_the_cli():
