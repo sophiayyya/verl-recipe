@@ -1,15 +1,9 @@
 """ThunderAgent program lifecycle for the unmodified Uni-Agent Gateway API.
 
-Select DynamoAgentFrameworkRolloutAdapter through agent_loop_manager_class.
-
-A gateway session is one trajectory, but not necessarily one program: a Claude
-Code run that dispatches subagents is a tree of them. The agent announces that
-tree in its request headers, which the Gateway terminates, so this module reads
-them here (``agent_identity``), names every turn's program for the client, and
-releases the tree -- subagents first, then the root -- when the session closes.
-Model calls are serial within a program; programs run concurrently, whether they
-are the subagents of one session or separate sessions. Backend state stays in
-the gateway actor that owns the client.
+Select DynamoAgentFrameworkRolloutAdapter through agent_loop_manager_class. A session is one
+trajectory but may be a tree of programs (Claude Code subagents): the Gateway terminates the identity
+headers, so this module reads them, names each turn's program and releases the tree, subagents first,
+when the session closes. Model calls are serial within a program; programs run concurrently.
 """
 
 from __future__ import annotations
@@ -37,18 +31,12 @@ from .dynamo_agent_loop import GenerationPaused
 
 logger = logging.getLogger(__name__)
 
-# The identity the current HTTP request announced, bound for the request's task
-# and every task it spawns, down to the backend call.
+# The identity the current request announced, visible down to the backend call.
 _REQUEST_IDENTITY: ContextVar[AgentIdentity | None] = ContextVar("dynamo_gateway_agent_identity", default=None)
 
 
 class _AgentIdentityMiddleware:
-    """Bind each request's coding-agent identity headers to its task.
-
-    A pure ASGI middleware runs the route in the same task, so a ``ContextVar``
-    set here is visible to the handler, to the task it spawns, and to the client
-    call at the bottom.
-    """
+    """Bind each request's agent identity headers to its task (pure ASGI: same task as the route)."""
 
     def __init__(self, app):
         self._app = app
@@ -68,13 +56,8 @@ _FINISH_REASON = re.compile(r'"(?:finish_reason|stop_reason)":\s*"([a-z_]+)"')
 
 
 def _turn_returned(body: bytes) -> bool:
-    """True when the response ends the agent's chain: it stopped without calling a tool.
-
-    An agent keeps running while its turns end in tool calls (``tool_calls`` /
-    ``tool_use``); a turn that ends with ``stop`` / ``end_turn`` is its final
-    answer, and for a subagent that is the moment the Agent tool returns it to
-    its dispatcher. Truncation and unknown reasons are not treated as a return.
-    """
+    """True when the turn ended with ``stop`` / ``end_turn``: the agent's final answer, for a subagent the
+    moment the Agent tool returns it. Tool calls, truncation and unknown reasons are not a return."""
     reasons = _FINISH_REASON.findall(body.decode("utf-8", "replace"))
     return bool(reasons) and reasons[-1] in ("stop", "end_turn")
 
@@ -96,8 +79,7 @@ def _observe_body(response, on_complete):
         on_complete(response.body)
 
 
-# How Claude Code agent identities become ThunderAgent programs. ``tree`` is the
-# design; the other two exist to measure what each step of it buys on a benchmark.
+# How agent identities become programs; ``tree`` is the design, the other two are benchmark ablations.
 SUBAGENT_PROGRAMS = ("tree", "isolated", "off")
 
 
@@ -109,9 +91,8 @@ def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, s
 
 
 def _routed_program(session_id: str, identity: AgentIdentity | None, mode: str) -> tuple[str, str | None]:
-    """What the router is told: ``tree`` the program and its parent, ``isolated`` the
-    program alone (no sibling co-location), ``off`` the session (every agent's turns in
-    one program, as before the recipe knew about subagents)."""
+    """``tree``: the program and its parent; ``isolated``: the program alone; ``off``: the session
+    (every agent's turns in one program, as before the recipe knew about subagents)."""
     if mode == "off":
         return session_id, None
     program_id, parent_program_id = _program_of(session_id, identity)
@@ -119,13 +100,8 @@ def _routed_program(session_id: str, identity: AgentIdentity | None, mode: str) 
 
 
 class _ProgramClient:
-    """The session's view of the ThunderAgent client: a program per agent identity.
-
-    Uni-Agent's session calls ``generate`` with its session id as the request id
-    and knows nothing about programs. The request id stays the routing key, so a
-    whole tree reaches one frontend; the program named here is what the router
-    schedules and what the actor later releases.
-    """
+    """The session's view of the client: a program per agent identity, with the session id kept as
+    the routing key so a whole tree reaches one frontend."""
 
     def __init__(self, client, subagent_programs="tree"):
         self._client = client
@@ -182,9 +158,7 @@ class _DynamoGatewayActor(_GatewayActor):
         self._programs = {}
         # session -> releases of returned subagents still in flight.
         self._releases = {}
-        # program -> retries left: releases that found the engines paused (released once
-        # generation resumes) or failed (retried in the background instead of failing the
-        # session close that owned them).
+        # program -> retries left for releases deferred by a pause or a failure.
         self._deferred = {}
         self._deferred_flush = None
         self._closing = {}
@@ -198,8 +172,7 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _handle_request(self, handler, session_id, payload):
         if session_id in self._closing or session_id in self._closed:
             raise HTTPException(status_code=409, detail="Session is closing")
-        # With subagent programs off, the gateway sees one program per session too: no
-        # tree, no release on return; the session close releases it.
+        # off: one program per session, released at close
         identity = None if self._subagent_programs == "off" else _REQUEST_IDENTITY.get()
         program_id, parent_program_id = _program_of(session_id, identity)
         inflight = self._requests.setdefault(session_id, {})
@@ -212,8 +185,7 @@ class _DynamoGatewayActor(_GatewayActor):
                 await self._release_returned_children(session_id, program_id)
             except Exception:
                 pass  # logged by _release_program; the child stays in the tree for the close path
-            # The backend call runs in its own task: a cancelled HTTP waiter must
-            # not abandon it half-way, and closing the session cancels it directly.
+            # own task: a cancelled HTTP waiter must not abandon it; closing the session cancels it
             request = asyncio.create_task(handler(session_id=session_id, payload=payload))
             inflight[program_id] = request
             response = await _wait_for_cleanup(request)
@@ -238,9 +210,7 @@ class _DynamoGatewayActor(_GatewayActor):
                 logger.info("ThunderAgent program finalized: program=%s", program_id)
                 return True
             except GenerationPaused:
-                # abort_all_requests paused the engines; the final request would park until
-                # resume_generation. The trajectories are complete, so hand them back now
-                # and release the program once generation resumes.
+                # engines paused by abort_all_requests: hand the trajectories back, release after resume
                 self._defer_release(program_id)
                 return False
             except Exception:
@@ -278,15 +248,12 @@ class _DynamoGatewayActor(_GatewayActor):
                 self._deferred.pop(program_id, None)
 
     async def _release_returned_children(self, session_id, program_id):
-        """Release the idle subagents of a program taking a new turn: its dispatcher
-        blocked until they returned, so that turn means they are done. A child still
-        mid-request (a background subagent) is kept. Every child is attempted; the
-        first failure is raised after the rest."""
+        """Release the idle children of a program taking a new turn (it blocked until they returned).
+        A child still mid-request is kept. Every child is attempted; the first failure is raised last."""
         tree = self._programs.get(session_id, {})
         failures = []
         for child in [child for child, parent in tree.items() if parent == program_id]:
-            # Checked per child: each release yields, and meanwhile a child may have
-            # started a turn or been released by another path.
+            # re-checked per child: a release yields, and another path may have taken it
             if child not in tree or child in self._requests.get(session_id, {}):
                 continue
             try:
@@ -297,8 +264,7 @@ class _DynamoGatewayActor(_GatewayActor):
             raise failures[0]
 
     def _release_if_returned(self, session_id, program_id, body):
-        """Release a subagent as soon as its final answer is produced, so the room it
-        held goes to the siblings its dispatcher is still waiting for."""
+        """Release a subagent as soon as its final answer is produced."""
         if not _turn_returned(body):
             return
         task = asyncio.create_task(self._release_subagent(session_id, program_id))
@@ -315,11 +281,8 @@ class _DynamoGatewayActor(_GatewayActor):
             return  # logged by _release_program; the close path retries it
 
     async def _release_tree_member(self, session_id, program_id):
-        """Release a program and its idle children. The program leaves the tree before
-        the release is awaited, so a concurrent release path cannot finalize it twice;
-        a failed or cancelled release puts it back for the close path to retry (the
-        router accepts a session-final request for a program it no longer holds, as
-        the startup probe relies on)."""
+        """Release a program and its idle children. It leaves the tree before the await, so no other
+        path finalizes it twice; a failed or cancelled release puts it back for the close path."""
         tree = self._programs.get(session_id, {})
         if program_id not in tree:
             return  # another release path took it out first and owns it
@@ -344,9 +307,7 @@ class _DynamoGatewayActor(_GatewayActor):
                 # The agent has exited; a turn that is still finishing is drained briefly.
                 _, pending = await asyncio.wait(requests, timeout=self._drain_timeout)
             if pending:
-                # Nobody is left to consume these turns. Cancelling the backend call
-                # reaches the frontend, which rolls the request back; parked, it
-                # would keep its program charged against the router for the whole run.
+                # nobody will consume these turns; cancelling reaches the frontend, which rolls them back
                 for request in pending:
                     request.cancel()
                 logger.warning("Session %s closed with %d turn(s) in flight; cancelled", session_id, len(pending))
@@ -358,9 +319,8 @@ class _DynamoGatewayActor(_GatewayActor):
             await asyncio.gather(*pending, return_exceptions=True)
         # The same actor owns the client's served-frontend records. A driver
         # copy of the client would not know every frontend visited on retries.
-        # One failed release must not strand the rest of the tree, and must not fail
-        # the close: the trajectories are complete, and failing would drop them without
-        # releasing anything. The program is retried in the background instead.
+        # a failed release must not strand the rest of the tree or fail the close (the
+        # trajectories are complete); it is retried in the background
         for program_id in self._session_programs(session_id):
             try:
                 await self._release_program(program_id)

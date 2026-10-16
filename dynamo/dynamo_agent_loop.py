@@ -52,12 +52,8 @@ async def _await_or_cancel(ref):
 
 
 class _CancellingHandle:
-    """Actor handle whose ``generate`` is cancelled on the actor when its awaiter is.
-
-    A caller that gives up a turn (a gateway session closing mid-request) must take
-    the frontend request down with it; parked, the request would keep its program
-    charged against the router for the rest of the run.
-    """
+    """Actor handle whose ``generate`` is cancelled on the actor when its awaiter is, so a closing
+    session takes its frontend request down with it instead of leaving it parked."""
 
     def __init__(self, handle):
         self._handle = handle
@@ -176,11 +172,9 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
     caller-side changes: when the kwarg is absent we key the program by
     request_id.
 
-    A trajectory that dispatches subagents is a tree of programs: Claude Code
-    gives every subagent its own identity, which the gateway passes as
-    ``program_id`` with the dispatcher in ``parent_program_id``. The request_id
-    stays the routing key, so the whole tree reaches the one frontend whose
-    ThunderAgent can schedule it as a tree; sibling turns run concurrently.
+    A trajectory that dispatches subagents is a tree of programs: the gateway
+    passes each turn's ``program_id`` and ``parent_program_id``; the request_id
+    stays the routing key, so the whole tree reaches one frontend.
 
     Program lifecycle: the router's ProgramTable only frees an entry on an
     explicit session-final request — there is NO passive expiry, so an
@@ -234,10 +228,8 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend. ProgramTables are frontend-local; cleanup must reach each
         # server that ever admitted the session.
         self._session_servers: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # OUTER routing key -> sessions (programs) currently inside generate()
-        # under it, so the per-attempt _acquire_server hook can attribute each
-        # acquired server to its session. Concurrent subagent turns share one
-        # routing key, so every program in flight under it is credited.
+        # OUTER routing key -> programs in flight under it, so _acquire_server can
+        # credit each acquired server to every one of them (concurrent subagent turns).
         self._inflight_routing_sessions: dict[str, list[str]] = {}
 
     _SESSION_ROUTING_CACHE_MAX = 65536
@@ -295,9 +287,8 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                 await self._finalize_with_recovery(session_id, routing_key=str(request_id))
 
     async def _finalize_on_handle(self, handle: Any, session_id: str) -> None:
-        # Bound each finalize RPC: a hung frontend must not park the trajectory for
-        # the full request_timeout_s (see the 8.4 probe fix). A paused frontend
-        # answers at once with False instead of parking the final request.
+        # Bounded: a hung frontend must not park the trajectory for request_timeout_s.
+        # A paused frontend answers False at once instead of parking the final request.
         released = await asyncio.wait_for(
             handle.finalize_program.remote(session_id=session_id),
             timeout=self._finalize_timeout_s,

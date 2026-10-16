@@ -1797,11 +1797,7 @@ class DynamoHttpServer:
     async def _frontend_post(
         self, payload: dict[str, Any], request_id: str, http_request_id: Optional[str] = None
     ) -> tuple[int, str]:
-        """POST one completion to the frontend; return ``(status, body_text)``.
-
-        ``request_id`` keys the session headers; ``http_request_id``, when given,
-        is the unique id of this one request.
-        """
+        """POST one completion; return ``(status, body_text)``. ``http_request_id`` is this request's unique id."""
         import aiohttp
 
         headers = self._frontend_headers(request_id)

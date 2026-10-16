@@ -1,12 +1,7 @@
 """Coding-agent program identity derived from request headers.
 
-Dynamo's HTTP frontend normalizes coding-agent identity headers into
-``agent_context`` (``lib/llm/src/protocols/agents.rs``), and ThunderAgent keys
-its programs off that session id. On the training path Claude Code talks to the
-Uni-Agent Gateway instead, so the headers terminate there. This module applies
-the same precedence, so the program tree the recipe reports is the one Dynamo
-would have derived: a Claude Code subagent turn carries ``x-claude-code-agent-id``
-and becomes a program of its own, with the run's session as its parent.
+Dynamo's frontend normalizes these headers into ``agent_context`` (``lib/llm/src/protocols/agents.rs``);
+on the training path they terminate at the Uni-Agent Gateway, so the recipe applies the same precedence.
 """
 
 from __future__ import annotations
@@ -20,9 +15,7 @@ class _HeaderMapping:
     root_session: str
     child_session: str | None
     parent_session: str | None
-    # A child turn with no explicit parent inherits the root session as its
-    # parent; Claude Code's top-level subagents rely on this.
-    infer_parent_for_child: bool
+    infer_parent_for_child: bool  # a child turn with no explicit parent has the root session as its parent
 
 
 _DYNAMO_SESSION = "x-dynamo-session-id"
@@ -30,19 +23,12 @@ _DYNAMO_PARENT = "x-dynamo-parent-session-id"
 
 _AGENT_HEADERS = (
     _HeaderMapping("x-claude-code-session-id", "x-claude-code-agent-id", "x-claude-code-parent-agent-id", True),
-    _HeaderMapping("thread-id", None, "x-codex-parent-thread-id", False),
-    _HeaderMapping("x-session-id", None, "x-parent-session-id", False),
 )
 
 
 @dataclass(frozen=True)
 class AgentIdentity:
-    """One reasoning chain's identity as the agent reported it.
-
-    ``session_id`` is the chain's own id: for a Claude Code subagent turn the
-    agent id, not the run's session. ``parent_session_id`` names the chain that
-    dispatched it, when known.
-    """
+    """A chain's own id (for a Claude Code subagent turn, the agent id) and the chain that dispatched it."""
 
     session_id: str
     parent_session_id: str | None = None
@@ -59,10 +45,7 @@ def _value(headers: Mapping[str, str], name: str) -> str | None:
 def agent_identity_from_headers(headers: Mapping[str, str]) -> AgentIdentity | None:
     """Derive the program identity from request headers, or None when none are set.
 
-    Canonical ``x-dynamo-*`` headers win; otherwise the first coding agent whose
-    root header is present decides. A parent equal to the session itself is
-    dropped. Lookups use lower-case names, so ``headers`` must be
-    case-insensitive, as Starlette's ``Headers`` is.
+    Canonical ``x-dynamo-*`` headers win. Lookups are lower-case, so ``headers`` must be case-insensitive.
     """
     session_id = _value(headers, _DYNAMO_SESSION)
     if session_id is not None:

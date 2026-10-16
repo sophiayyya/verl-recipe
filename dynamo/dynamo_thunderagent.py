@@ -78,12 +78,8 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         return value
 
     def _thunderagent_native(self) -> bool:
-        """Schedule programs with Dynamo's builtin ThunderAgent plugin instead of the Python prototype.
-
-        The plugin runs inside the frontend's KV router (``--router-policy-config``), so
-        there is no router process to launch, workers keep the public model name and the
-        session-final request is an ordinary one-token completion.
-        """
+        """Schedule programs with Dynamo's builtin ThunderAgent plugin (inside the KV router) instead of
+        launching the Python prototype as a separate router process."""
         if not self._thunderagent_enabled():
             return False
         value = self._thunderagent_config().get("native", False)
@@ -130,8 +126,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         args = super()._frontend_router_args()
         if not self._thunderagent_native():
             return args
-        # Soft affinity lets the plugin repack a session between turns; hard affinity
-        # would pin the request to a worker before the plugin's selector runs.
+        # soft affinity lets the plugin repack a session between turns
         policy = self._write_thunderagent_policy()
         return [*args, "--router-policy-config", policy, "--router-session-affinity-mode", "soft"]
 
@@ -309,8 +304,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if not 200 <= status < 300:
             raise FinalRequestError(status, body)
         if not body.strip() or self._thunderagent_native():
-            # The native plugin releases the program from inside the router and lets the
-            # one-token request complete on a worker; only the prototype answers it itself.
+            # the native plugin lets the one-token final request complete on a worker
             return
         data = json.loads(body)
         if data.get("choices"):
@@ -319,10 +313,8 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
     async def finalize_program(self, session_id: str) -> bool:
         """Release a ThunderAgent program with the session-final request.
 
-        Returns False, without posting, while abort_all_requests has the engines paused
-        in native mode: the plugin releases the program inside the router, but the
-        one-token request still completes on a worker and would park until
-        resume_generation. The Python prototype answers the request itself.
+        Returns False without posting while the engines are paused in native mode: the request
+        would park on a worker until resume_generation (the Python prototype answers it itself).
         """
         if not self._thunderagent_enabled():
             return True
@@ -365,12 +357,8 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         return timeout
 
     async def _probe_final_request(self) -> None:
-        """Release a throwaway program to prove the session-final path works.
-
-        ``/health`` lists the workers as soon as they register, but the frontend commits
-        the model's completions route a moment later; until then the probe is answered
-        with 404. Wait that out within a bound instead of failing startup.
-        """
+        """Release a throwaway program to prove the session-final path works; the completions
+        route may answer 404 for a moment after /health passes, so a 404 is waited out."""
         deadline = time.monotonic() + self._health_probe_timeout()
         while True:
             try:

@@ -173,17 +173,12 @@ adapter accepts `engine: sglang` (tool parsing follows the engine), but its
 SGLang GPU validation is still pending.
 
 `thunderagent.enabled=true` launches Dynamo's Python ThunderAgent prototype as a
-separate router process behind a round-robin frontend. With a Dynamo that ships
-the builtin plugin (main since 2026-09-23), set `thunderagent.native=true` as
-well: the recipe keeps `router_mode=kv`, writes the plugin's policy file and
-passes it to the frontend as `--router-policy-config`, so programs are
-scheduled inside the KV router with no extra process. Plugin admission
-parameters (`pause_threshold`, `scheduler_interval_seconds`, ...) go under
-`thunderagent.native_parameters`; the same `X-Dynamo-Session-ID` /
-`X-Dynamo-Parent-Session-ID` / `X-Dynamo-Session-Final` headers drive both.
-At startup the server proves the session-final path with a throwaway program;
-the frontend may answer 404 for a moment after `/health` passes, which is
-retried for `thunderagent.health_probe_timeout_s` (default 60).
+separate router process. With a Dynamo that ships the builtin plugin (main since
+2026-09-23), set `thunderagent.native=true` as well: the recipe keeps
+`router_mode=kv` and passes the plugin's policy file as `--router-policy-config`,
+so programs are scheduled inside the KV router with no extra process; admission
+parameters go under `thunderagent.native_parameters`. The startup probe retries a
+404 from the completions route for `thunderagent.health_probe_timeout_s` (default 60).
 
 For current multi-turn Uni-Agent, use the
 [dedicated launcher](run_uniagent_thunderagent_vllm024.sh). Its recipe Gateway
@@ -194,26 +189,18 @@ See the [guide](THUNDERAGENT_VLLM024.md) for the version pins and cleanup scope.
 
 ### Subagent programs (Claude Code)
 
-A Claude Code rollout that dispatches subagents is a tree of programs, not one:
-every subagent turn carries its own `x-claude-code-agent-id`, and Dynamo's
-frontend normalizes it into a distinct `agent_context.session_id` with the root
-as `parent_session_id`. The Gateway terminates those headers, so the recipe's
-adapter ([uniagent_gateway.py](uniagent_gateway.py)) applies the same rules
-([agent_identity.py](agent_identity.py)) itself, with Uni-Agent unmodified. It
+A Claude Code rollout that dispatches subagents is a tree of programs: every
+subagent turn carries its own `x-claude-code-agent-id`. The Gateway terminates
+those headers, so the adapter ([uniagent_gateway.py](uniagent_gateway.py)) reads
+them itself ([agent_identity.py](agent_identity.py)), with Uni-Agent unmodified:
 
-- names each turn's ThunderAgent program after the agent that sent it and
-  passes the dispatcher as `X-Dynamo-Parent-Session-ID`, so a router that
-  understands the link can place siblings together;
-- keeps the trajectory's request id as the routing key, so the whole tree
-  reaches one frontend, and serializes turns per program rather than per
-  session, so parallel subagents are not rejected;
-- releases a subagent the moment its final answer is produced (a turn that
-  ends without a tool call is the Agent tool returning), releases a
-  dispatcher's remaining idle subagents when the dispatcher takes its next
-  turn, and the rest of the tree, children first, when the session closes. A
-  session that closes with a turn still in flight (the agent timed out) has
-  that turn cancelled through to the frontend before its programs are
-  released, so nothing stays charged against the router.
+- each turn's program is named after the agent that sent it, with the dispatcher
+  as `X-Dynamo-Parent-Session-ID`; the trajectory's request id stays the routing
+  key, and turns are serialized per program, so parallel subagents are accepted;
+- a subagent is released when its final answer is produced, a dispatcher's idle
+  subagents when it takes its next turn, and the rest of the tree, children
+  first, at session close; a turn still in flight at close is cancelled through
+  to the frontend first.
 
 Subagents are off by default in the Uni-Agent Claude Code recipe; enable them
 in the Task Config with `agent.enable_subagents: true`.
