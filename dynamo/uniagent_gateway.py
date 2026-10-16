@@ -96,11 +96,26 @@ def _observe_body(response, on_complete):
         on_complete(response.body)
 
 
+# How Claude Code agent identities become ThunderAgent programs. ``tree`` is the
+# design; the other two exist to measure what each step of it buys on a benchmark.
+SUBAGENT_PROGRAMS = ("tree", "isolated", "off")
+
+
 def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, str | None]:
     """The program a turn belongs to and its parent; a turn without identity headers is the session."""
     if identity is None:
         return session_id, None
     return identity.session_id, identity.parent_session_id
+
+
+def _routed_program(session_id: str, identity: AgentIdentity | None, mode: str) -> tuple[str, str | None]:
+    """What the router is told: ``tree`` the program and its parent, ``isolated`` the
+    program alone (no sibling co-location), ``off`` the session (every agent's turns in
+    one program, as before the recipe knew about subagents)."""
+    if mode == "off":
+        return session_id, None
+    program_id, parent_program_id = _program_of(session_id, identity)
+    return program_id, (parent_program_id if mode == "tree" else None)
 
 
 class _ProgramClient:
@@ -112,11 +127,12 @@ class _ProgramClient:
     schedules and what the actor later releases.
     """
 
-    def __init__(self, client):
+    def __init__(self, client, subagent_programs="tree"):
         self._client = client
+        self._subagent_programs = subagent_programs
 
     async def generate(self, request_id, **kwargs):
-        program_id, parent_program_id = _program_of(request_id, _REQUEST_IDENTITY.get())
+        program_id, parent_program_id = _routed_program(request_id, _REQUEST_IDENTITY.get(), self._subagent_programs)
         return await self._client.generate(
             request_id, program_id=program_id, parent_program_id=parent_program_id, **kwargs
         )
@@ -149,12 +165,17 @@ class _DynamoGatewayActor(_GatewayActor):
     _deferred_poll = 1.0
     _deferred_retries = 3
 
-    def __init__(self, config, backend):
+    def __init__(self, config, backend, subagent_programs="tree"):
         if not callable(getattr(backend, "finalize_program", None)):
             raise ValueError("Dynamo Gateway requires a client with finalize_program")
         if getattr(backend, "_auto_finalize", True):
             raise ValueError("Dynamo Gateway requires thunderagent.auto_finalize=false")
-        super().__init__(config, _ProgramClient(backend))
+        if subagent_programs not in SUBAGENT_PROGRAMS:
+            raise ValueError(
+                f"thunderagent.subagent_programs must be one of {SUBAGENT_PROGRAMS}, got {subagent_programs!r}"
+            )
+        self._subagent_programs = subagent_programs
+        super().__init__(config, _ProgramClient(backend, subagent_programs))
         self._app.add_middleware(_AgentIdentityMiddleware)
         self._requests = {}
         # session -> {program: parent}, in creation order; a child is created after its parent.
@@ -177,7 +198,10 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _handle_request(self, handler, session_id, payload):
         if session_id in self._closing or session_id in self._closed:
             raise HTTPException(status_code=409, detail="Session is closing")
-        program_id, parent_program_id = _program_of(session_id, _REQUEST_IDENTITY.get())
+        # With subagent programs off, the gateway sees one program per session too: no
+        # tree, no release on return; the session close releases it.
+        identity = None if self._subagent_programs == "off" else _REQUEST_IDENTITY.get()
+        program_id, parent_program_id = _program_of(session_id, identity)
         inflight = self._requests.setdefault(session_id, {})
         if program_id in inflight:
             raise HTTPException(status_code=409, detail="Dynamo Gateway requires serial calls within one program")
@@ -397,7 +421,9 @@ DynamoGatewayActor = ray.remote(_DynamoGatewayActor)
 class DynamoGatewayManager(GatewayManager):
     """Use the recipe actor while retaining upstream session routing methods."""
 
-    def __init__(self, llm_client, *, gateway_count, gateway_actor_config, actor_cls=DynamoGatewayActor):
+    def __init__(
+        self, llm_client, *, gateway_count, gateway_actor_config, actor_cls=DynamoGatewayActor, **actor_kwargs
+    ):
         if gateway_count <= 0:
             raise ValueError("gateway_count must be positive")
         nodes = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
@@ -408,7 +434,7 @@ class DynamoGatewayManager(GatewayManager):
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                     node_id=nodes[i % len(nodes)], soft=True
                 )
-            ).remote(gateway_actor_config, backend=llm_client)
+            ).remote(gateway_actor_config, backend=llm_client, **actor_kwargs)
             for i in range(gateway_count)
         ]
         ray.get([gateway.start.remote() for gateway in self.gateways])
@@ -417,7 +443,7 @@ class DynamoGatewayManager(GatewayManager):
         self._session_to_gateway_index = {}
 
 
-def _build_gateway_manager(config, llm_client, *, thunderagent, engine):
+def _build_gateway_manager(config, llm_client, *, thunderagent, engine, subagent_programs="tree"):
     """Mirror Uni-Agent's GatewayActorConfig wiring without replacing globals.
 
     Dynamo serves its engines behind its own rollout registry name, so the tool
@@ -452,6 +478,7 @@ def _build_gateway_manager(config, llm_client, *, thunderagent, engine):
         gateway_count=int(af["gateway_count"]),
         gateway_actor_config=actor_config,
         actor_cls=DynamoGatewayActor if thunderagent else GatewayActor,
+        **({"subagent_programs": subagent_programs} if thunderagent else {}),
     )
 
 
@@ -469,7 +496,10 @@ class DynamoAgentFrameworkRolloutAdapter(AgentFrameworkRolloutAdapter):
         thunderagent = bool(dynamo.thunderagent.enabled)
         if thunderagent and dynamo.thunderagent.get("auto_finalize", True):
             raise ValueError("ThunderAgent with the Uni-Agent Gateway requires thunderagent.auto_finalize=false")
-        gateway_manager = _build_gateway_manager(config, llm_client, thunderagent=thunderagent, engine=engine)
+        ablation = {"subagent_programs": dynamo.thunderagent.get("subagent_programs", "tree")} if thunderagent else {}
+        gateway_manager = _build_gateway_manager(
+            config, llm_client, thunderagent=thunderagent, engine=engine, **ablation
+        )
         instance = cls()
         instance.gateway_manager = gateway_manager
         instance.framework_worker = AgentFrameworkWorker.remote(

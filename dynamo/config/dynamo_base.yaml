@@ -21,6 +21,11 @@ actor_rollout_ref:
           #                             # the Python prototype router process
           # native_parameters: {}       # plugin admission parameters, e.g. pause_threshold: 0.95
           # health_probe_timeout_s: 60  # wait for the frontend's completions route at startup
+          # subagent_programs: tree     # how Claude Code agent identities become programs: tree =
+          #                             # a program per agent, parent announced to the router;
+          #                             # isolated = a program per agent, no parent (no sibling
+          #                             # co-location); off = identity ignored, one program per
+          #                             # session. The last two are benchmark ablations.
         # Sleep/wake the engine around the training phase. verl's own
         # rollout.free_cache_engine defaults to true; the server validates the
         # two stay aligned (a contradiction fails at startup) — the engine

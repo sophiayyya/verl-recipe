@@ -58,9 +58,9 @@ class Backend:
 def make_actor(monkeypatch):
     monkeypatch.setattr("ray.util.get_node_ip_address", lambda: "127.0.0.1")
 
-    def make(cls=_DynamoGatewayActor):
+    def make(cls=_DynamoGatewayActor, **kwargs):
         backend = Backend()
-        actor = cls(GatewayActorConfig(tokenizer=Tokenizer()), backend)
+        actor = cls(GatewayActorConfig(tokenizer=Tokenizer()), backend, **kwargs)
         actor._server_base_url = "http://test"
         actor._retry_delay = 0
         return actor, backend
@@ -617,6 +617,41 @@ async def test_a_sibling_that_moves_on_during_a_release_is_left_to_its_own_path(
         assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
         release.set()
         assert (await background).status_code == 200
+    await actor.finalize_session("session")
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+
+
+def test_subagent_programs_must_be_a_known_mode(make_actor):
+    with pytest.raises(ValueError, match="subagent_programs"):
+        make_actor(subagent_programs="flat")
+
+
+@pytest.mark.asyncio
+async def test_subagent_programs_off_puts_every_agent_in_the_sessions_program(make_actor):
+    # The ablation baseline: identity headers are ignored, so the router sees one
+    # program per session and nothing is released before the session closes.
+    actor, backend = make_actor(subagent_programs="off")
+    await session_with_two_subagents(actor, backend)
+    assert backend.programs == [("session", None)] * 3
+    backend.stop_reason = "completed"
+    await post(actor, "session", subagent("sub-a"), "task a, done")
+    await settled(actor)
+    backend.finalize_program.assert_not_awaited()
+    await actor.finalize_session("session")
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session"]
+
+
+@pytest.mark.asyncio
+async def test_subagent_programs_isolated_keeps_programs_and_releases_but_hides_the_parent(make_actor):
+    # Middle rung of the ablation: a program per agent, released on return as in tree
+    # mode, but the router is never told who dispatched it (no sibling co-location).
+    actor, backend = make_actor(subagent_programs="isolated")
+    await session_with_two_subagents(actor, backend)
+    assert backend.programs == [("run-1", None), ("sub-a", None), ("sub-b", None)]
+    backend.stop_reason = "completed"
+    await post(actor, "session", subagent("sub-a"), "task a, done")
+    await settled(actor)
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
     await actor.finalize_session("session")
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
 
