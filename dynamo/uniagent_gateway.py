@@ -147,6 +147,7 @@ class _DynamoGatewayActor(_GatewayActor):
     _retry_delay = 0.2
     _drain_timeout = 60.0
     _deferred_poll = 1.0
+    _deferred_retries = 3
 
     def __init__(self, config, backend):
         if not callable(getattr(backend, "finalize_program", None)):
@@ -160,8 +161,10 @@ class _DynamoGatewayActor(_GatewayActor):
         self._programs = {}
         # session -> releases of returned subagents still in flight.
         self._releases = {}
-        # programs whose release found the engines paused; released once generation resumes.
-        self._deferred = set()
+        # program -> retries left: releases that found the engines paused (released once
+        # generation resumes) or failed (retried in the background instead of failing the
+        # session close that owned them).
+        self._deferred = {}
         self._deferred_flush = None
         self._closing = {}
         self._closed = OrderedDict()
@@ -222,10 +225,18 @@ class _DynamoGatewayActor(_GatewayActor):
                     raise
                 await asyncio.sleep(self._retry_delay * 2**attempt)
 
-    def _defer_release(self, program_id):
-        if program_id not in self._deferred:
+    def _defer_release(self, program_id, *, failed=False):
+        if failed:
+            left = self._deferred.get(program_id, self._deferred_retries) - 1
+            if left <= 0:
+                self._deferred.pop(program_id, None)
+                logger.warning("ThunderAgent program leaked: release gave up after retries: program=%s", program_id)
+                return
+            logger.warning("ThunderAgent program release retried in the background: program=%s", program_id)
+            self._deferred[program_id] = left
+        elif program_id not in self._deferred:
             logger.info("ThunderAgent program release deferred until generation resumes: program=%s", program_id)
-            self._deferred.add(program_id)
+            self._deferred[program_id] = self._deferred_retries
         if self._deferred_flush is None or self._deferred_flush.done():
             self._deferred_flush = asyncio.create_task(self._flush_deferred())
 
@@ -234,11 +245,13 @@ class _DynamoGatewayActor(_GatewayActor):
             await asyncio.sleep(self._deferred_poll)
             for program_id in list(self._deferred):
                 try:
-                    if not await self._release_program(program_id):
-                        break  # still paused
+                    released = await self._release_program(program_id)
                 except Exception:
-                    pass  # logged by _release_program; the program leaks
-                self._deferred.discard(program_id)
+                    self._defer_release(program_id, failed=True)
+                    continue
+                if not released:
+                    break  # still paused
+                self._deferred.pop(program_id, None)
 
     async def _release_returned_children(self, session_id, program_id):
         """Release the idle subagents of a program taking a new turn: its dispatcher
@@ -321,16 +334,14 @@ class _DynamoGatewayActor(_GatewayActor):
             await asyncio.gather(*pending, return_exceptions=True)
         # The same actor owns the client's served-frontend records. A driver
         # copy of the client would not know every frontend visited on retries.
-        # One failed release must not strand the rest of the tree: attempt every
-        # program, then surface the first failure.
-        failures = []
+        # One failed release must not strand the rest of the tree, and must not fail
+        # the close: the trajectories are complete, and failing would drop them without
+        # releasing anything. The program is retried in the background instead.
         for program_id in self._session_programs(session_id):
             try:
                 await self._release_program(program_id)
-            except Exception as error:
-                failures.append(error)  # logged by _release_program
-        if failures:
-            raise failures[0]
+            except Exception:
+                self._defer_release(program_id, failed=True)  # logged by _release_program
         self._programs.pop(session_id, None)
         if abort:
             await super().abort_session(session_id)

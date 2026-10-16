@@ -5,6 +5,7 @@ Requires a Uni-Agent checkout and its verl submodule.
 
 import asyncio
 import json
+import logging
 from unittest.mock import AsyncMock
 
 import httpx
@@ -125,19 +126,38 @@ async def test_transient_cleanup_failure_retries(make_actor):
 
 
 @pytest.mark.asyncio
-async def test_exhausted_cleanup_is_visible_and_does_not_restart_retry_budget(make_actor):
+async def test_a_failed_release_at_close_keeps_the_trajectories_and_is_retried_in_the_background(make_actor):
+    # The trajectories are complete when the session closes; a router that cannot
+    # release the program must not cost them. The release moves to the background.
     actor, backend = make_actor()
+    actor._deferred_poll = 0
+    await create(actor)
+    await generate(actor)
+    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * 3 + [None]
+    trajectories = await actor.finalize_session("session")
+    assert len(trajectories) == 1
+    assert "session" not in actor._sessions
+    # The close spent its own retry budget (3); the background flusher succeeds on the 4th call.
+    await actor._deferred_flush
+    assert not actor._deferred
+    assert backend.finalize_program.await_count == 4
+    assert await actor.abort_session("session") is None  # closed; nothing restarts
+
+
+@pytest.mark.asyncio
+async def test_a_release_that_keeps_failing_is_given_up_as_leaked(make_actor, caplog):
+    actor, backend = make_actor()
+    actor._deferred_poll = 0
     await create(actor)
     await generate(actor)
     backend.finalize_program.side_effect = RuntimeError("unreachable")
-    for method in [actor.finalize_session, actor.abort_session]:
-        with pytest.raises(RuntimeError, match="unreachable"):
-            await method("session")
-    assert backend.finalize_program.await_count == 3
-    assert "session" in actor._sessions
-    with pytest.raises(HTTPException) as error:
-        await generate(actor)
-    assert error.value.status_code == 409
+    with caplog.at_level(logging.WARNING):
+        await actor.finalize_session("session")
+        await actor._deferred_flush
+    assert not actor._deferred
+    # Three attempts at close, then two background rounds of three before giving up.
+    assert backend.finalize_program.await_count == 9
+    assert "ThunderAgent program leaked" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -151,7 +171,7 @@ async def test_release_is_deferred_while_generation_is_paused(make_actor):
     # The trajectories come back at once; the program waits for resume_generation.
     assert len(trajectories) == 1
     assert "session" not in actor._sessions
-    assert actor._deferred == {"session"}
+    assert set(actor._deferred) == {"session"}
     await actor._deferred_flush
     assert not actor._deferred
     assert backend.finalize_program.await_count == 3
@@ -167,10 +187,11 @@ async def test_cleanup_timeout_is_bounded(make_actor):
         await asyncio.Future()
 
     backend.finalize_program.side_effect = hang
-    with pytest.raises(TimeoutError):
-        await actor.finalize_session("session")
+    await actor.finalize_session("session")
     assert backend.finalize_program.await_count == 3
-    assert "session" in actor._sessions
+    assert "session" not in actor._sessions
+    assert set(actor._deferred) == {"session"}  # retried in the background
+    actor._deferred_flush.cancel()
 
 
 @pytest.mark.asyncio
@@ -500,11 +521,15 @@ async def test_a_failed_release_at_close_still_releases_the_rest_of_the_tree(mak
             raise RuntimeError("unreachable")
 
     backend.finalize_program.side_effect = finalize
-    for method in [actor.finalize_session, actor.abort_session]:
-        with pytest.raises(RuntimeError, match="unreachable"):
-            await method("session")
+    actor._deferred_poll = 0.2  # the flusher's first retry lands after the close has finished
+    assert len(await actor.finalize_session("session")) == 3
     # Children before the root, every program attempted, the retry budget not restarted.
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-b"] * 3 + ["sub-a", "run-1"]
+    assert set(actor._deferred) == {"sub-b"}
+    backend.finalize_program.side_effect = None
+    await actor._deferred_flush
+    assert not actor._deferred
+    assert [call.args[0] for call in backend.finalize_program.await_args_list][5:] == ["sub-b"]
 
 
 @pytest.mark.asyncio
@@ -607,10 +632,10 @@ async def test_shutdown_attempts_all_sessions_even_if_one_cleanup_fails(make_act
             raise RuntimeError("failed")
 
     backend.finalize_program.side_effect = finalize
-    with pytest.raises(RuntimeError, match="failed"):
-        await actor.shutdown()
-    assert set(actor._sessions) == {"bad"}
-    assert [call.args[0] for call in backend.finalize_program.await_args_list].count("healthy") == 1
+    await actor.shutdown()
+    assert not actor._sessions
+    calls = [call.args[0] for call in backend.finalize_program.await_args_list]
+    assert calls.count("healthy") == 1 and calls.count("bad") == 3
 
 
 @pytest.mark.asyncio
