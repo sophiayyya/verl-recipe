@@ -376,13 +376,13 @@ async def test_claude_code_subagents_are_programs_of_their_own_and_run_in_parall
     await started.wait()
     second = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b"))
     await asyncio.sleep(0)
-    assert set(actor._requests["session"]) == {"sub-a", "sub-b"}
+    assert set(actor._requests["session"]) == {"session/sub-a", "session/sub-b"}
     assert (await post(actor, "session", subagent("sub-a"), "task a")).status_code == 409
     release.set()
     assert {r.status_code for r in await asyncio.gather(first, second)} == {200}
     assert backend.ids == ["session"] * 3
-    assert backend.programs[0] == ("run-1", None)
-    assert sorted(backend.programs[1:]) == [("sub-a", "run-1"), ("sub-b", "run-1")]
+    assert backend.programs[0] == ("session/run-1", None)
+    assert sorted(backend.programs[1:]) == [("session/sub-a", "session/run-1"), ("session/sub-b", "session/run-1")]
 
 
 @pytest.mark.asyncio
@@ -395,7 +395,7 @@ async def test_a_subagent_still_running_survives_the_dispatchers_turn_and_goes_a
     original = backend.generate
 
     async def pending(*args, **kwargs):
-        if kwargs.get("program_id") == "sub-b":
+        if kwargs.get("program_id") == "session/sub-b":
             started.set()
             await release.wait()
         return await original(*args, **kwargs)
@@ -406,13 +406,13 @@ async def test_a_subagent_still_running_survives_the_dispatchers_turn_and_goes_a
     await started.wait()
 
     await post(actor, "session", ROOT)  # sub-a returned, sub-b is mid-request
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a"]
 
     release.set()
     await background
     await actor.finalize_session("session")
     # Children before the root that dispatched them.
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-b", "session/run-1"]
 
 
 def test_turn_returned_reads_the_last_finish_reason_in_either_dialect():
@@ -445,18 +445,18 @@ async def test_a_subagent_is_released_the_moment_its_final_answer_is_produced(ma
     backend.stop_reason = "completed"
     await post(actor, "session", subagent("sub-a"), "task a, done")
     await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
-    assert "sub-a" not in actor._programs["session"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a"]
+    assert "session/sub-a" not in actor._programs["session"]
 
     # The streaming dialect carries the finish reason in its last chunk.
     response = await post(actor, "session", subagent("sub-b"), "task b", stream=True)
     assert response.status_code == 200 and b"[DONE]" in response.content
     await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-b"]
 
     await post(actor, "session", ROOT)
     await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-b", "session/run-1"]
 
 
 @pytest.mark.asyncio
@@ -482,7 +482,7 @@ async def test_a_turn_for_a_program_being_released_waits_for_the_release(make_ac
     release.set()
     assert (await resumed).status_code == 200 and len(backend.ids) == 3
     await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-a"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-a"]
 
 
 async def session_with_two_subagents(actor, backend):
@@ -502,19 +502,19 @@ async def test_a_failed_release_at_close_still_releases_the_rest_of_the_tree(mak
     await session_with_two_subagents(actor, backend)
 
     async def finalize(program):
-        if program == "sub-b":
+        if program == "session/sub-b":
             raise RuntimeError("unreachable")
 
     backend.finalize_program.side_effect = finalize
     actor._deferred_poll = 0.2  # the flusher's first retry lands after the close has finished
     assert len(await actor.finalize_session("session")) == 3
     # Children before the root, every program attempted, the retry budget not restarted.
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-b"] * 3 + ["sub-a", "run-1"]
-    assert set(actor._deferred) == {"sub-b"}
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-b"] * 3 + ["session/sub-a", "session/run-1"]
+    assert set(actor._deferred) == {"session/sub-b"}
     backend.finalize_program.side_effect = None
     await actor._deferred_flush
     assert not actor._deferred
-    assert [call.args[0] for call in backend.finalize_program.await_args_list][5:] == ["sub-b"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list][5:] == ["session/sub-b"]
 
 
 @pytest.mark.asyncio
@@ -523,7 +523,7 @@ async def test_a_failed_subagent_release_does_not_fail_the_dispatchers_turn(make
     # rejects stays in the tree for the close path instead of failing the turn.
     actor, backend = make_actor()
     await session_with_two_subagents(actor, backend)
-    unreachable = {"sub-a"}
+    unreachable = {"session/sub-a"}
 
     async def finalize(program):
         if program in unreachable:
@@ -532,11 +532,11 @@ async def test_a_failed_subagent_release_does_not_fail_the_dispatchers_turn(make
     backend.finalize_program.side_effect = finalize
     assert (await post(actor, "session", ROOT)).status_code == 200
     assert backend.ids == ["session"] * 4
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"] * 3 + ["sub-b"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a"] * 3 + ["session/sub-b"]
 
     unreachable.clear()
     await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list][4:] == ["sub-a", "run-1"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list][4:] == ["session/sub-a", "session/run-1"]
 
 
 @pytest.mark.asyncio
@@ -548,7 +548,7 @@ async def test_a_subagent_release_cancelled_by_abort_is_retried_at_close(make_ac
     stalled = asyncio.Event()
 
     async def finalize(program):
-        if program == "sub-a" and not stalled.is_set():
+        if program == "session/sub-a" and not stalled.is_set():
             stalled.set()
             await asyncio.Event().wait()  # the frontend has not answered yet
 
@@ -557,7 +557,7 @@ async def test_a_subagent_release_cancelled_by_abort_is_retried_at_close(make_ac
     await stalled.wait()
     await actor.abort_session("session")
     await asyncio.gather(turn, return_exceptions=True)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-a", "sub-b", "run-1"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-a", "session/sub-b", "session/run-1"]
 
 
 @pytest.mark.asyncio
@@ -572,7 +572,7 @@ async def test_a_sibling_that_moves_on_during_a_release_is_left_to_its_own_path(
     stalled, answer = asyncio.Event(), asyncio.Event()
 
     async def finalize(program):
-        if program == "sub-a":
+        if program == "session/sub-a":
             stalled.set()
             await answer.wait()
 
@@ -584,7 +584,7 @@ async def test_a_sibling_that_moves_on_during_a_release_is_left_to_its_own_path(
         original = backend.generate
 
         async def pending(*args, **kwargs):
-            if kwargs.get("program_id") == "sub-b":
+            if kwargs.get("program_id") == "session/sub-b":
                 started.set()
                 await release.wait()
             return await original(*args, **kwargs)
@@ -599,11 +599,11 @@ async def test_a_sibling_that_moves_on_during_a_release_is_left_to_its_own_path(
     answer.set()
     assert (await turn).status_code == 200
     if sibling == "resumed":
-        assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
+        assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a"]
         release.set()
         assert (await background).status_code == 200
     await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-b", "session/run-1"]
 
 
 def test_subagent_programs_must_be_a_known_mode(make_actor):
@@ -632,13 +632,13 @@ async def test_subagent_programs_isolated_keeps_programs_and_releases_but_hides_
     # mode, but the router is never told who dispatched it (no sibling co-location).
     actor, backend = make_actor(subagent_programs="isolated")
     await session_with_two_subagents(actor, backend)
-    assert backend.programs == [("run-1", None), ("sub-a", None), ("sub-b", None)]
+    assert backend.programs == [("session/run-1", None), ("session/sub-a", None), ("session/sub-b", None)]
     backend.stop_reason = "completed"
     await post(actor, "session", subagent("sub-a"), "task a, done")
     await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a"]
     await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/sub-a", "session/sub-b", "session/run-1"]
 
 
 @pytest.mark.asyncio

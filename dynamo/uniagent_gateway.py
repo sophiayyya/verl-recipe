@@ -84,14 +84,16 @@ SUBAGENT_PROGRAMS = ("tree", "isolated", "off")
 
 
 def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, str | None]:
-    """The program a turn belongs to and its parent; a turn without identity headers is the session."""
+    """The program a turn belongs to and its parent: the trajectory's request id, extended by the agent id
+    when the turn names one, so programs are unique per trajectory and read as their session in the router."""
     if identity is None:
         return session_id, None
-    return identity.session_id, identity.parent_session_id
+    parent = identity.parent_session_id
+    return f"{session_id}/{identity.session_id}", None if parent is None else f"{session_id}/{parent}"
 
 
 def _routed_program(session_id: str, identity: AgentIdentity | None, mode: str) -> tuple[str, str | None]:
-    """``tree``: the program and its parent; ``isolated``: the program alone; ``off``: the session
+    """``tree``: the program and its parent; ``isolated``: the program alone; ``off``: the request id
     (every agent's turns in one program, as before the recipe knew about subagents)."""
     if mode == "off":
         return session_id, None

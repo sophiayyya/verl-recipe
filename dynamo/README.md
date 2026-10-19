@@ -194,9 +194,10 @@ subagent turn carries its own `x-claude-code-agent-id`. The Gateway terminates
 those headers, so the adapter ([uniagent_gateway.py](uniagent_gateway.py)) reads
 them itself ([agent_identity.py](agent_identity.py)), with Uni-Agent unmodified:
 
-- each turn's program is named after the agent that sent it, with the dispatcher
-  as `X-Dynamo-Parent-Session-ID`; the trajectory's request id stays the routing
-  key, and turns are serialized per program, so parallel subagents are accepted;
+- each turn's program is the trajectory's request id extended by the agent that
+  sent it (`<request id>/<agent id>`), with the dispatcher's program as
+  `X-Dynamo-Parent-Session-ID`; the request id alone stays the routing key, and
+  turns are serialized per program, so parallel subagents are accepted;
 - a subagent is released when its final answer is produced, a dispatcher's idle
   subagents when it takes its next turn, and the rest of the tree, children
   first, at session close; a turn still in flight at close is cancelled through
