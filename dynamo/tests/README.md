@@ -30,7 +30,7 @@ enabled. The upstream setup test skips when verl is absent.
 [test_uniagent_gateway.py](test_uniagent_gateway.py) uses Uni-Agent's actual
 Gateway with a fake model backend to check token alignment, program cleanup,
 retries, timeouts and cancellation. Install the Uni-Agent/verl versions in the
-[0.24 guide](../THUNDERAGENT_VLLM024.md); this module skips when Uni-Agent is absent.
+[Claude Code configuration](../README.md#claude-code-with-rust-thunderagent); this module skips when Uni-Agent is absent.
 
 [check_continuations.py](check_continuations.py) checks all recipe shell/Slurm
 scripts recursively by default; optional arguments select file/glob paths:

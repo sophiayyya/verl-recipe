@@ -44,6 +44,75 @@ RECIPE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = RECIPE_ROOT.parent
 
 
+@pytest.mark.asyncio
+async def test_native_generations_keep_program_parent_and_use_unique_wire_requests(monkeypatch):
+    server = _make_http_server({"enabled": True, "implementation": "native"})
+    calls = []
+
+    async def generate(self, **kwargs):
+        payload = {"request_id": kwargs["request_id"]}
+        # The base server can retry HTTP after optional-field negotiation.
+        for _ in range(2):
+            await self._frontend_post(payload, kwargs["request_id"])
+        assert payload["request_id"] == "stable-lb-key"
+        return kwargs
+
+    async def post(self, payload, request_id):
+        headers = self._frontend_headers(request_id)
+        assert payload["request_id"] == headers["X-Request-Id"] == request_id
+        calls.append((request_id, headers))
+        return 200, '{"choices": []}'
+
+    monkeypatch.setattr(DynamoHttpServer, "generate", generate)
+    monkeypatch.setattr(DynamoHttpServer, "_frontend_post", post)
+    for _ in range(2):
+        await server.generate(
+            request_id="stable-lb-key",
+            prompt_ids=[1],
+            sampling_params={},
+            thunderagent_session_id="rollout/agent/a",
+            thunderagent_parent_session_id="rollout/main",
+        )
+    assert len({request_id for request_id, _ in calls}) == 4
+    assert all(headers["X-Dynamo-Session-ID"] == "rollout/agent/a" for _, headers in calls)
+    assert all(headers["X-Dynamo-Parent-Session-ID"] == "rollout/main" for _, headers in calls)
+    assert "X-Dynamo-Parent-Session-ID" not in server._frontend_headers("outside")
+
+
+def test_native_startup_registers_both_roles_without_python_service(monkeypatch, tmp_path):
+    server = _make_http_server(
+        {"enabled": True, "implementation": "native", "native_parameters": {"session_retention_seconds": 60}}
+    )
+    monkeypatch.setenv("VERL_DYNAMO_LOG_DIR", str(tmp_path))
+    server._start_thunderagent()
+    assert server._thunderagent_process is None
+    args = server._frontend_extra_args()
+    policy = yaml.safe_load(Path(args[args.index("--router-policy-config") + 1]).read_text())
+    assert policy["request_classifier"]["type"] == "thunderagent"
+    assert policy["worker_selection"]["aggregated"] == "thunderagent"
+    assert args[-2:] == ["--router-session-affinity-mode", "soft"]
+
+
+@pytest.mark.asyncio
+async def test_native_final_defers_while_paused_and_accepts_worker_completion(monkeypatch):
+    server = _make_http_server({"enabled": True, "implementation": "native"})
+    server._generation_resumed.clear()
+    calls = []
+
+    async def post(payload, request_id):
+        calls.append((payload, server._frontend_headers(request_id)))
+        return 200, '{"choices": [{"text": "x"}]}'
+
+    monkeypatch.setattr(server, "_frontend_post", post)
+    assert await server.finalize_program("rollout/agent/a") is False
+    assert not calls
+    server._generation_resumed.set()
+    assert await server.finalize_program("rollout/agent/a") is True
+    assert len(calls) == 1
+    assert calls[0][1]["X-Dynamo-Session-Final"] == "true"
+    assert calls[0][0]["max_tokens"] == 1
+
+
 def _make_http_server(thunderagent: dict | None = None) -> DynamoThunderAgentHttpServer:
     server = object.__new__(DynamoThunderAgentHttpServer)
     server.config = SimpleNamespace(engine_kwargs={"dynamo": {"thunderagent": thunderagent or {"enabled": True}}})
@@ -55,6 +124,8 @@ def _make_http_server(thunderagent: dict | None = None) -> DynamoThunderAgentHtt
     server._frontend_process = None
     server._thunderagent_process = None
     server._thunderagent_log_fp = None
+    server._generation_resumed = asyncio.Event()
+    server._generation_resumed.set()
     return server
 
 
@@ -155,6 +226,38 @@ async def test_client_omits_empty_audio_arguments_unsupported_by_pr110() -> None
 
     assert "audio_data" not in server.generate_calls[0]
     assert "mm_processor_kwargs" not in server.generate_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_frontend_health_waits_for_model_routes_after_worker_discovery(monkeypatch):
+    server = _make_http_server({"enabled": True, "implementation": "native"})
+    server._frontend_port = 8000
+    calls = []
+    model_checks = 0
+
+    def get(url, **kwargs):
+        nonlocal model_checks
+        calls.append(url.rsplit("/", 1)[-1])
+        if url.endswith("/health"):
+            data = {"instances": [{"endpoint": "generate"}] * 4}
+        else:
+            model_checks += 1
+            data = {"data": [{"id": "unrelated-model"}]}
+            if model_checks == 2:
+                data["data"].append({"id": "test-model"})
+        return SimpleNamespace(status_code=200, json=lambda: data)
+
+    async def finalize(_session_id):
+        assert model_checks == 2
+        calls.append("finalize")
+
+    monkeypatch.setattr(dynamo_async_server.requests, "get", get)
+    monkeypatch.setattr(dynamo_async_server, "_FRONTEND_READY_POLL_S", 0)
+    monkeypatch.setattr(server, "finalize_program", finalize)
+
+    await server._healthcheck_frontend(4)
+
+    assert calls == ["health", "models", "health", "models", "finalize"]
 
 
 @pytest.mark.asyncio
@@ -392,9 +495,13 @@ def test_frontend_start_starts_thunderagent_first(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("enabled", "expected_workers"), [(True, 5), (False, 4)])
-async def test_frontend_health_waits_for_router_and_workers(monkeypatch, enabled, expected_workers) -> None:
-    server = _make_http_server({"enabled": enabled})
+@pytest.mark.parametrize(
+    ("enabled", "implementation", "expected_workers"), [(True, "python", 5), (False, "python", 4), (True, "native", 4)]
+)
+async def test_frontend_health_waits_for_router_and_workers(
+    monkeypatch, enabled, implementation, expected_workers
+) -> None:
+    server = _make_http_server({"enabled": enabled, "implementation": implementation})
     observed = []
 
     async def healthcheck(_self, workers):

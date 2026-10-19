@@ -1614,6 +1614,8 @@ class DynamoHttpServer:
 
     async def _healthcheck_frontend(self, expected_workers: int):
         url = f"http://localhost:{self._frontend_port}/health"
+        models_url = f"http://localhost:{self._frontend_port}/v1/models"
+        model = self._served_model_name or self.model_config.local_path
         deadline = time.monotonic() + _FRONTEND_READY_TIMEOUT_S
         last_err: Optional[str] = None
         while time.monotonic() < deadline:
@@ -1626,13 +1628,22 @@ class DynamoHttpServer:
                     instances = data.get("instances") or []
                     n_gen = sum(1 for i in instances if i.get("endpoint") == "generate")
                     if n_gen >= expected_workers:
-                        logger.info(
-                            "[DynamoHttpServer] frontend healthy: %s/%s workers registered",
-                            n_gen,
-                            expected_workers,
-                        )
-                        return
-                    last_err = f"only {n_gen}/{expected_workers} workers registered"
+                        # Discovery can list workers before the frontend installs
+                        # the model routes. A completion in that gap returns 404.
+                        models = await asyncio.to_thread(requests.get, models_url, timeout=5)
+                        if models.status_code == 200 and any(
+                            entry.get("id") == model for entry in models.json().get("data", [])
+                        ):
+                            logger.info(
+                                "[DynamoHttpServer] frontend healthy: %s/%s workers registered, model=%s",
+                                n_gen,
+                                expected_workers,
+                                model,
+                            )
+                            return
+                        last_err = f"model {model!r} not advertised by frontend (HTTP {models.status_code})"
+                    else:
+                        last_err = f"only {n_gen}/{expected_workers} workers registered"
                 else:
                     last_err = f"HTTP {resp.status_code}"
             except requests.RequestException as e:
@@ -3208,6 +3219,18 @@ class DynamoReplica(RolloutReplica):
 
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
+
+    @property
+    def max_concurrency(self) -> int:
+        # One Dynamo frontend serves the entire pool, including parked native
+        # TA requests and program-final control calls. Large agent sweeps must
+        # leave room for those calls beyond the per-engine sequence limit.
+        value = (self.config.engine_kwargs or {}).get("dynamo", {}).get("max_actor_concurrency")
+        if value is None:
+            return super().max_concurrency
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("dynamo.max_actor_concurrency must be a positive integer")
+        return max(super().max_concurrency, value)
 
     async def sleep(self):
         """Drain in-flight requests before the weight-offloading sleep.

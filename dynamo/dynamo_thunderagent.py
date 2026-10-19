@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -37,14 +38,14 @@ _REQUEST_PROGRAM: ContextVar[tuple[str, bool] | None] = ContextVar(
     default=None,
 )
 _THUNDERAGENT_BACKEND_MODEL_SUFFIX = "--verl-thunderagent-backend"
+_REQUEST_PARENT: ContextVar[str | None] = ContextVar("dynamo_thunderagent_parent", default=None)
 
 
 class DynamoThunderAgentHttpServer(DynamoHttpServer):
     """Add program-aware routing while preserving PR #110's server stack.
 
-    The frontend selects the ThunderAgent endpoint. ThunderAgent then selects
-    a complete engine (worker, DP rank) pair; never pre-pin a bare engine rank
-    in the frontend request, where session affinity requires an explicit worker.
+    Native mode installs the Rust classifier and worker selector in the
+    frontend. Python mode retains the separate ThunderAgent router endpoint.
     """
 
     def __init__(self, *args, **kwargs):
@@ -52,7 +53,49 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         self._thunderagent_process: Optional[subprocess.Popen] = None
         self._thunderagent_log_fp = None
         if self._thunderagent_enabled():
-            self._router_mode = "round-robin"
+            self._router_mode = "kv" if self._native_thunderagent() else "round-robin"
+
+    def _native_thunderagent(self) -> bool:
+        implementation = self._thunderagent_config().get("implementation", "python")
+        if implementation not in ("python", "native"):
+            raise ValueError("thunderagent.implementation must be python or native")
+        return self._thunderagent_enabled() and implementation == "native"
+
+    def _dynamo_env_vars(self) -> dict[str, str]:
+        env = super()._dynamo_env_vars()
+        trace_path = os.environ.get("DYN_REQUEST_TRACE_OUTPUT_PATH")
+        if self._native_thunderagent() and trace_path:
+            # Frontends have independent writers and must not truncate each
+            # other's evidence when multiple replicas share a filesystem.
+            env["DYN_REQUEST_TRACE_OUTPUT_PATH"] = f"{trace_path}-replica{self.replica_rank}-node{self.node_rank}"
+        return env
+
+    def _frontend_extra_args(self) -> list[str]:
+        args = super()._frontend_extra_args()
+        if not self._native_thunderagent():
+            return args
+        if any(arg.split("=", 1)[0] in ("--router-policy-config", "--router-session-affinity-mode") for arg in args):
+            raise ValueError("Native ThunderAgent owns router policy and soft affinity arguments")
+        import yaml
+
+        directory = Path(os.environ.get("VERL_DYNAMO_LOG_DIR", "/tmp"))
+        directory.mkdir(parents=True, exist_ok=True)
+        policy = directory / f"thunderagent-native-{self.replica_rank}.yaml"
+        policy.write_text(
+            yaml.safe_dump(
+                {
+                    "request_classifier": {
+                        "type": "thunderagent",
+                        "parameters": self._thunderagent_config().get("native_parameters", {}),
+                    },
+                    "worker_selection": {
+                        "aggregated": "thunderagent",
+                        "instances": [{"name": "thunderagent", "type": "thunderagent"}],
+                    },
+                }
+            )
+        )
+        return args + ["--router-policy-config", str(policy), "--router-session-affinity-mode", "soft"]
 
     def _thunderagent_config(self) -> dict[str, Any]:
         config = self._dynamo_cfg().get("thunderagent", {}) or {}
@@ -101,7 +144,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         tp: int,
         kv_events_config_json: Optional[str] = None,
     ) -> list[str]:
-        thunderagent_enabled = self._thunderagent_enabled()
+        thunderagent_enabled = self._thunderagent_enabled() and not self._native_thunderagent()
         worker_model_name = (
             f"{served_model_name}{_THUNDERAGENT_BACKEND_MODEL_SUFFIX}" if thunderagent_enabled else served_model_name
         )
@@ -139,7 +182,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         contradicts the router block size fails fast here, same as the vLLM
         --block-size check.
         """
-        if not self._thunderagent_enabled():
+        if not self._thunderagent_enabled() or self._native_thunderagent():
             return super()._build_sglang_cmd(served_model_name, tp, nccl_port=nccl_port, **kwargs)
         explicit_page_size = self._sglang_cfg().get("page_size")
         router_block_size = self._thunderagent_router_block_size()
@@ -152,7 +195,7 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         return super()._build_sglang_cmd(worker_model_name, tp, nccl_port=nccl_port, **kwargs)
 
     def _start_thunderagent(self) -> None:
-        if not self._thunderagent_enabled() or self._thunderagent_process is not None:
+        if not self._thunderagent_enabled() or self._native_thunderagent() or self._thunderagent_process is not None:
             return
         env = os.environ.copy()
         env.update(self._dynamo_env_vars())
@@ -192,23 +235,49 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             session_id, is_final = request_program
             headers.pop("x-dynamo-session-id", None)
             headers["X-Dynamo-Session-ID"] = session_id
+            parent = _REQUEST_PARENT.get()
+            if parent:
+                headers["X-Dynamo-Parent-Session-ID"] = parent
             if is_final:
                 headers["X-Dynamo-Session-Final"] = "true"
         return headers
 
-    async def generate(self, *args, thunderagent_session_id: Optional[str] = None, **kwargs):
+    async def generate(
+        self,
+        *args,
+        thunderagent_session_id: Optional[str] = None,
+        thunderagent_parent_session_id: Optional[str] = None,
+        **kwargs,
+    ):
         if not self._thunderagent_enabled():
             return await super().generate(*args, **kwargs)
         if not thunderagent_session_id:
             raise RuntimeError("ThunderAgent generation requires a non-empty session ID")
+        if thunderagent_parent_session_id == thunderagent_session_id:
+            raise ValueError("ThunderAgent parent session ID must differ from the session ID")
         if self._use_direct_generate():
             raise RuntimeError("direct_generate bypasses ThunderAgent and cannot be enabled")
 
         token = _REQUEST_PROGRAM.set((thunderagent_session_id, False))
+        parent_token = _REQUEST_PARENT.set(thunderagent_parent_session_id)
         try:
+            if self._native_thunderagent() and args:
+                raise TypeError("Native ThunderAgent generate requires keyword arguments")
             return await super().generate(*args, **kwargs)
         finally:
+            _REQUEST_PARENT.reset(parent_token)
             _REQUEST_PROGRAM.reset(token)
+
+    async def _frontend_post(self, payload: dict[str, Any], request_id: str) -> tuple[int, str]:
+        if self._native_thunderagent():
+            # Allocate at the HTTP boundary, including extension-negotiation
+            # and finalization retries. The caller's stable LB key stays local.
+            program = _REQUEST_PROGRAM.get()
+            prefix = "thunderagent-final" if program and program[1] else "req"
+            request_id = f"{prefix}-{uuid4().hex}"
+            if "request_id" in payload:
+                payload = dict(payload, request_id=request_id)
+        return await super()._frontend_post(payload, request_id)
 
     def _finalize_max_attempts(self) -> int:
         attempts = int(self._thunderagent_config().get("finalize_max_attempts", 3))
@@ -232,11 +301,16 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
         if data.get("choices"):
             raise RuntimeError("ThunderAgent final request was bypassed and reached a model worker")
 
-    async def finalize_program(self, session_id: str) -> None:
+    async def finalize_program(self, session_id: str) -> bool:
         if not self._thunderagent_enabled():
-            return
+            return True
         if not session_id:
             raise ValueError("session_id must be non-empty")
+
+        if self._native_thunderagent() and not self._generation_resumed.is_set():
+            # A native final is a minimal generation. Let the Gateway return
+            # completed trajectories and retry cleanup after the trainer resumes.
+            return False
 
         request_id = f"thunderagent-final-{uuid4().hex}"
         payload = {
@@ -256,8 +330,18 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
                     last_error = error
                 else:
                     if status not in {408, 429} and status < 500:
-                        self._validate_final_response(status, body)
-                        return
+                        if self._native_thunderagent():
+                            # Native finalization removes program state and then
+                            # dispatches the minimal request. A normal completion
+                            # is expected; Python's router instead short-circuits.
+                            if not 200 <= status < 300:
+                                raise RuntimeError(f"Native final request failed: {status} {body[:500]}")
+                            data = json.loads(body)
+                            if data.get("error") or "choices" not in data:
+                                raise RuntimeError(f"Invalid native final response: {body[:500]}")
+                        else:
+                            self._validate_final_response(status, body)
+                        return True
                     last_error = RuntimeError(f"ThunderAgent final request failed status={status} body={body[:2000]!r}")
                 if attempt < attempts:
                     await asyncio.sleep(self._finalize_retry_delay())
@@ -266,7 +350,9 @@ class DynamoThunderAgentHttpServer(DynamoHttpServer):
             _REQUEST_PROGRAM.reset(token)
 
     async def _healthcheck_frontend(self, expected_workers: int) -> None:
-        await super()._healthcheck_frontend(expected_workers + int(self._thunderagent_enabled()))
+        await super()._healthcheck_frontend(
+            expected_workers + int(self._thunderagent_enabled() and not self._native_thunderagent())
+        )
         if self._thunderagent_enabled():
             await self.finalize_program(f"thunderagent-health-{time.time_ns()}")
 

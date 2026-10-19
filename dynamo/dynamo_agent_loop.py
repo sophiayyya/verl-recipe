@@ -25,6 +25,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -40,6 +41,49 @@ from .thunderagent import current_program
 from .thunderagent import program_scope as bind_program
 
 logger = logging.getLogger(__name__)
+
+_REQUEST_PROGRAM: ContextVar[str | None] = ContextVar("dynamo_client_program", default=None)
+
+
+async def _await_or_cancel(ref):
+    """Cancel the Ray generation too, and wait for its cancellation to settle."""
+    pending = asyncio.ensure_future(ref)
+    try:
+        return await asyncio.shield(pending)
+    except asyncio.CancelledError:
+        if isinstance(ref, ray.ObjectRef):
+            ray.cancel(ref, force=False)
+        else:
+            pending.cancel()
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not pending.cancelled():
+            pending.exception()
+        raise
+
+
+class _CancellingMethod:
+    def __init__(self, method):
+        self.method = method
+
+    def remote(self, *args, **kwargs):
+        return _await_or_cancel(self.method.remote(*args, **kwargs))
+
+
+class _CancellingHandle:
+    def __init__(self, handle):
+        self.handle = handle
+
+    def __getattr__(self, name):
+        value = getattr(self.handle, name)
+        return _CancellingMethod(value) if name == "generate" else value
+
+
+class GenerationPaused(RuntimeError):
+    """Native TA cleanup needs a running engine; retry after generation resumes."""
 
 
 class DynamoServerManager:
@@ -71,7 +115,9 @@ class DynamoServerManager:
             yield
 
     async def _finalize_program(self, session_id: str) -> None:
-        await self.server.finalize_program.remote(session_id=session_id)
+        released = await _await_or_cancel(self.server.finalize_program.remote(session_id=session_id))
+        if released is False:
+            raise GenerationPaused(session_id)
 
     async def generate(
         self,
@@ -97,16 +143,15 @@ class DynamoServerManager:
             **kwargs,
         )
         if not self.thunderagent_enabled:
-            output = await self.server.generate.remote(**generate_kwargs)
+            output = await _await_or_cancel(self.server.generate.remote(**generate_kwargs))
             return self._tag_weight_versions(output)
 
         scope = current_program()
         if scope is None:
             raise RuntimeError("Dynamo generation requires an active ThunderAgent program")
         async with scope.request():
-            output = await self.server.generate.remote(
-                **generate_kwargs,
-                thunderagent_session_id=scope.session_id,
+            output = await _await_or_cancel(
+                self.server.generate.remote(**generate_kwargs, thunderagent_session_id=scope.session_id)
             )
             return self._tag_weight_versions(output)
 
@@ -154,6 +199,8 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
     finalizes each of them; cleanup counts as confirmed only when all ack.
     """
 
+    _pause_poll_s = 1.0
+
     def __init__(
         self,
         config,
@@ -187,10 +234,6 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend. ProgramTables are frontend-local; cleanup must reach each
         # server that ever admitted the session.
         self._session_servers: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # OUTER routing key -> session for requests currently inside
-        # generate(), so the per-attempt _acquire_server hook can attribute
-        # each acquired server to its session.
-        self._inflight_routing_sessions: dict[str, str] = {}
 
     _SESSION_ROUTING_CACHE_MAX = 65536
 
@@ -222,10 +265,12 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend is a cheap no-op) is what lets finalize reach frontends the
         # LB has since removed or re-routed away from.
         server_id, handle = await super()._acquire_server(request_id, **extra)
-        session_id = self._inflight_routing_sessions.get(str(request_id))
+        # Siblings share an outer routing key, but each task records only the
+        # frontends that actually served its own program, including retries.
+        session_id = _REQUEST_PROGRAM.get()
         if session_id is not None:
             self._record_served_server(session_id, server_id, handle)
-        return server_id, handle
+        return server_id, _CancellingHandle(handle)
 
     async def generate(self, request_id, **kwargs):
         session_id = str(kwargs.setdefault("thunderagent_session_id", str(request_id)))
@@ -234,11 +279,11 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # explicitly passed session_id — remember it so both auto and manual
         # finalize route with the key the requests actually used.
         self._remember_routing_key(session_id, str(request_id))
-        self._inflight_routing_sessions[str(request_id)] = session_id
+        token = _REQUEST_PROGRAM.set(session_id)
         try:
             return await super().generate(request_id, **kwargs)
         finally:
-            self._inflight_routing_sessions.pop(str(request_id), None)
+            _REQUEST_PROGRAM.reset(token)
             if self._auto_finalize:
                 await self._finalize_with_recovery(session_id, routing_key=str(request_id))
 
@@ -247,10 +292,23 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # currently paused for the trainer phase — the router answers final
         # requests without the engine, but a hung frontend must not park the
         # trajectory for the full request_timeout_s (see the 8.4 probe fix).
-        await asyncio.wait_for(
-            handle.finalize_program.remote(session_id=session_id),
+        released = await asyncio.wait_for(
+            _await_or_cancel(handle.finalize_program.remote(session_id=session_id)),
             timeout=self._finalize_timeout_s,
         )
+        if released is False:
+            raise GenerationPaused(session_id)
+
+    async def _through_pause(self, finalize):
+        """Auto-finalized callers have no Gateway to retry cleanup after a pause."""
+        deadline = asyncio.get_running_loop().time() + self._finalize_timeout_s
+        while True:
+            try:
+                return await finalize()
+            except GenerationPaused:
+                if asyncio.get_running_loop().time() + self._pause_poll_s >= deadline:
+                    raise
+                await asyncio.sleep(self._pause_poll_s)
 
     async def finalize_program(self, session_id: str, routing_key: str = None) -> None:
         """Release the ThunderAgent program for one trajectory.
@@ -270,7 +328,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         session_id = str(session_id)
         served = self._session_servers.get(session_id)
         if served:
-            await asyncio.gather(*[self._finalize_on_handle(handle, session_id) for handle in dict(served).values()])
+            await self._finalize_all_handles(session_id, list(served.values()))
             self._drop_session(session_id)
             return
         if routing_key is None:
@@ -284,8 +342,18 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                 self._load_balancer.release_server.remote(server_id=server_id)
             self._drop_session(session_id)
             return
-        await asyncio.gather(*[self._finalize_on_handle(handle, session_id) for handle in self._dynamo_server_handles])
+        await self._finalize_all_handles(session_id, self._dynamo_server_handles)
         self._drop_session(session_id)
+
+    async def _finalize_all_handles(self, session_id, handles):
+        # A paused/failed frontend must not let the caller resume while a final
+        # request is still running on another frontend visited by this program.
+        results = await asyncio.gather(
+            *(self._finalize_on_handle(handle, session_id) for handle in handles), return_exceptions=True
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise next((error for error in errors if not isinstance(error, GenerationPaused)), errors[0])
 
     def _raise_if_leak_threshold(self) -> None:
         if self._unresolved_finalize_leaks >= self._finalize_leak_threshold:
@@ -309,7 +377,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
             delay = 0.2
             for attempt in range(3):
                 try:
-                    await self._finalize_on_handle(handle, session_id)
+                    await self._through_pause(lambda: self._finalize_on_handle(handle, session_id))
                     return True
                 except Exception:
                     logger.warning(
@@ -360,7 +428,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         delay = 0.2
         for attempt in range(3):
             try:
-                await self.finalize_program(session_id, routing_key=routing_key)
+                await self._through_pause(lambda: self.finalize_program(session_id, routing_key=routing_key))
                 return  # confirmed: routed via the sticky entry the requests used
             except Exception:
                 logger.warning(

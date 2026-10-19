@@ -1,6 +1,6 @@
-"""Exercise the unmodified Uni-Agent Gateway with the recipe lifecycle adapter.
+"""Exercise the pinned Uni-Agent Gateway with the recipe lifecycle adapter.
 
-Requires the optional Uni-Agent 0825e1ea checkout and its verl submodule.
+Requires the Uni-Agent pin in dynamo/requirements-uniagent.txt and verl v0.9.1.
 """
 
 import asyncio
@@ -119,19 +119,24 @@ async def test_transient_cleanup_failure_retries(make_actor):
 
 
 @pytest.mark.asyncio
-async def test_exhausted_cleanup_is_visible_and_does_not_restart_retry_budget(make_actor):
+async def test_exhausted_cleanup_can_retry_and_return_collected_trajectory(make_actor):
     actor, backend = make_actor()
     await create(actor)
     await generate(actor)
     backend.finalize_program.side_effect = RuntimeError("unreachable")
-    for method in [actor.finalize_session, actor.abort_session]:
-        with pytest.raises(RuntimeError, match="unreachable"):
-            await method("session")
+    with pytest.raises(RuntimeError, match="unreachable"):
+        await actor.finalize_session("session")
     assert backend.finalize_program.await_count == 3
     assert "session" in actor._sessions
+    assert "session" not in actor._closing
     with pytest.raises(HTTPException) as error:
         await generate(actor)
     assert error.value.status_code == 409
+    backend.finalize_program.side_effect = None
+    trajectories = await actor.finalize_session("session")
+    assert sum(sum(t.response_mask) for t in trajectories) == 1
+    assert backend.finalize_program.await_count == 4
+    assert await actor.finalize_session("session") is trajectories
 
 
 @pytest.mark.asyncio
@@ -139,6 +144,7 @@ async def test_cleanup_timeout_is_bounded(make_actor):
     actor, backend = make_actor()
     actor._finalize_timeout = 0.01
     await create(actor)
+    await generate(actor)
 
     async def hang(_):
         await asyncio.Future()
@@ -146,14 +152,16 @@ async def test_cleanup_timeout_is_bounded(make_actor):
     backend.finalize_program.side_effect = hang
     with pytest.raises(TimeoutError):
         await actor.finalize_session("session")
-    assert backend.finalize_program.await_count == 3
     assert "session" in actor._sessions
+    backend.finalize_program.side_effect = None
+    await actor.abort_session("session")
 
 
 @pytest.mark.asyncio
 async def test_repeated_waiter_cancellation_waits_for_cleanup(make_actor):
     actor, backend = make_actor()
     await create(actor)
+    await generate(actor)
     started, release = asyncio.Event(), asyncio.Event()
 
     async def finalize(_):
@@ -199,11 +207,16 @@ async def test_close_drains_or_cancels_the_complete_request(make_actor, abort):
     request = asyncio.create_task(generate(actor))
     await started.wait()
     task = asyncio.create_task((actor.abort_session if abort else actor.finalize_session)("session"))
-    await asyncio.sleep(0)
-    backend.finalize_program.assert_not_awaited()
-    assert not stopped.is_set()
-    release.set()
-    await task
+    if abort:
+        await asyncio.wait_for(task, 1)
+        assert stopped.is_set()
+        assert not release.is_set()
+    else:
+        await asyncio.sleep(0)
+        backend.finalize_program.assert_not_awaited()
+        assert not stopped.is_set()
+        release.set()
+        await task
     result = await asyncio.gather(request, return_exceptions=True)
     assert isinstance(result[0], asyncio.CancelledError) == abort
     assert not actor._sessions
@@ -211,55 +224,58 @@ async def test_close_drains_or_cancels_the_complete_request(make_actor, abort):
 
 
 @pytest.mark.asyncio
-async def test_drain_timeout_keeps_live_program_and_reports_failure(make_actor):
+async def test_drain_timeout_keeps_live_program_and_allows_later_abort(make_actor):
     actor, backend = make_actor()
     actor._drain_timeout = 0.01
     await create(actor)
     started, release = asyncio.Event(), asyncio.Event()
-    original = backend.generate
 
-    async def pending(*args, **kwargs):
+    async def uncooperative(**kwargs):
         started.set()
-        await release.wait()
-        return await original(*args, **kwargs)
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                pass
+        return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason="completed")
 
-    backend.generate = pending
+    backend.generate = uncooperative
     request = asyncio.create_task(generate(actor))
     await started.wait()
     with pytest.raises(TimeoutError, match="still has an active generation"):
         await actor.abort_session("session")
     backend.finalize_program.assert_not_awaited()
     assert not request.done()
-    assert "session" in actor._sessions
     release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await request
+    await request
+    await actor.abort_session("session")
+    backend.finalize_program.assert_awaited_once_with("session")
+    assert not actor._sessions
 
 
 @pytest.mark.asyncio
-async def test_independent_sessions_run_concurrently_but_same_session_is_rejected(make_actor):
+async def test_independent_sessions_overlap_and_same_program_serializes(make_actor):
     actor, backend = make_actor()
-    await create(actor, "one")
-    await create(actor, "two")
+    for name in ("one", "two"):
+        await create(actor, name)
     started, release = asyncio.Event(), asyncio.Event()
     original = backend.generate
+    calls = []
 
     async def pending(*args, **kwargs):
+        calls.append(kwargs["request_id"])
         started.set()
         await release.wait()
         return await original(*args, **kwargs)
 
     backend.generate = pending
-    request = asyncio.create_task(generate(actor, "one"))
-    await started.wait()
-    with pytest.raises(HTTPException) as error:
-        await generate(actor, "one")
-    assert error.value.status_code == 409
-    second = asyncio.create_task(generate(actor, "two"))
-    await asyncio.sleep(0)
-    assert set(actor._requests) == {"one", "two"}
+    requests = [asyncio.create_task(generate(actor, name)) for name in ("one", "two", "one")]
+    while len(calls) < 2:
+        await asyncio.sleep(0)
+    assert calls == ["one", "two"]
     release.set()
-    await asyncio.gather(request, second)
+    await asyncio.gather(*requests)
+    assert calls == ["one", "two", "one"]
     await asyncio.gather(actor.finalize_session("one"), actor.finalize_session("two"))
     assert backend.finalize_program.await_count == 2
 
@@ -269,6 +285,7 @@ async def test_shutdown_attempts_all_sessions_even_if_one_cleanup_fails(make_act
     actor, backend = make_actor()
     for session in ["bad", "healthy"]:
         await create(actor, session)
+        await generate(actor, session)
 
     async def finalize(session):
         if session == "bad":
@@ -301,7 +318,7 @@ async def test_anthropic_requests_share_the_lifecycle(make_actor):
 async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     from collections import OrderedDict
 
-    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient
+    from recipe.dynamo.dynamo_agent_loop import _REQUEST_PROGRAM, DynamoFullyAsyncLLMServerClient
 
     from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
@@ -310,7 +327,121 @@ async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     monkeypatch.setattr(FullyAsyncLLMServerClient, "_acquire_server", acquire)
     client = object.__new__(DynamoFullyAsyncLLMServerClient)
     client._session_servers = OrderedDict()
-    client._inflight_routing_sessions = {"request": "session"}
-    assert await client._acquire_server("request", prompt_ids=[1, 2]) == ("worker", handle)
+    token = _REQUEST_PROGRAM.set("session")
+    try:
+        server_id, wrapper = await client._acquire_server("request", prompt_ids=[1, 2])
+    finally:
+        _REQUEST_PROGRAM.reset(token)
+    assert (server_id, wrapper.handle) == ("worker", handle)
     acquire.assert_awaited_once_with("request", prompt_ids=[1, 2])
     assert client._session_servers["session"]["worker"] is handle
+
+
+@pytest.mark.asyncio
+async def test_concurrent_siblings_record_their_own_frontends_under_one_routing_key(monkeypatch):
+    from collections import OrderedDict
+
+    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient
+
+    from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
+
+    handles = [object(), object()]
+    keys = []
+
+    async def acquire(self, request_id, **kwargs):
+        index = len(keys)
+        keys.append(request_id)
+        await asyncio.sleep(0)
+        return f"worker-{index}", handles[index]
+
+    async def generate(self, request_id, **kwargs):
+        await self._acquire_server(request_id)
+        await asyncio.sleep(0)
+        return TokenOutput(token_ids=[1])
+
+    monkeypatch.setattr(FullyAsyncLLMServerClient, "_acquire_server", acquire)
+    monkeypatch.setattr(FullyAsyncLLMServerClient, "generate", generate)
+    client = object.__new__(DynamoFullyAsyncLLMServerClient)
+    client._session_servers = OrderedDict()
+    client._session_routing_keys = OrderedDict()
+    client._auto_finalize = False
+    await asyncio.gather(
+        client.generate("rollout", thunderagent_session_id="rollout/agent/a"),
+        client.generate("rollout", thunderagent_session_id="rollout/agent/b"),
+    )
+    assert keys == ["rollout", "rollout"]
+    assert client._session_servers == {
+        "rollout/agent/a": {"worker-0": handles[0]},
+        "rollout/agent/b": {"worker-1": handles[1]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_ray_generation_cancellation_is_acknowledged_before_cleanup():
+    import ray
+    from recipe.dynamo.dynamo_agent_loop import _await_or_cancel
+
+    @ray.remote
+    class Probe:
+        def __init__(self):
+            self.started = self.stopped = False
+
+        async def generate(self):
+            self.started = True
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0.02)
+                self.stopped = True
+
+        async def state(self):
+            return self.started, self.stopped
+
+    owns_ray = not ray.is_initialized()
+    if owns_ray:
+        ray.init(num_cpus=1, include_dashboard=False, log_to_driver=False)
+    probe = Probe.remote()
+    try:
+        task = asyncio.create_task(_await_or_cancel(probe.generate.remote()))
+        for _ in range(500):
+            if (await probe.state.remote())[0]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("Ray generation did not start")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert await probe.state.remote() == (True, True)
+    finally:
+        ray.kill(probe)
+        if owns_ray:
+            ray.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_multi_frontend_cleanup_waits_for_every_release_before_reporting_pause():
+    from collections import OrderedDict
+
+    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient, GenerationPaused
+
+    client = object.__new__(DynamoFullyAsyncLLMServerClient)
+    client._session_servers = OrderedDict({"program": {"paused": "paused", "running": "running"}})
+    client._session_routing_keys = OrderedDict({"program": "rollout"})
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def finalize(handle, session_id):
+        if handle == "paused":
+            raise GenerationPaused(session_id)
+        started.set()
+        await finish.wait()
+
+    client._finalize_on_handle = finalize
+    closing = asyncio.create_task(client.finalize_program("program"))
+    await started.wait()
+    await asyncio.sleep(0)
+    assert not closing.done()
+    finish.set()
+    with pytest.raises(GenerationPaused):
+        await closing
+    assert "program" in client._session_servers

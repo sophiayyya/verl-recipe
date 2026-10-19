@@ -171,12 +171,87 @@ for native verl vLLM. V1 supports ThunderAgent in `colocate_async` and
 `separate_async`. ThunderAgent GPU validation covers vLLM; SGLang routing
 validation is still pending.
 
-For current multi-turn Uni-Agent, use the
+For the historical Python ThunderAgent/vLLM 0.24 experiment, use the
 [dedicated launcher](run_uniagent_thunderagent_vllm024.sh). Its recipe Gateway
 adapter releases ThunderAgent programs on session completion or abort, with
 bounded retries and timeouts. Uni-Agent source changes are unnecessary. Keep
-model calls serial within a session; independent sessions run concurrently.
+model calls serial within a program; independent programs run concurrently.
 See the [guide](THUNDERAGENT_VLLM024.md) for the version pins and cleanup scope.
+
+### Claude Code with Rust ThunderAgent
+
+Use verl v0.9.1 and a Dynamo build with Rust ThunderAgent from
+[PR #15164](https://github.com/ai-dynamo/dynamo/pull/15164)
+(the GPU experiments used commit `b1429b8bf67a47f4657fb716b2fab369c172f5e5`).
+Install the Uni-Agent [PR #270](https://github.com/verl-project/uni-agent/pull/270)
+revision pinned in [requirements-uniagent.txt](requirements-uniagent.txt), with
+training and runtime dependencies installed separately:
+
+```bash
+python -m pip install --no-deps -r recipe/dynamo/requirements-uniagent.txt
+export VERL_USE_EXTERNAL_MODULES=recipe.dynamo.register
+```
+
+Remove stale `UNIAGENT_ROOT` or `PYTHONPATH` overrides, or point them at the same
+Uni-Agent revision. Merge the following into the training configuration, keeping
+your existing model, data, optimizer, reward and sandbox settings:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    name: dynamo
+    agent:
+      agent_loop_manager_class: recipe.dynamo.uniagent_native_gateway.NativeClaudeRolloutAdapter
+    engine_kwargs:
+      dynamo:
+        engine: sglang  # vllm is also supported
+        router_mode: kv
+        thunderagent:
+          enabled: true
+          implementation: native
+          auto_finalize: false
+          finalize_timeout_s: 60
+    custom:
+      agent_framework:
+        agent_runners:
+          task:
+            runner_fqn: uni_agent.framework.task_runner.run_task
+            trajectory_selection: all
+```
+
+`trajectory_selection: all` trains on every retained agent chain; use `longest`
+to follow the upstream [Claude Code RL example](https://uni-agent.readthedocs.io/en/latest/quickstart/rl-training.html#case-2-claude-code-rl).
+In the Uni-Agent task YAML, enable subagents:
+
+```yaml
+agent:
+  name: claude_code
+  enable_subagents: true
+```
+
+Subagent use still depends on the model. To release a subagent's TA program when
+it stops, optionally place [claude_lifecycle_hook.py](claude_lifecycle_hook.py) in
+the sandbox and add this to the task's `agent` configuration. Merge with an
+existing `--settings` argument rather than passing it twice:
+
+```yaml
+  extra_args:
+    - --settings
+    - >-
+      {"hooks":{"SubagentStop":[{"hooks":[{"type":"command","command":"python /opt/dynamo-hooks/claude_lifecycle_hook.py","timeout":600}]}]}}
+```
+
+For Docker, append these entries to `sandbox.sandbox_kwargs.run_args`:
+
+```yaml
+  - -v
+  - /absolute/worker/path/claude_lifecycle_hook.py:/opt/dynamo-hooks/claude_lifecycle_hook.py:ro
+```
+
+The source file must exist on every Docker host; other sandbox providers can
+include it in the image. The hook derives its endpoint from `ANTHROPIC_BASE_URL`;
+`DYNAMO_AGENT_EVENT_URL` optionally overrides it. Without the hook, programs are
+released when the rollout is finalized or aborted.
 
 ## Results
 
