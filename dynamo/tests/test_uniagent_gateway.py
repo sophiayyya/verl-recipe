@@ -548,6 +548,42 @@ async def test_a_subagent_turn_on_the_responses_route_is_a_program_too(make_acto
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/main"]
 
 
+@pytest.mark.asyncio
+async def test_a_release_given_up_is_retried_after_the_next_release_and_at_shutdown(make_actor):
+    actor, backend = make_actor()
+    actor._deferred_poll = 0
+    router_down = {"a"}
+
+    async def finalize(program_id):
+        if program_id in router_down:
+            raise RuntimeError("unreachable")
+
+    backend.finalize_program.side_effect = finalize
+    await create(actor, "a")
+    await generate(actor, "a")
+    await actor.finalize_session("a")  # 3 attempts at close + 6 in the background, then given up
+    await actor._deferred_flush
+    assert actor._unreleased == {"a"} and not actor._deferred
+    # a later program that is first paused, then released, gives "a" a fresh budget
+    router_down.clear()
+    await create(actor, "b")
+    await generate(actor, "b")
+    backend.finalize_program.side_effect = [GenerationPaused("b"), None, None]
+    await actor.finalize_session("b")
+    await actor._deferred_flush
+    assert not actor._unreleased and not actor._deferred
+    assert [call.args[0] for call in backend.finalize_program.await_args_list][-3:] == ["b", "b", "a"]
+    # shutdown tries the given-up programs once more
+    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * 9 + [None]
+    await create(actor, "c")
+    await generate(actor, "c")
+    await actor.finalize_session("c")
+    await actor._deferred_flush
+    assert actor._unreleased == {"c"}
+    await actor.shutdown()
+    assert not actor._unreleased
+
+
 async def session_with_two_subagents(actor, backend):
     """A root turn and two subagent turns, all mid-chain (their last turn called a tool)."""
     backend.stop_reason = "tool_calls"

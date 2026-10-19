@@ -203,7 +203,8 @@ them itself ([agent_identity.py](agent_identity.py)), with Uni-Agent unmodified:
   subagents when it takes its next turn, and the rest of the tree, children
   first, at session close; a turn still in flight at close is cancelled through
   to the frontend first. A turn for a program whose release is in flight waits
-  for it and then owns the program again.
+  for it and then owns the program again. A release that gives up after its
+  retries is kept and retried after the next successful release and at shutdown.
   All three request dialects (Chat Completions, Responses, Anthropic Messages)
   go through this lifecycle; the final answer is read from the finish reason of
   the first and the last.

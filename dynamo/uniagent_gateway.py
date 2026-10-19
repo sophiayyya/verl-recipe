@@ -171,6 +171,8 @@ class _DynamoGatewayActor(_GatewayActor):
         self._deferred_flush = None
         # program -> event set when its release in flight ends; a new turn for that program waits for it.
         self._releasing = {}
+        # programs whose release gave up after its retries; retried after the next successful release and at shutdown.
+        self._unreleased = set()
         self._closing = {}
         self._closed = OrderedDict()
 
@@ -193,6 +195,7 @@ class _DynamoGatewayActor(_GatewayActor):
             while (release := self._releasing.get(program_id)) is not None:
                 await release.wait()
             self._deferred.pop(program_id, None)  # a resumed program is released by its own path
+            self._unreleased.discard(program_id)
             self._programs.setdefault(session_id, {}).setdefault(program_id, parent_program_id)
             try:
                 await self._release_returned_children(session_id, program_id)
@@ -241,6 +244,7 @@ class _DynamoGatewayActor(_GatewayActor):
             left = self._deferred.get(program_id, self._deferred_retries) - 1
             if left <= 0:
                 self._deferred.pop(program_id, None)
+                self._unreleased.add(program_id)
                 logger.warning("ThunderAgent program leaked: release gave up after retries: program=%s", program_id)
                 return
             logger.warning("ThunderAgent program release retried in the background: program=%s", program_id)
@@ -275,6 +279,10 @@ class _DynamoGatewayActor(_GatewayActor):
                 if not released:
                     break  # still paused
                 self._deferred.pop(program_id, None)
+                # the router is releasing again: the programs given up earlier get a fresh budget
+                for given_up in self._unreleased:
+                    self._deferred.setdefault(given_up, self._deferred_retries)
+                self._unreleased.clear()
 
     async def _release_returned_children(self, session_id, program_id):
         """Release the idle children of a program taking a new turn (it blocked until they returned).
@@ -402,8 +410,17 @@ class _DynamoGatewayActor(_GatewayActor):
         finally:
             if self._deferred_flush is not None:
                 self._deferred_flush.cancel()
-            if self._deferred:
-                logger.warning("%d ThunderAgent program release(s) still deferred at shutdown", len(self._deferred))
+            for program_id in list(self._unreleased):
+                try:
+                    await self._release_program(program_id)
+                    self._unreleased.discard(program_id)
+                except Exception:
+                    pass  # logged by _release_program
+            if self._deferred or self._unreleased:
+                logger.warning(
+                    "%d ThunderAgent program release(s) still deferred and %d given up at shutdown",
+                    len(self._deferred), len(self._unreleased),
+                )
             await super().shutdown()
 
 
