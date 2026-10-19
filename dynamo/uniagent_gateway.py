@@ -84,12 +84,18 @@ SUBAGENT_PROGRAMS = ("tree", "isolated", "off")
 
 
 def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, str | None]:
-    """The program a turn belongs to and its parent: the trajectory's request id, extended by the agent id
-    when the turn names one, so programs are unique per trajectory and read as their session in the router."""
+    """The program a turn belongs to and its parent: the trajectory's request id, then ``main`` or
+    ``agent/<agent id>``, so programs are unique per trajectory and read as their session in the router.
+    A subagent that does not name its parent belongs to the main agent."""
     if identity is None:
         return session_id, None
-    parent = identity.parent_session_id
-    return f"{session_id}/{identity.session_id}", None if parent is None else f"{session_id}/{parent}"
+
+    def program(agent_id):
+        return f"{session_id}/main" if agent_id is None else f"{session_id}/agent/{agent_id}"
+
+    if identity.agent_id is None:
+        return program(None), None
+    return program(identity.agent_id), program(identity.parent_agent_id)
 
 
 def _routed_program(session_id: str, identity: AgentIdentity | None, mode: str) -> tuple[str, str | None]:
@@ -173,7 +179,7 @@ class _DynamoGatewayActor(_GatewayActor):
             raise ValueError("Use a fresh session ID for every trajectory")
         return await super().create_session(session_id, **kwargs)
 
-    async def _handle_request(self, handler, session_id, payload):
+    async def _handle_request(self, handler, session_id, payload, **kwargs):
         if session_id in self._closing or session_id in self._closed:
             raise HTTPException(status_code=409, detail="Session is closing")
         # off: one program per session, released at close
@@ -196,7 +202,7 @@ class _DynamoGatewayActor(_GatewayActor):
             except Exception:
                 pass  # logged by _release_program; the child stays in the tree for the close path
             # own task: a cancelled HTTP waiter must not abandon it; closing the session cancels it
-            request = asyncio.create_task(handler(session_id=session_id, payload=payload))
+            request = asyncio.create_task(handler(session_id=session_id, payload=payload, **kwargs))
             inflight[program_id] = request
             response = await _wait_for_cleanup(request)
             if parent_program_id is not None:
@@ -207,11 +213,12 @@ class _DynamoGatewayActor(_GatewayActor):
             if not inflight:
                 self._requests.pop(session_id, None)
 
-    async def _handle_openai_chat_completions(self, *, session_id, payload):
-        return await self._handle_request(super()._handle_openai_chat_completions, session_id, payload)
+    # **kwargs: a Gateway that parses the identity itself passes it as agent_context
+    async def _handle_openai_chat_completions(self, *, session_id, payload, **kwargs):
+        return await self._handle_request(super()._handle_openai_chat_completions, session_id, payload, **kwargs)
 
-    async def _handle_anthropic_messages(self, *, session_id, payload):
-        return await self._handle_request(super()._handle_anthropic_messages, session_id, payload)
+    async def _handle_anthropic_messages(self, *, session_id, payload, **kwargs):
+        return await self._handle_request(super()._handle_anthropic_messages, session_id, payload, **kwargs)
 
     async def _release_program(self, program_id):
         for attempt in range(self._finalize_attempts):
