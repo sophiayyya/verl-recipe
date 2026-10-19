@@ -296,6 +296,16 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         if released is False:
             raise GenerationPaused(session_id)
 
+    async def _finalize_on_handles(self, handles, session_id: str) -> None:
+        """Finalize on every handle and only then report: a frontend that pauses or fails must not hide
+        another frontend's final request still running. A pause wins over other failures."""
+        results = await asyncio.gather(
+            *[self._finalize_on_handle(handle, session_id) for handle in handles], return_exceptions=True
+        )
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise next((error for error in errors if isinstance(error, GenerationPaused)), errors[0])
+
     async def _through_pause(self, finalize):
         """Run one finalize, polling through a generation pause for up to finalize_timeout_s."""
         deadline = asyncio.get_running_loop().time() + self._finalize_timeout_s
@@ -325,7 +335,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         session_id = str(session_id)
         served = self._session_servers.get(session_id)
         if served:
-            await asyncio.gather(*[self._finalize_on_handle(handle, session_id) for handle in dict(served).values()])
+            await self._finalize_on_handles(list(dict(served).values()), session_id)
             self._drop_session(session_id)
             return
         if routing_key is None:
@@ -339,7 +349,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
                 self._load_balancer.release_server.remote(server_id=server_id)
             self._drop_session(session_id)
             return
-        await asyncio.gather(*[self._finalize_on_handle(handle, session_id) for handle in self._dynamo_server_handles])
+        await self._finalize_on_handles(self._dynamo_server_handles, session_id)
         self._drop_session(session_id)
 
     def _raise_if_leak_threshold(self) -> None:

@@ -1014,6 +1014,36 @@ async def test_cross_pool_retry_finalizes_all_served_frontends() -> None:
 
 
 @pytest.mark.asyncio
+async def test_finalize_waits_for_every_frontend_before_reporting_a_pause() -> None:
+    # One frontend answers "paused" at once; the other's final request is still running. Reporting
+    # before it ends would let a release be retried while that final is in flight.
+    paused, slow = _FakeServer(), _FakeServer()
+    paused.finalize_program = SimpleNamespace(remote=lambda **_kwargs: _ready(False))
+    gate = asyncio.Event()
+
+    async def slow_finalize(session_id):
+        await gate.wait()
+        slow.finalize_calls.append(session_id)
+
+    slow.finalize_program = SimpleNamespace(remote=slow_finalize)
+    client = _make_fully_async_client(_FakeLoadBalancer(slow), [slow])
+    client._record_served_server("s1", "a", paused)
+    client._record_served_server("s1", "b", slow)
+
+    finalize = asyncio.create_task(client.finalize_program("s1"))
+    await asyncio.sleep(0.01)
+    assert not finalize.done()
+    gate.set()
+    with pytest.raises(GenerationPaused):
+        await finalize
+    assert slow.finalize_calls == ["s1"]
+
+
+async def _ready(value):
+    return value
+
+
+@pytest.mark.asyncio
 async def test_unconfirmed_served_frontend_counts_individual_leak() -> None:
     # One of the served frontends never acks its finalize: that program is a
     # permanent frontend-local leak (broadcasting to OTHER frontends cannot
