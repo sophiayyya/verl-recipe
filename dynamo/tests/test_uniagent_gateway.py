@@ -485,6 +485,49 @@ async def test_a_turn_for_a_program_being_released_waits_for_the_release(make_ac
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-a"]
 
 
+@pytest.mark.asyncio
+async def test_a_resumed_program_waits_for_its_own_release_only(make_actor):
+    # The background flusher serves every deferred program; a program it has already released must
+    # not wait for the loop to finish with the others, which may stay paused for a long time.
+    actor, backend = make_actor()
+    actor._deferred_poll = 0
+    gate, unrelated_paused = asyncio.Event(), True
+    attempts = {}
+
+    async def finalize(program_id):
+        attempts[program_id] = attempts.get(program_id, 0) + 1
+        if program_id == "unrelated":
+            if unrelated_paused:
+                raise GenerationPaused(program_id)
+            return
+        if attempts[program_id] == 1:
+            raise GenerationPaused(program_id)
+        await gate.wait()
+
+    backend.finalize_program.side_effect = finalize
+    backend.stop_reason = "tool_calls"
+    await create(actor)
+    await post(actor, "session", ROOT)
+    backend.stop_reason = "completed"
+    await post(actor, "session", subagent("sub-a"), "task a")  # release pauses: deferred
+    await settled(actor)
+    await create(actor, "unrelated")
+    await generate(actor, "unrelated")
+    await actor.finalize_session("unrelated")  # also deferred, and never releasable in this test
+    assert list(actor._deferred) == ["session/agent/sub-a", "unrelated"]
+    while attempts.get("session/agent/sub-a") != 2:  # the flusher is mid-release of sub-a
+        await asyncio.sleep(0)
+    resumed = asyncio.create_task(post(actor, "session", subagent("sub-a"), "task a, resumed"))
+    await asyncio.sleep(0.01)
+    assert not resumed.done()
+    gate.set()
+    assert (await asyncio.wait_for(resumed, 1)).status_code == 200
+    assert list(actor._deferred) == ["unrelated"]
+    unrelated_paused = False
+    await actor._deferred_flush
+    await actor.finalize_session("session")
+
+
 async def session_with_two_subagents(actor, backend):
     """A root turn and two subagent turns, all mid-chain (their last turn called a tool)."""
     backend.stop_reason = "tool_calls"
