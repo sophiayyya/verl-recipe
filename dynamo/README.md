@@ -204,6 +204,9 @@ them itself ([agent_identity.py](agent_identity.py)), with Uni-Agent unmodified:
   first, at session close; a turn still in flight at close is cancelled through
   to the frontend first. A turn for a program whose release is in flight waits
   for it and then owns the program again.
+  All three request dialects (Chat Completions, Responses, Anthropic Messages)
+  go through this lifecycle; the final answer is read from the finish reason of
+  the first and the last.
 
 A final answer is taken as the end of the agent: this holds for foreground
 subagents, which Uni-Agent enforces (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`

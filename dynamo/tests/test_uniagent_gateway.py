@@ -528,6 +528,26 @@ async def test_a_resumed_program_waits_for_its_own_release_only(make_actor):
     await actor.finalize_session("session")
 
 
+@pytest.mark.asyncio
+async def test_a_subagent_turn_on_the_responses_route_is_a_program_too(make_actor):
+    if not hasattr(_GatewayActor, "_handle_openai_responses"):
+        pytest.skip("this Uni-Agent has no Responses route")
+    actor, backend = make_actor()
+    await create(actor)
+    backend.stop_reason = "tool_calls"
+    await post(actor, "session", ROOT)
+    transport = httpx.ASGITransport(app=actor._app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
+        response = await client.post(
+            "/sessions/session/v1/responses", json={"model": "test", "input": "task a"}, headers=subagent("sub-a")
+        )
+    assert response.status_code == 200, response.text
+    assert backend.programs[-1] == ("session/agent/sub-a", "session/main")
+    assert "session/agent/sub-a" in actor._programs["session"]
+    await actor.finalize_session("session")
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/main"]
+
+
 async def session_with_two_subagents(actor, backend):
     """A root turn and two subagent turns, all mid-chain (their last turn called a tool)."""
     backend.stop_reason = "tool_calls"

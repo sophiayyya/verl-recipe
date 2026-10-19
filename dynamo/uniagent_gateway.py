@@ -217,6 +217,9 @@ class _DynamoGatewayActor(_GatewayActor):
     async def _handle_anthropic_messages(self, *, session_id, payload, **kwargs):
         return await self._handle_request(super()._handle_anthropic_messages, session_id, payload, **kwargs)
 
+    async def _handle_openai_responses(self, *, session_id, payload, **kwargs):
+        return await self._handle_request(super()._handle_openai_responses, session_id, payload, **kwargs)
+
     async def _release_program(self, program_id):
         for attempt in range(self._finalize_attempts):
             try:
