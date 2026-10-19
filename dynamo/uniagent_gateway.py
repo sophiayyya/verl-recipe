@@ -161,6 +161,8 @@ class _DynamoGatewayActor(_GatewayActor):
         # program -> retries left for releases deferred by a pause or a failure.
         self._deferred = {}
         self._deferred_flush = None
+        # program -> its release in flight; a new turn for that program waits for it, then owns the program.
+        self._releasing = {}
         self._closing = {}
         self._closed = OrderedDict()
 
@@ -180,6 +182,12 @@ class _DynamoGatewayActor(_GatewayActor):
             raise HTTPException(status_code=409, detail="Dynamo Gateway requires serial calls within one program")
         inflight[program_id] = asyncio.current_task()
         try:
+            while (release := self._releasing.get(program_id)) is not None:
+                try:
+                    await asyncio.shield(release)
+                except Exception:
+                    pass  # logged by _release_program; the program is back in the tree
+            self._deferred.pop(program_id, None)  # a resumed program is released by its own path
             self._programs.setdefault(session_id, {}).setdefault(program_id, parent_program_id)
             try:
                 await self._release_returned_children(session_id, program_id)
@@ -238,11 +246,14 @@ class _DynamoGatewayActor(_GatewayActor):
         while self._deferred:
             await asyncio.sleep(self._deferred_poll)
             for program_id in list(self._deferred):
+                self._releasing[program_id] = asyncio.current_task()
                 try:
                     released = await self._release_program(program_id)
                 except Exception:
                     self._defer_release(program_id, failed=True)
                     continue
+                finally:
+                    self._releasing.pop(program_id, None)
                 if not released:
                     break  # still paused
                 self._deferred.pop(program_id, None)
@@ -287,12 +298,15 @@ class _DynamoGatewayActor(_GatewayActor):
         if program_id not in tree:
             return  # another release path took it out first and owns it
         parent = tree.pop(program_id)
+        self._releasing[program_id] = asyncio.current_task()
         try:
             await self._release_returned_children(session_id, program_id)
             await self._release_program(program_id)
         except BaseException:
             tree[program_id] = parent
             raise
+        finally:
+            self._releasing.pop(program_id, None)
 
     def _session_programs(self, session_id):
         """Every program the session created, children before the root that dispatched them."""

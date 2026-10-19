@@ -459,6 +459,32 @@ async def test_a_subagent_is_released_the_moment_its_final_answer_is_produced(ma
     assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-b", "run-1"]
 
 
+@pytest.mark.asyncio
+async def test_a_turn_for_a_program_being_released_waits_for_the_release(make_actor):
+    # A finalization in flight and a new generation for the same program must not overlap.
+    actor, backend = make_actor()
+    await create(actor)
+    backend.stop_reason = "tool_calls"
+    await post(actor, "session", ROOT)
+    finalizing, release = asyncio.Event(), asyncio.Event()
+
+    async def finalize(program_id):
+        finalizing.set()
+        await release.wait()
+
+    backend.finalize_program.side_effect = finalize
+    backend.stop_reason = "completed"
+    await post(actor, "session", subagent("sub-a"), "task a")
+    await finalizing.wait()
+    resumed = asyncio.create_task(post(actor, "session", subagent("sub-a"), "task a, resumed"))
+    await asyncio.sleep(0.01)
+    assert not resumed.done() and len(backend.ids) == 2
+    release.set()
+    assert (await resumed).status_code == 200 and len(backend.ids) == 3
+    await settled(actor)
+    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["sub-a", "sub-a"]
+
+
 async def session_with_two_subagents(actor, backend):
     """A root turn and two subagent turns, all mid-chain (their last turn called a tool)."""
     backend.stop_reason = "tool_calls"

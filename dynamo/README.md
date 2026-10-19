@@ -200,10 +200,19 @@ them itself ([agent_identity.py](agent_identity.py)), with Uni-Agent unmodified:
 - a subagent is released when its final answer is produced, a dispatcher's idle
   subagents when it takes its next turn, and the rest of the tree, children
   first, at session close; a turn still in flight at close is cancelled through
-  to the frontend first.
+  to the frontend first. A turn for a program whose release is in flight waits
+  for it and then owns the program again.
 
-Subagents are off by default in the Uni-Agent Claude Code recipe; enable them
-in the Task Config with `agent.enable_subagents: true`.
+A final answer is taken as the end of the agent: this holds for foreground
+subagents, which Uni-Agent enforces (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`
+in the Claude Code launcher); a background subagent could still be running a
+tool when its program is released. Subagents are off by default in the
+Uni-Agent Claude Code recipe; enable them in the Task Config with
+`agent.enable_subagents: true`. The Gateway coalesces identical in-flight
+requests of one session into one generation
+(`agent_framework.coalesce_reserved_exact_requests`, default true), which
+sibling subagents dispatched with the same prompt will hit; set it to `false`
+when they must be independent samples.
 
 ## Results
 
