@@ -25,6 +25,7 @@ import asyncio
 import logging
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -41,13 +42,26 @@ from .thunderagent import program_scope as bind_program
 
 logger = logging.getLogger(__name__)
 
+_REQUEST_PROGRAM: ContextVar[str | None] = ContextVar("dynamo_client_program", default=None)
+
 
 async def _await_or_cancel(ref):
-    """Await an actor task; a cancelled awaiter cancels the task on the actor too."""
+    """Cancel the remote operation and wait until its cleanup has settled."""
+    pending = asyncio.ensure_future(ref)
     try:
-        return await ref
+        return await asyncio.shield(pending)
     except asyncio.CancelledError:
-        ray.cancel(ref)
+        if isinstance(ref, ray.ObjectRef):
+            ray.cancel(ref, force=False)
+        else:
+            pending.cancel()
+        while not pending.done():
+            try:
+                await asyncio.shield(pending)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not pending.cancelled():
+            pending.exception()
         raise
 
 
@@ -103,7 +117,9 @@ class DynamoServerManager:
             yield
 
     async def _finalize_program(self, session_id: str) -> None:
-        await self.server.finalize_program.remote(session_id=session_id)
+        released = await _await_or_cancel(self.server.finalize_program.remote(session_id=session_id))
+        if released is False:
+            raise GenerationPaused(session_id)
 
     async def generate(
         self,
@@ -228,9 +244,6 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend. ProgramTables are frontend-local; cleanup must reach each
         # server that ever admitted the session.
         self._session_servers: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # OUTER routing key -> programs in flight under it, so _acquire_server can
-        # credit each acquired server to every one of them (concurrent subagent turns).
-        self._inflight_routing_sessions: dict[str, list[str]] = {}
 
     _SESSION_ROUTING_CACHE_MAX = 65536
 
@@ -262,7 +275,10 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # frontend is a cheap no-op) is what lets finalize reach frontends the
         # LB has since removed or re-routed away from.
         server_id, handle = await super()._acquire_server(request_id, **extra)
-        for session_id in self._inflight_routing_sessions.get(str(request_id), ()):
+        # Siblings share a routing key, but only this task's program visited
+        # the acquired frontend. Keep retry attribution local to the task.
+        session_id = _REQUEST_PROGRAM.get()
+        if session_id is not None:
             self._record_served_server(session_id, server_id, handle)
         return server_id, _CancellingHandle(handle)
 
@@ -275,14 +291,11 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # explicitly passed session_id — remember it so both auto and manual
         # finalize route with the key the requests actually used.
         self._remember_routing_key(session_id, str(request_id))
-        inflight = self._inflight_routing_sessions.setdefault(str(request_id), [])
-        inflight.append(session_id)
+        token = _REQUEST_PROGRAM.set(session_id)
         try:
             return await super().generate(request_id, **kwargs)
         finally:
-            inflight.remove(session_id)
-            if not inflight:
-                self._inflight_routing_sessions.pop(str(request_id), None)
+            _REQUEST_PROGRAM.reset(token)
             if self._auto_finalize:
                 await self._finalize_with_recovery(session_id, routing_key=str(request_id))
 
@@ -290,7 +303,7 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
         # Bounded: a hung frontend must not park the trajectory for request_timeout_s.
         # A paused frontend answers False at once instead of parking the final request.
         released = await asyncio.wait_for(
-            handle.finalize_program.remote(session_id=session_id),
+            _await_or_cancel(handle.finalize_program.remote(session_id=session_id)),
             timeout=self._finalize_timeout_s,
         )
         if released is False:
@@ -298,13 +311,14 @@ class DynamoFullyAsyncLLMServerClient(FullyAsyncLLMServerClient):
 
     async def _finalize_on_handles(self, handles, session_id: str) -> None:
         """Finalize on every handle and only then report: a frontend that pauses or fails must not hide
-        another frontend's final request still running. A pause wins over other failures."""
+        another frontend's final request still running. Transport errors must consume the retry
+        budget even when another frontend is paused."""
         results = await asyncio.gather(
             *[self._finalize_on_handle(handle, session_id) for handle in handles], return_exceptions=True
         )
         errors = [result for result in results if isinstance(result, BaseException)]
         if errors:
-            raise next((error for error in errors if isinstance(error, GenerationPaused)), errors[0])
+            raise next((error for error in errors if not isinstance(error, GenerationPaused)), errors[0])
 
     async def _through_pause(self, finalize):
         """Run one finalize, polling through a generation pause for up to finalize_timeout_s."""

@@ -1,132 +1,86 @@
-"""ThunderAgent program lifecycle for the unmodified Uni-Agent Gateway API.
+"""Dynamo program lifecycle over Uni-Agent's agent-aware Gateway.
 
-Select DynamoAgentFrameworkRolloutAdapter through agent_loop_manager_class. A session is one
-trajectory but may be a tree of programs (Claude Code subagents): the Gateway terminates the identity
-headers, so this module reads them, names each turn's program and releases the tree, subagents first,
-when the session closes. Model calls are serial within a program; programs run concurrently.
+Uni-Agent owns header parsing, chain isolation and trajectory metadata. This
+module maps AgentContext to TA programs and coordinates generation and cleanup.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections import OrderedDict
-from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from urllib.parse import quote
 
 import ray
-from fastapi import HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import HTTPException, Request
 from omegaconf import OmegaConf
-from starlette.datastructures import Headers
 from uni_agent.framework.entry import AgentFrameworkRolloutAdapter, AgentFrameworkWorker
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import GatewayActor, _GatewayActor
 from uni_agent.gateway.manager import GatewayManager
+from uni_agent.gateway.session.types import AgentContext
 
 from verl.utils.config import omega_conf_to_dataclass
 
-from .agent_identity import AgentIdentity, agent_identity_from_headers
 from .dynamo_agent_loop import GenerationPaused
 
 logger = logging.getLogger(__name__)
 
-# The identity the current request announced, visible down to the backend call.
-_REQUEST_IDENTITY: ContextVar[AgentIdentity | None] = ContextVar("dynamo_gateway_agent_identity", default=None)
-
-
-class _AgentIdentityMiddleware:
-    """Bind each request's agent identity headers to its task (pure ASGI: same task as the route)."""
-
-    def __init__(self, app):
-        self._app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http":
-            return await self._app(scope, receive, send)
-        token = _REQUEST_IDENTITY.set(agent_identity_from_headers(Headers(scope=scope)))
-        try:
-            return await self._app(scope, receive, send)
-        finally:
-            _REQUEST_IDENTITY.reset(token)
-
-
-# The last finish reason a response carries, in either dialect; streams repeat it per chunk.
-_FINISH_REASON = re.compile(r'"(?:finish_reason|stop_reason)":\s*"([a-z_]+)"')
-
-
-def _turn_returned(body: bytes) -> bool:
-    """True when the turn ended with ``stop`` / ``end_turn``: the agent's final answer, for a subagent the
-    moment the Agent tool returns it. Tool calls, truncation and unknown reasons are not a return."""
-    reasons = _FINISH_REASON.findall(body.decode("utf-8", "replace"))
-    return bool(reasons) and reasons[-1] in ("stop", "end_turn")
-
-
-def _observe_body(response, on_complete):
-    """Call ``on_complete(body)`` with the response body once it has been produced."""
-    if isinstance(response, StreamingResponse):
-        inner = response.body_iterator
-
-        async def tee():
-            chunks = []
-            async for chunk in inner:
-                chunks.append(chunk if isinstance(chunk, bytes) else chunk.encode())
-                yield chunk
-            on_complete(b"".join(chunks))
-
-        response.body_iterator = tee()
-    else:
-        on_complete(response.body)
-
-
-# How agent identities become programs; ``tree`` is the design, the other two are benchmark ablations.
 SUBAGENT_PROGRAMS = ("tree", "isolated", "off")
 
 
-def _program_of(session_id: str, identity: AgentIdentity | None) -> tuple[str, str | None]:
-    """The program a turn belongs to and its parent: the trajectory's request id, then ``main`` or
-    ``agent/<agent id>``, so programs are unique per trajectory and read as their session in the router.
-    A subagent that does not name its parent belongs to the main agent."""
-    if identity is None:
-        return session_id, None
+def _program_ids(rollout_id: str, context: AgentContext | None) -> tuple[str, str | None]:
+    if context is None:
+        return rollout_id, None
 
     def program(agent_id):
-        return f"{session_id}/main" if agent_id is None else f"{session_id}/agent/{agent_id}"
+        return f"{rollout_id}/main" if agent_id is None else f"{rollout_id}/agent/{quote(agent_id, safe='')}"
 
-    if identity.agent_id is None:
-        return program(None), None
-    return program(identity.agent_id), program(identity.parent_agent_id)
+    agent = context["agent_id"]
+    parent = context["parent_agent_id"]
+    # Claude omits the parent header for direct children of the main session.
+    if parent == context["session_id"]:
+        parent = None
+    return program(agent), program(parent) if agent is not None else None
 
 
-def _routed_program(session_id: str, identity: AgentIdentity | None, mode: str) -> tuple[str, str | None]:
-    """``tree``: the program and its parent; ``isolated``: the program alone; ``off``: the request id
-    (every agent's turns in one program, as before the recipe knew about subagents)."""
-    if mode == "off":
-        return session_id, None
-    program_id, parent_program_id = _program_of(session_id, identity)
-    return program_id, (parent_program_id if mode == "tree" else None)
+@dataclass
+class _Program:
+    program_id: str
+    parent_id: str | None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    active: bool = False
+    generation: int = 0
+    cleanup_error: Exception | None = None
+    release: asyncio.Task | None = None
 
 
 class _ProgramClient:
-    """The session's view of the client: a program per agent identity, with the session id kept as
-    the routing key so a whole tree reaches one frontend."""
+    supports_agent_context = True
 
-    def __init__(self, client, subagent_programs="tree"):
-        self._client = client
-        self._subagent_programs = subagent_programs
+    def __init__(self, actor, client):
+        self.actor, self.client = actor, client
 
-    async def generate(self, request_id, **kwargs):
-        program_id, parent_program_id = _routed_program(request_id, _REQUEST_IDENTITY.get(), self._subagent_programs)
-        return await self._client.generate(
-            request_id, program_id=program_id, parent_program_id=parent_program_id, **kwargs
+    async def generate(self, request_id, *, agent_context=None, **kwargs):
+        program = self.actor._program(request_id, agent_context)
+        program.active = True  # A failed/cancelled call may already have reached the frontend.
+        program.generation += 1
+        if getattr(self.client, "supports_agent_context", False) is True and agent_context is not None:
+            kwargs["agent_context"] = agent_context
+        return await self.client.generate(
+            request_id=request_id,
+            program_id=program.program_id,
+            parent_program_id=program.parent_id if self.actor._subagent_programs == "tree" else None,
+            **kwargs,
         )
 
     async def finalize_program(self, program_id):
-        await self._client.finalize_program(program_id)
+        return await self.client.finalize_program(program_id)
 
 
 async def _wait_for_cleanup(task):
-    """Finish cleanup even if the waiter is cancelled repeatedly; then propagate."""
+    """Keep an owned operation alive across cancellation of its HTTP/Ray waiter."""
     cancelled = False
     while not task.done():
         try:
@@ -140,258 +94,284 @@ async def _wait_for_cleanup(task):
 
 
 class _DynamoGatewayActor(_GatewayActor):
-    """Close the gateway session and every ThunderAgent program it created together."""
-
     _finalize_attempts = 3
     _finalize_timeout = 60.0
     _retry_delay = 0.2
     _drain_timeout = 60.0
     _deferred_poll = 1.0
-    _deferred_retries = 3
+    _deferred_attempts = 3
 
     def __init__(self, config, backend, subagent_programs="tree"):
+        if subagent_programs not in SUBAGENT_PROGRAMS:
+            raise ValueError(f"thunderagent.subagent_programs must be one of {SUBAGENT_PROGRAMS}")
+        self._subagent_programs = subagent_programs
         if not callable(getattr(backend, "finalize_program", None)):
             raise ValueError("Dynamo Gateway requires a client with finalize_program")
         if getattr(backend, "_auto_finalize", True):
             raise ValueError("Dynamo Gateway requires thunderagent.auto_finalize=false")
-        if subagent_programs not in SUBAGENT_PROGRAMS:
-            raise ValueError(
-                f"thunderagent.subagent_programs must be one of {SUBAGENT_PROGRAMS}, got {subagent_programs!r}"
-            )
-        self._subagent_programs = subagent_programs
-        super().__init__(config, _ProgramClient(backend, subagent_programs))
-        self._app.add_middleware(_AgentIdentityMiddleware)
+        super().__init__(
+            replace(config, rollout_backend=config.rollout_backend or "vllm"), _ProgramClient(self, backend)
+        )
         self._requests = {}
-        # session -> {program: parent}, in creation order; a child is created after its parent.
         self._programs = {}
-        # session -> releases of returned subagents still in flight.
-        self._releases = {}
-        # program -> retries left for releases deferred by a pause or a failure.
+        self._identities = {}
+        self._hook_events = {}
+        self._closing = {}
+        self._close_requested = set()
+        self._abort_requested = set()
+        self._closed = OrderedDict()
         self._deferred = {}
         self._deferred_flush = None
-        # program -> event set when its release in flight ends; a new turn for that program waits for it.
-        self._releasing = {}
-        # programs whose release gave up after its retries; retried after the next successful release and at shutdown.
-        self._unreleased = set()
-        self._closing = {}
-        self._closed = OrderedDict()
+        self._shutting_down = False
+
+    def _register_routes(self):
+        super()._register_routes()
+
+        @self._app.post("/sessions/{session_id}/agent_events")
+        async def agent_event(session_id: str, request: Request):
+            return await self.handle_agent_event(session_id, await request.json())
 
     async def create_session(self, session_id, **kwargs):
-        if session_id in self._closing or session_id in self._closed:
-            raise ValueError("Use a fresh session ID for every trajectory")
+        if session_id in self._close_requested or session_id in self._closed or session_id in self._programs:
+            raise ValueError("Use a fresh session ID for every rollout")
         return await super().create_session(session_id, **kwargs)
 
-    async def _handle_request(self, handler, session_id, payload, **kwargs):
-        if session_id in self._closing or session_id in self._closed:
-            raise HTTPException(status_code=409, detail="Session is closing")
-        # off: one program per session, released at close
-        identity = None if self._subagent_programs == "off" else _REQUEST_IDENTITY.get()
-        program_id, parent_program_id = _program_of(session_id, identity)
-        inflight = self._requests.setdefault(session_id, {})
-        if program_id in inflight:
-            raise HTTPException(status_code=409, detail="Dynamo Gateway requires serial calls within one program")
-        inflight[program_id] = asyncio.current_task()
+    def _program(self, session_id, context):
+        # Names deliberately omit the harness session: enforce one harness per rollout.
+        identity = (context["provider"], context["session_id"]) if context else None
+        if session_id in self._identities and self._identities[session_id] != identity:
+            raise HTTPException(409, "Agent identity source changed within the rollout")
+        self._identities[session_id] = identity
+        program_id, parent_id = _program_ids(session_id, None if self._subagent_programs == "off" else context)
+        programs = self._programs.setdefault(session_id, {})
+        program = programs.get(program_id)
+        if program is None:
+            ancestor = parent_id
+            while ancestor is not None:
+                if ancestor == program_id:
+                    raise HTTPException(409, "Agent parent relationship contains a cycle")
+                ancestor = programs[ancestor].parent_id if ancestor in programs else None
+            program = programs[program_id] = _Program(program_id, parent_id)
+        elif program.parent_id != parent_id:
+            raise HTTPException(409, "Agent parent changed within the rollout")
+        return program
+
+    async def _handle_request(self, handler, session_id, payload, agent_context=None):
+        if session_id in self._close_requested or session_id in self._closed:
+            raise HTTPException(409, "Rollout is closing")
+        self._get_session(session_id)
+        program = self._program(session_id, agent_context)
+
+        async def generate():
+            async with program.lock:
+                if program.cleanup_error is not None:
+                    raise HTTPException(503, "Program cleanup is unconfirmed; retry cleanup before resuming")
+                # A resumed agent supersedes a deferred stop from its previous turn.
+                self._deferred.pop((session_id, program.program_id), None)
+                return await handler(session_id=session_id, payload=payload, agent_context=agent_context)
+
+        request = asyncio.create_task(generate())
+        pending = self._requests.setdefault(session_id, set())
+        pending.add(request)
         try:
-            while (release := self._releasing.get(program_id)) is not None:
-                await release.wait()
-            self._deferred.pop(program_id, None)  # a resumed program is released by its own path
-            self._unreleased.discard(program_id)
-            self._programs.setdefault(session_id, {}).setdefault(program_id, parent_program_id)
-            try:
-                await self._release_returned_children(session_id, program_id)
-            except Exception:
-                pass  # logged by _release_program; the child stays in the tree for the close path
-            # own task: a cancelled HTTP waiter must not abandon it; closing the session cancels it
-            request = asyncio.create_task(handler(session_id=session_id, payload=payload, **kwargs))
-            inflight[program_id] = request
-            response = await _wait_for_cleanup(request)
-            if parent_program_id is not None:
-                _observe_body(response, lambda body: self._release_if_returned(session_id, program_id, body))
-            return response
+            return await _wait_for_cleanup(request)
         finally:
-            inflight.pop(program_id, None)
-            if not inflight:
+            pending.discard(request)
+            if not pending:
                 self._requests.pop(session_id, None)
 
-    # **kwargs: a Gateway that parses the identity itself passes it as agent_context
-    async def _handle_openai_chat_completions(self, *, session_id, payload, **kwargs):
-        return await self._handle_request(super()._handle_openai_chat_completions, session_id, payload, **kwargs)
+    async def _handle_openai_chat_completions(self, *, session_id, payload, agent_context=None):
+        return await self._handle_request(super()._handle_openai_chat_completions, session_id, payload, agent_context)
 
-    async def _handle_anthropic_messages(self, *, session_id, payload, **kwargs):
-        return await self._handle_request(super()._handle_anthropic_messages, session_id, payload, **kwargs)
+    async def _handle_openai_responses(self, *, session_id, payload, agent_context=None):
+        return await self._handle_request(super()._handle_openai_responses, session_id, payload, agent_context)
 
-    async def _handle_openai_responses(self, *, session_id, payload, **kwargs):
-        return await self._handle_request(super()._handle_openai_responses, session_id, payload, **kwargs)
+    async def _handle_anthropic_messages(self, *, session_id, payload, agent_context=None):
+        return await self._handle_request(super()._handle_anthropic_messages, session_id, payload, agent_context)
 
     async def _release_program(self, program_id):
         for attempt in range(self._finalize_attempts):
             try:
-                await asyncio.wait_for(self._backend.finalize_program(program_id), self._finalize_timeout)
-                logger.info("ThunderAgent program finalized: program=%s", program_id)
+                released = await asyncio.wait_for(self._backend.finalize_program(program_id), self._finalize_timeout)
+                if released is False:
+                    raise GenerationPaused(program_id)
                 return True
             except GenerationPaused:
-                # engines paused by abort_all_requests: hand the trajectories back, release after resume
-                self._defer_release(program_id)
                 return False
             except Exception:
                 if attempt + 1 == self._finalize_attempts:
-                    logger.exception("ThunderAgent program cleanup failed: program=%s", program_id)
+                    logger.exception("ThunderAgent cleanup failed: program=%s", program_id)
                     raise
                 await asyncio.sleep(self._retry_delay * 2**attempt)
 
-    def _defer_release(self, program_id, *, failed=False):
-        if failed:
-            left = self._deferred.get(program_id, self._deferred_retries) - 1
-            if left <= 0:
-                self._deferred.pop(program_id, None)
-                self._unreleased.add(program_id)
-                logger.warning("ThunderAgent program leaked: release gave up after retries: program=%s", program_id)
-                return
-            logger.warning("ThunderAgent program release retried in the background: program=%s", program_id)
-            self._deferred[program_id] = left
-        elif program_id not in self._deferred:
-            logger.info("ThunderAgent program release deferred until generation resumes: program=%s", program_id)
-            self._deferred[program_id] = self._deferred_retries
-        if self._deferred_flush is None or self._deferred_flush.done():
+    def _defer(self, session_id, program):
+        key = (session_id, program.program_id)
+        if key not in self._deferred or self._deferred[key][0] != program.generation:
+            self._deferred[key] = (program.generation, self._deferred_attempts)
+        if not self._shutting_down and (self._deferred_flush is None or self._deferred_flush.done()):
             self._deferred_flush = asyncio.create_task(self._flush_deferred())
 
-    def _release_begins(self, program_id):
-        self._releasing[program_id] = ended = asyncio.Event()
-        return ended
+    async def _close_program(self, session_id, program, expected_generation=None):
+        async def release():
+            async with program.lock:
+                if expected_generation is not None and program.generation != expected_generation:
+                    return
+                if not program.active:
+                    return
+                try:
+                    if not await self._release_program(program.program_id):
+                        self._defer(session_id, program)
+                        return
+                except Exception as error:
+                    program.cleanup_error = error
+                    raise
+                program.active = False
+                program.cleanup_error = None
+                self._deferred.pop((session_id, program.program_id), None)
+                logger.info("ThunderAgent program finalized: program=%s", program.program_id)
 
-    def _release_ends(self, program_id, ended):
-        ended.set()
-        if self._releasing.get(program_id) is ended:
-            del self._releasing[program_id]
+        # Keep the shared lock until the RPC really settles, even if a close waiter
+        # times out. A retry joins that release instead of racing a resumed turn.
+        if program.release is None or program.release.done():
+            program.release = asyncio.create_task(release())
+            program.release.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+        timeout = self._finalize_timeout * self._finalize_attempts + self._retry_delay * 2**self._finalize_attempts + 1
+        await asyncio.wait_for(asyncio.shield(program.release), max(timeout, 0.01))
+        if expected_generation is None and program.active and (session_id, program.program_id) not in self._deferred:
+            # A joined hook release may have become stale while it waited for
+            # the lock. Rollout close still owes cleanup of the latest turn.
+            await self._close_program(session_id, program)
 
     async def _flush_deferred(self):
-        while self._deferred:
+        while any(left > 0 for _, left in self._deferred.values()):
             await asyncio.sleep(self._deferred_poll)
-            for program_id in list(self._deferred):
-                ended = self._release_begins(program_id)
-                try:
-                    released = await self._release_program(program_id)
-                except Exception:
-                    self._defer_release(program_id, failed=True)
+            for key, (generation, left) in list(self._deferred.items()):
+                if left <= 0 or self._deferred.get(key) != (generation, left):
                     continue
-                finally:
-                    self._release_ends(program_id, ended)
-                if not released:
-                    break  # still paused
-                self._deferred.pop(program_id, None)
-                # the router is releasing again: the programs given up earlier get a fresh budget
-                for given_up in self._unreleased:
-                    self._deferred.setdefault(given_up, self._deferred_retries)
-                self._unreleased.clear()
+                session_id, program_id = key
+                program = self._programs.get(session_id, {}).get(program_id)
+                if program is None or program.generation != generation:
+                    self._deferred.pop(key, None)
+                    continue
+                try:
+                    await self._close_program(session_id, program, generation)
+                except Exception:
+                    if self._deferred.get(key) == (generation, left):
+                        self._deferred[key] = (generation, left - 1)
+                    logger.exception("Deferred TA cleanup failed; retries_left=%s program=%s", left - 1, program_id)
+                self._forget_released_programs(session_id)
 
-    async def _release_returned_children(self, session_id, program_id):
-        """Release the idle children of a program taking a new turn (it blocked until they returned).
-        A child still mid-request is kept. Every child is attempted; the first failure is raised last."""
-        tree = self._programs.get(session_id, {})
-        failures = []
-        for child in [child for child, parent in tree.items() if parent == program_id]:
-            # re-checked per child: a release yields, and another path may have taken it
-            if child not in tree or child in self._requests.get(session_id, {}):
-                continue
+    def _forget_released_programs(self, session_id):
+        if session_id not in self._sessions and not any(p.active for p in self._programs.get(session_id, {}).values()):
+            self._programs.pop(session_id, None)
+
+    async def handle_agent_event(self, session_id, payload):
+        if session_id in self._closed:
+            return {"status": "closed"}
+        if session_id in self._close_requested:
+            return {"status": "closing"}
+        self._get_session(session_id)
+        name = payload.get("hook_event_name")
+        if name not in ("SubagentStart", "SubagentStop", "SessionEnd"):
+            raise HTTPException(400, "Unsupported lifecycle event")
+        identity = self._identities.get(session_id)
+        root = payload.get("session_id")
+        if not root or (identity is not None and identity != ("claude_code", root)):
+            raise HTTPException(409, "Lifecycle event belongs to another Claude session")
+        events = self._hook_events.setdefault(session_id, {})
+        event_id = payload.get("event_id")
+        previous = events.get(event_id) if event_id else None
+        if previous is not None and previous[1]:
+            return {"status": "duplicate"}
+        generation = None
+        if name == "SubagentStop" and self._subagent_programs != "off":
+            agent = payload.get("agent_id")
+            if not isinstance(agent, str) or not agent:
+                raise HTTPException(400, "SubagentStop requires agent_id")
+            program = self._programs.get(session_id, {}).get(f"{session_id}/agent/{quote(agent, safe='')}")
+            if program is not None:
+                generation = previous[0] if previous is not None else program.generation
+                if event_id:
+                    events[event_id] = (generation, False)
+                await self._close_program(session_id, program, generation)
+        if event_id:
+            events[event_id] = (generation, True)
+        return {"status": "ok"}
+
+    async def _release_session_programs(self, session_id):
+        programs = self._programs.get(session_id, {})
+
+        def depth(program):
+            level, parent = 0, program.parent_id
+            while parent in programs:
+                level, parent = level + 1, programs[parent].parent_id
+            return level
+
+        for program in sorted(programs.values(), key=depth, reverse=True):
             try:
-                await self._release_tree_member(session_id, child)
-            except Exception as error:
-                failures.append(error)
-        if failures:
-            raise failures[0]
-
-    def _release_if_returned(self, session_id, program_id, body):
-        """Release a subagent as soon as its final answer is produced."""
-        if not _turn_returned(body):
-            return
-        task = asyncio.create_task(self._release_subagent(session_id, program_id))
-        pending = self._releases.setdefault(session_id, set())
-        pending.add(task)
-        task.add_done_callback(pending.discard)
-
-    async def _release_subagent(self, session_id, program_id):
-        if program_id not in self._programs.get(session_id, {}) or program_id in self._requests.get(session_id, {}):
-            return
-        try:
-            await self._release_tree_member(session_id, program_id)
-        except Exception:
-            return  # logged by _release_program; the close path retries it
-
-    async def _release_tree_member(self, session_id, program_id):
-        """Release a program and its idle children. It leaves the tree before the await, so no other
-        path finalizes it twice; a failed or cancelled release puts it back for the close path."""
-        tree = self._programs.get(session_id, {})
-        if program_id not in tree:
-            return  # another release path took it out first and owns it
-        parent = tree.pop(program_id)
-        ended = self._release_begins(program_id)
-        try:
-            await self._release_returned_children(session_id, program_id)
-            await self._release_program(program_id)
-        except BaseException:
-            tree[program_id] = parent
-            raise
-        finally:
-            self._release_ends(program_id, ended)
-
-    def _session_programs(self, session_id):
-        """Every program the session created, children before the root that dispatched them."""
-        programs = list(self._programs.get(session_id, {}))
-        return list(reversed(programs)) if programs else [session_id]
-
-    async def _close_session(self, session_id, abort):
-        requests = list(self._requests.get(session_id, {}).values())
-        if requests:
-            pending = set(requests)
-            if not abort:
-                # The agent has exited; a turn that is still finishing is drained briefly.
-                _, pending = await asyncio.wait(requests, timeout=self._drain_timeout)
-            if pending:
-                # nobody will consume these turns; cancelling reaches the frontend, which rolls them back
-                for request in pending:
-                    request.cancel()
-                logger.warning("Session %s closed with %d turn(s) in flight; cancelled", session_id, len(pending))
-                _, pending = await asyncio.wait(pending, timeout=self._drain_timeout)
-            if pending:
-                self._closing.pop(session_id, None)  # a later close retries once the turn has ended
-                raise TimeoutError(f"Session {session_id} still has an active generation; program was not released")
-        if pending := self._releases.pop(session_id, None):
-            await asyncio.gather(*pending, return_exceptions=True)
-        # The same actor owns the client's served-frontend records. A driver
-        # copy of the client would not know every frontend visited on retries.
-        # a failed release must not strand the rest of the tree or fail the close (the
-        # trajectories are complete); it is retried in the background
-        for program_id in self._session_programs(session_id):
-            try:
-                await self._release_program(program_id)
+                await self._close_program(session_id, program)
             except Exception:
-                self._defer_release(program_id, failed=True)  # logged by _release_program
-        self._programs.pop(session_id, None)
-        if abort:
+                # Generation has drained: keep completed training samples while
+                # cleanup retries independently, including explicit later closes.
+                self._defer(session_id, program)
+                logger.exception("Deferring unconfirmed TA cleanup: program=%s", program.program_id)
+
+    async def _close_session(self, session_id):
+        pending = set(self._requests.get(session_id, ()))
+        if pending and session_id not in self._abort_requested:
+            _, pending = await asyncio.wait(pending, timeout=self._drain_timeout)
+        if pending:
+            for request in pending:
+                request.cancel()
+            _, pending = await asyncio.wait(pending, timeout=self._drain_timeout)
+        if pending:
+            raise TimeoutError(f"Rollout {session_id} still has an active generation; program was not released")
+        # Cleanup failure must not send the framework down its abort path and
+        # discard completed trajectories. Keep failed programs for later retries.
+        await self._release_session_programs(session_id)
+        if session_id in self._abort_requested:
             await super().abort_session(session_id)
             result = None
         else:
             result = await super().finalize_session(session_id)
+            result.sort(key=lambda t: (t.extra_fields.get("agent_context") or {}).get("agent_id") is None)
         self._closed[session_id] = result
-        self._closed.move_to_end(session_id)
         while len(self._closed) > 64:
             self._closed.popitem(last=False)
-        self._closing.pop(session_id, None)
+        self._forget_released_programs(session_id)
+        self._identities.pop(session_id, None)
+        self._hook_events.pop(session_id, None)
+        self._close_requested.discard(session_id)
+        self._abort_requested.discard(session_id)
         return result
 
     async def _finish(self, session_id, *, abort):
         if session_id in self._closed:
+            await self._release_session_programs(session_id)
+            self._forget_released_programs(session_id)
             return None if abort else self._closed[session_id]
-        if session_id not in self._sessions and session_id not in self._closing:
+        if session_id not in self._sessions:
+            if session_id in self._programs:
+                await self._release_session_programs(session_id)
+                self._forget_released_programs(session_id)
             if abort:
                 return None
             raise KeyError(session_id)
+        self._close_requested.add(session_id)
+        if abort:
+            self._abort_requested.add(session_id)
+            for request in self._requests.get(session_id, ()):
+                request.cancel()
         task = self._closing.get(session_id)
-        if task is None:
-            task = asyncio.create_task(self._close_session(session_id, abort))
+        if task is None or task.done():
+            task = asyncio.create_task(self._close_session(session_id))
             self._closing[session_id] = task
-        # Reuse the task and its bounded retry budget, including failures.
-        return await _wait_for_cleanup(task)
+        try:
+            result = await _wait_for_cleanup(task)
+            return None if abort else result
+        finally:
+            if task.done() and self._closing.get(session_id) is task:
+                self._closing.pop(session_id, None)
 
     async def finalize_session(self, session_id):
         return await self._finish(session_id, abort=False)
@@ -399,28 +379,31 @@ class _DynamoGatewayActor(_GatewayActor):
     async def abort_session(self, session_id):
         await self._finish(session_id, abort=True)
 
+    async def get_cleanup_state(self):
+        """Actor-level counters remain available after rollout sessions close."""
+        programs = [program for tree in self._programs.values() for program in tree.values()]
+        return {
+            "active_programs": sum(program.active for program in programs),
+            "pending_cleanup": len(self._deferred),
+            "exhausted_cleanup": sum(left == 0 for _, left in self._deferred.values()),
+            "running_releases": sum(program.release is not None and not program.release.done() for program in programs),
+        }
+
     async def shutdown(self):
+        self._shutting_down = True
+        if self._deferred_flush is not None:
+            self._deferred_flush.cancel()
+            await asyncio.gather(self._deferred_flush, return_exceptions=True)
         try:
             results = await asyncio.gather(
-                *(self.abort_session(session_id) for session_id in tuple(self._sessions)), return_exceptions=True
+                *(self.abort_session(sid) for sid in set(self._sessions) | set(self._programs)), return_exceptions=True
             )
             for result in results:
                 if isinstance(result, BaseException):
                     raise result
+            if any(program.active for programs in self._programs.values() for program in programs.values()):
+                raise RuntimeError("Shutdown left unconfirmed ThunderAgent programs")
         finally:
-            if self._deferred_flush is not None:
-                self._deferred_flush.cancel()
-            for program_id in list(self._unreleased):
-                try:
-                    await self._release_program(program_id)
-                    self._unreleased.discard(program_id)
-                except Exception:
-                    pass  # logged by _release_program
-            if self._deferred or self._unreleased:
-                logger.warning(
-                    "%d ThunderAgent program release(s) still deferred and %d given up at shutdown",
-                    len(self._deferred), len(self._unreleased),
-                )
             await super().shutdown()
 
 

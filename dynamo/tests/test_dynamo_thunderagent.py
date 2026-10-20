@@ -16,11 +16,12 @@ import asyncio
 import importlib.metadata
 import inspect
 import json
+import socket
 import subprocess
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -44,6 +45,54 @@ from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
 RECIPE_ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_ROOT = RECIPE_ROOT.parent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("port_occupied", [False, True])
+async def test_control_port_reserved_before_engine_start(monkeypatch, port_occupied):
+    import zmq
+    from recipe.dynamo import _dynamo_vllm_with_control as control
+
+    reservation = socket.socket()
+    reservation.bind(("127.0.0.1", 0))
+    port = reservation.getsockname()[1]
+    if not port_occupied:
+        reservation.close()
+    monkeypatch.setenv("VERL_DYNAMO_CONTROL_ZMQ", f"tcp://127.0.0.1:{port}")
+    monkeypatch.setitem(control._engine_holder, "engine", None)
+    calls = []
+
+    def capture():
+        # Simulate a TP worker allocating a port during synchronous engine init.
+        with socket.socket() as competitor, pytest.raises(OSError):
+            competitor.bind(("127.0.0.1", port))
+        calls.append("capture")
+
+    async def worker():
+        calls.append("worker")
+
+    main = ModuleType("dynamo.vllm.main")
+    main.worker = worker
+    vllm = ModuleType("dynamo.vllm")
+    vllm.main = main
+    dynamo = ModuleType("dynamo")
+    dynamo.vllm = vllm
+    for name, module in [("dynamo", dynamo), ("dynamo.vllm", vllm), ("dynamo.vllm.main", main)]:
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(control, "_install_engine_capture", capture)
+    try:
+        if port_occupied:
+            with pytest.raises(zmq.ZMQError):
+                await control._amain()
+            assert not calls
+        else:
+            await control._amain()
+            assert calls == ["capture", "worker"]
+    finally:
+        reservation.close()
+    # Cancellation while waiting for an engine must release the listener.
+    with socket.socket() as released:
+        released.bind(("127.0.0.1", port))
 
 
 def _make_http_server(thunderagent: dict | None = None) -> DynamoThunderAgentHttpServer:
@@ -557,6 +606,12 @@ async def test_shutdown_stops_frontend_then_thunderagent_then_base(monkeypatch) 
 
 def test_registered_replica_uses_thunderagent_server_class() -> None:
     assert DynamoThunderAgentReplica.__name__ == "DynamoThunderAgentReplica"
+
+
+def test_replica_honors_verl_configured_actor_concurrency() -> None:
+    replica = object.__new__(DynamoThunderAgentReplica)
+    replica.config = SimpleNamespace(ray_actor_max_concurrency=2048)
+    assert replica.max_concurrency == 2048
 
 
 def test_recipe_registry_loads_thunderagent_replica() -> None:
@@ -1389,10 +1444,8 @@ class _BlockingServer(_FakeServer):
 
 
 @pytest.mark.asyncio
-async def test_concurrent_sibling_turns_credit_every_program_in_flight() -> None:
-    # Siblings share the routing key, so the per-attempt acquire hook cannot
-    # tell them apart; every program in flight under the key is credited with
-    # the server, which is what lets a manual finalize reach each of them.
+async def test_concurrent_sibling_turns_keep_programs_and_shared_routing_key() -> None:
+    # Siblings retain separate programs while sharing the outer routing key.
     server = _BlockingServer()
     lb = _FakeLoadBalancer(server)
     client = _make_fully_async_client(lb, [server])
@@ -1406,7 +1459,6 @@ async def test_concurrent_sibling_turns_credit_every_program_in_flight() -> None
     ]
     while len(server.generate_calls) < 2:
         await asyncio.sleep(0)
-    assert client._inflight_routing_sessions == {"traj-1": ["sub-a", "sub-b"]}
     server.release.set()
     await asyncio.gather(*turns)
 
@@ -1416,7 +1468,6 @@ async def test_concurrent_sibling_turns_credit_every_program_in_flight() -> None
     ]
     assert lb.acquire_keys == ["traj-1", "traj-1"]  # the tree stays on the trajectory's frontend
     assert set(client._session_servers) == {"sub-a", "sub-b"}
-    assert client._inflight_routing_sessions == {}
     await client.finalize_program("sub-b")
     await client.finalize_program("sub-a")
     assert server.finalize_calls == ["sub-b", "sub-a"]

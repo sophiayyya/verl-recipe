@@ -2817,7 +2817,7 @@ class DynamoHttpServer:
             try:
                 output = await asyncio.wait_for(
                     self.generate(
-                        prompt_ids=self._fallback_token_ids(),
+                        prompt_ids=[0],
                         sampling_params={"max_tokens": 1, "logprobs": True, "temperature": 0.0},
                         request_id=probe_id,
                         thunderagent_session_id=probe_id,
@@ -3217,6 +3217,13 @@ class DynamoReplica(RolloutReplica):
 
     def _get_server_name_prefix(self) -> str:
         return "dynamo_"
+
+    @property
+    def max_concurrency(self) -> int:
+        # verl 0.10 moved the server actor limit from RolloutReplica to config.
+        if hasattr(self.config, "ray_actor_max_concurrency"):
+            return self.config.ray_actor_max_concurrency
+        return super().max_concurrency
 
     async def sleep(self):
         """Drain in-flight requests before the weight-offloading sleep.

@@ -1,21 +1,17 @@
-"""Exercise the unmodified Uni-Agent Gateway with the recipe lifecycle adapter.
+"""Exercise the pinned Uni-Agent Gateway with the recipe lifecycle adapter.
 
-Requires a Uni-Agent checkout and its verl submodule.
+Requires the Uni-Agent pin in dynamo/requirements-uniagent.txt and verl v0.9.1.
 """
 
 import asyncio
 import json
-import logging
 from unittest.mock import AsyncMock
 
-import httpx
 import pytest
 
 pytest.importorskip("uni_agent.gateway.gateway")
 
-from fastapi import HTTPException
-from recipe.dynamo.dynamo_agent_loop import GenerationPaused
-from recipe.dynamo.uniagent_gateway import DynamoAgentFrameworkRolloutAdapter, _DynamoGatewayActor, _turn_returned
+from recipe.dynamo.uniagent_gateway import DynamoAgentFrameworkRolloutAdapter, _DynamoGatewayActor
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.gateway import _GatewayActor
 
@@ -43,15 +39,11 @@ class Backend:
 
     def __init__(self):
         self.ids = []
-        self.programs = []
         self.finalize_program = AsyncMock()
-        # "tool_calls" keeps the agent's chain running; "completed" is its final answer.
-        self.stop_reason = "completed"
 
     async def generate(self, request_id, **kwargs):
         self.ids.append(request_id)
-        self.programs.append((kwargs.get("program_id"), kwargs.get("parent_program_id")))
-        return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason=self.stop_reason)
+        return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason="completed")
 
 
 @pytest.fixture
@@ -101,7 +93,6 @@ async def test_two_turns_share_program_and_cleanup_preserves_tokens(make_actor):
     backend.finalize_program.assert_not_awaited()
     trajectories = await actor.finalize_session("session")
     assert backend.ids == ["session", "session"]
-    assert backend.programs == [("session", None)] * 2  # no identity headers: the session is the program
     backend.finalize_program.assert_awaited_once_with("session")
     assert len(trajectories) == 1
     trajectory = trajectories[0]
@@ -127,65 +118,10 @@ async def test_transient_cleanup_failure_retries(make_actor):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("recovers", [True, False])
-async def test_a_failed_release_at_close_keeps_the_trajectories_and_is_retried_in_the_background(
-    make_actor, caplog, recovers
-):
-    # The trajectories are complete when the session closes; a router that cannot release the
-    # program must not cost them. The close spends its retry budget (3), then the flusher retries
-    # in the background: two more rounds of three before the program is given up as leaked.
-    actor, backend = make_actor()
-    actor._deferred_poll = 0
-    await create(actor)
-    await generate(actor)
-    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * (3 if recovers else 9) + [None]
-    with caplog.at_level(logging.WARNING):
-        assert len(await actor.finalize_session("session")) == 1
-        await actor._deferred_flush
-    assert "session" not in actor._sessions
-    assert not actor._deferred
-    assert backend.finalize_program.await_count == (4 if recovers else 9)
-    assert ("ThunderAgent program leaked" in caplog.text) is not recovers
-
-
-@pytest.mark.asyncio
-async def test_release_is_deferred_while_generation_is_paused(make_actor):
-    actor, backend = make_actor()
-    actor._deferred_poll = 0
-    await create(actor)
-    await generate(actor)
-    backend.finalize_program.side_effect = [GenerationPaused("session"), GenerationPaused("session"), None]
-    trajectories = await actor.finalize_session("session")
-    # The trajectories come back at once; the program waits for resume_generation.
-    assert len(trajectories) == 1
-    assert "session" not in actor._sessions
-    assert set(actor._deferred) == {"session"}
-    await actor._deferred_flush
-    assert not actor._deferred
-    assert backend.finalize_program.await_count == 3
-
-
-@pytest.mark.asyncio
-async def test_cleanup_timeout_is_bounded(make_actor):
-    actor, backend = make_actor()
-    actor._finalize_timeout = 0.01
-    await create(actor)
-
-    async def hang(_):
-        await asyncio.Future()
-
-    backend.finalize_program.side_effect = hang
-    await actor.finalize_session("session")
-    assert backend.finalize_program.await_count == 3
-    assert "session" not in actor._sessions
-    assert set(actor._deferred) == {"session"}  # retried in the background
-    actor._deferred_flush.cancel()
-
-
-@pytest.mark.asyncio
 async def test_repeated_waiter_cancellation_waits_for_cleanup(make_actor):
     actor, backend = make_actor()
     await create(actor)
+    await generate(actor)
     started, release = asyncio.Event(), asyncio.Event()
 
     async def finalize(_):
@@ -231,11 +167,16 @@ async def test_close_drains_or_cancels_the_complete_request(make_actor, abort):
     request = asyncio.create_task(generate(actor))
     await started.wait()
     task = asyncio.create_task((actor.abort_session if abort else actor.finalize_session)("session"))
-    await asyncio.sleep(0)
-    backend.finalize_program.assert_not_awaited()
-    assert not stopped.is_set()
-    release.set()
-    await task
+    if abort:
+        await asyncio.wait_for(task, 1)
+        assert stopped.is_set()
+        assert not release.is_set()
+    else:
+        await asyncio.sleep(0)
+        backend.finalize_program.assert_not_awaited()
+        assert not stopped.is_set()
+        release.set()
+        await task
     result = await asyncio.gather(request, return_exceptions=True)
     assert isinstance(result[0], asyncio.CancelledError) == abort
     assert not actor._sessions
@@ -243,518 +184,60 @@ async def test_close_drains_or_cancels_the_complete_request(make_actor, abort):
 
 
 @pytest.mark.asyncio
-async def test_finalize_cancels_a_parked_turn_and_releases_the_program(make_actor):
-    """A session whose agent exited mid-turn (timeout) must not leave its program behind."""
-    actor, backend = make_actor()
-    actor._drain_timeout = 0.01
-    await create(actor)
-    started, cancelled = asyncio.Event(), asyncio.Event()
-
-    async def parked(*args, **kwargs):
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
-
-    backend.generate = parked
-    request = asyncio.create_task(generate(actor))
-    await started.wait()
-    await actor.finalize_session("session")
-    assert cancelled.is_set()
-    backend.finalize_program.assert_awaited_once_with("session")
-    assert "session" not in actor._sessions
-    with pytest.raises(asyncio.CancelledError):
-        await request
-
-
-@pytest.mark.asyncio
-async def test_close_reports_failure_when_a_turn_survives_cancellation(make_actor):
+async def test_drain_timeout_keeps_live_program_and_allows_later_abort(make_actor):
     actor, backend = make_actor()
     actor._drain_timeout = 0.01
     await create(actor)
     started, release = asyncio.Event(), asyncio.Event()
 
-    async def unstoppable(*args, **kwargs):
+    async def uncooperative(**kwargs):
         started.set()
-        while True:
+        while not release.is_set():
             try:
                 await release.wait()
-                break
             except asyncio.CancelledError:
                 pass
         return TokenOutput(token_ids=[65], log_probs=[-0.1], stop_reason="completed")
 
-    backend.generate = unstoppable
+    backend.generate = uncooperative
     request = asyncio.create_task(generate(actor))
     await started.wait()
     with pytest.raises(TimeoutError, match="still has an active generation"):
         await actor.abort_session("session")
     backend.finalize_program.assert_not_awaited()
-    assert "session" in actor._sessions
-    # Once the turn does finish, closing again releases the program.
+    assert not request.done()
     release.set()
     await request
     await actor.abort_session("session")
     backend.finalize_program.assert_awaited_once_with("session")
-    assert "session" not in actor._sessions
+    assert not actor._sessions
 
 
 @pytest.mark.asyncio
-async def test_independent_sessions_run_concurrently_but_same_session_is_rejected(make_actor):
+async def test_independent_sessions_overlap_and_same_program_serializes(make_actor):
     actor, backend = make_actor()
-    await create(actor, "one")
-    await create(actor, "two")
+    for name in ("one", "two"):
+        await create(actor, name)
     started, release = asyncio.Event(), asyncio.Event()
     original = backend.generate
+    calls = []
 
     async def pending(*args, **kwargs):
+        calls.append(kwargs["request_id"])
         started.set()
         await release.wait()
         return await original(*args, **kwargs)
 
     backend.generate = pending
-    request = asyncio.create_task(generate(actor, "one"))
-    await started.wait()
-    with pytest.raises(HTTPException) as error:
-        await generate(actor, "one")
-    assert error.value.status_code == 409
-    second = asyncio.create_task(generate(actor, "two"))
-    await asyncio.sleep(0)
-    assert set(actor._requests) == {"one", "two"}
+    requests = [asyncio.create_task(generate(actor, name)) for name in ("one", "two", "one")]
+    while len(calls) < 2:
+        await asyncio.sleep(0)
+    assert calls == ["one", "two"]
     release.set()
-    await asyncio.gather(request, second)
+    await asyncio.gather(*requests)
+    assert calls == ["one", "two", "one"]
     await asyncio.gather(actor.finalize_session("one"), actor.finalize_session("two"))
     assert backend.finalize_program.await_count == 2
-
-
-async def post(actor, session, headers, content="question", stream=False):
-    """Drive the real HTTP route, so identity headers pass through the middleware."""
-    transport = httpx.ASGITransport(app=actor._app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
-        return await client.post(
-            f"/sessions/{session}/v1/chat/completions",
-            json={"model": "test", "messages": [{"role": "user", "content": content}], "stream": stream},
-            headers=headers,
-        )
-
-
-async def settled(actor):
-    """Let background releases of returned subagents finish."""
-    while any(actor._releases.values()):
-        await asyncio.sleep(0)
-
-
-ROOT = {"x-claude-code-session-id": "run-1"}
-
-
-def subagent(agent_id):
-    return {"x-claude-code-session-id": "run-1", "x-claude-code-agent-id": agent_id}
-
-
-@pytest.mark.asyncio
-async def test_claude_code_subagents_are_programs_of_their_own_and_run_in_parallel(make_actor):
-    # Claude Code names the run in x-claude-code-session-id and each subagent in
-    # x-claude-code-agent-id; the recipe derives the same tree Dynamo's frontend
-    # would. Two subagents of one session overlap, a second turn of the SAME
-    # program is still rejected, and the request id stays the routing key.
-    actor, backend = make_actor()
-    backend.stop_reason = "tool_calls"
-    await create(actor)
-    await post(actor, "session", ROOT)
-    started, release = asyncio.Event(), asyncio.Event()
-    original = backend.generate
-
-    async def pending(*args, **kwargs):
-        started.set()
-        await release.wait()
-        return await original(*args, **kwargs)
-
-    backend.generate = pending
-    first = asyncio.create_task(post(actor, "session", subagent("sub-a"), "task a"))
-    await started.wait()
-    second = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b"))
-    await asyncio.sleep(0)
-    assert set(actor._requests["session"]) == {"session/agent/sub-a", "session/agent/sub-b"}
-    assert (await post(actor, "session", subagent("sub-a"), "task a")).status_code == 409
-    release.set()
-    assert {r.status_code for r in await asyncio.gather(first, second)} == {200}
-    assert backend.ids == ["session"] * 3
-    assert backend.programs[0] == ("session/main", None)
-    assert sorted(backend.programs[1:]) == [("session/agent/sub-a", "session/main"), ("session/agent/sub-b", "session/main")]
-
-
-@pytest.mark.asyncio
-async def test_a_subagent_still_running_survives_the_dispatchers_turn_and_goes_at_close(make_actor):
-    actor, backend = make_actor()
-    backend.stop_reason = "tool_calls"
-    await create(actor)
-    await post(actor, "session", ROOT)
-    started, release = asyncio.Event(), asyncio.Event()
-    original = backend.generate
-
-    async def pending(*args, **kwargs):
-        if kwargs.get("program_id") == "session/agent/sub-b":
-            started.set()
-            await release.wait()
-        return await original(*args, **kwargs)
-
-    backend.generate = pending
-    await post(actor, "session", subagent("sub-a"), "task a")
-    background = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b"))
-    await started.wait()
-
-    await post(actor, "session", ROOT)  # sub-a returned, sub-b is mid-request
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a"]
-
-    release.set()
-    await background
-    await actor.finalize_session("session")
-    # Children before the root that dispatched them.
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-b", "session/main"]
-
-
-def test_turn_returned_reads_the_last_finish_reason_in_either_dialect():
-    openai_json = b'{"choices":[{"index":0,"finish_reason":"tool_calls"}]}'
-    anthropic_json = b'{"stop_reason": "end_turn", "stop_sequence": null}'
-    sse = (
-        b'data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}\n\n'
-        b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'
-    )
-    assert _turn_returned(openai_json) is False
-    assert _turn_returned(anthropic_json) is True
-    assert _turn_returned(sse) is True
-    assert _turn_returned(b'{"choices":[{"finish_reason":"length"}]}') is False
-    assert _turn_returned(b"{}") is False
-
-
-@pytest.mark.asyncio
-async def test_a_subagent_is_released_the_moment_its_final_answer_is_produced(make_actor):
-    # The dispatcher only continues once every subagent has returned; a subagent
-    # that already stopped calling tools would otherwise hold admission and
-    # resident KV while its siblings finish.
-    actor, backend = make_actor()
-    await create(actor)
-    backend.stop_reason = "tool_calls"
-    await post(actor, "session", ROOT)
-    await post(actor, "session", subagent("sub-a"), "task a")
-    await settled(actor)
-    backend.finalize_program.assert_not_awaited()
-
-    backend.stop_reason = "completed"
-    await post(actor, "session", subagent("sub-a"), "task a, done")
-    await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a"]
-    assert "session/agent/sub-a" not in actor._programs["session"]
-
-    # The streaming dialect carries the finish reason in its last chunk.
-    response = await post(actor, "session", subagent("sub-b"), "task b", stream=True)
-    assert response.status_code == 200 and b"[DONE]" in response.content
-    await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-b"]
-
-    await post(actor, "session", ROOT)
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-b", "session/main"]
-
-
-@pytest.mark.asyncio
-async def test_a_turn_for_a_program_being_released_waits_for_the_release(make_actor):
-    # A finalization in flight and a new generation for the same program must not overlap.
-    actor, backend = make_actor()
-    await create(actor)
-    backend.stop_reason = "tool_calls"
-    await post(actor, "session", ROOT)
-    finalizing, release = asyncio.Event(), asyncio.Event()
-
-    async def finalize(program_id):
-        finalizing.set()
-        await release.wait()
-
-    backend.finalize_program.side_effect = finalize
-    backend.stop_reason = "completed"
-    await post(actor, "session", subagent("sub-a"), "task a")
-    await finalizing.wait()
-    resumed = asyncio.create_task(post(actor, "session", subagent("sub-a"), "task a, resumed"))
-    await asyncio.sleep(0.01)
-    assert not resumed.done() and len(backend.ids) == 2
-    release.set()
-    assert (await resumed).status_code == 200 and len(backend.ids) == 3
-    await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-a"]
-
-
-@pytest.mark.asyncio
-async def test_a_resumed_program_waits_for_its_own_release_only(make_actor):
-    # The background flusher serves every deferred program; a program it has already released must
-    # not wait for the loop to finish with the others, which may stay paused for a long time.
-    actor, backend = make_actor()
-    actor._deferred_poll = 0
-    gate, unrelated_paused = asyncio.Event(), True
-    attempts = {}
-
-    async def finalize(program_id):
-        attempts[program_id] = attempts.get(program_id, 0) + 1
-        if program_id == "unrelated":
-            if unrelated_paused:
-                raise GenerationPaused(program_id)
-            return
-        if attempts[program_id] == 1:
-            raise GenerationPaused(program_id)
-        await gate.wait()
-
-    backend.finalize_program.side_effect = finalize
-    backend.stop_reason = "tool_calls"
-    await create(actor)
-    await post(actor, "session", ROOT)
-    backend.stop_reason = "completed"
-    await post(actor, "session", subagent("sub-a"), "task a")  # release pauses: deferred
-    await settled(actor)
-    await create(actor, "unrelated")
-    await generate(actor, "unrelated")
-    await actor.finalize_session("unrelated")  # also deferred, and never releasable in this test
-    assert list(actor._deferred) == ["session/agent/sub-a", "unrelated"]
-    while attempts.get("session/agent/sub-a") != 2:  # the flusher is mid-release of sub-a
-        await asyncio.sleep(0)
-    resumed = asyncio.create_task(post(actor, "session", subagent("sub-a"), "task a, resumed"))
-    await asyncio.sleep(0.01)
-    assert not resumed.done()
-    gate.set()
-    assert (await asyncio.wait_for(resumed, 1)).status_code == 200
-    assert list(actor._deferred) == ["unrelated"]
-    unrelated_paused = False
-    await actor._deferred_flush
-    await actor.finalize_session("session")
-
-
-@pytest.mark.asyncio
-async def test_a_subagent_turn_on_the_responses_route_is_a_program_too(make_actor):
-    if not hasattr(_GatewayActor, "_handle_openai_responses"):
-        pytest.skip("this Uni-Agent has no Responses route")
-    actor, backend = make_actor()
-    await create(actor)
-    backend.stop_reason = "tool_calls"
-    await post(actor, "session", ROOT)
-    transport = httpx.ASGITransport(app=actor._app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://gateway") as client:
-        response = await client.post(
-            "/sessions/session/v1/responses", json={"model": "test", "input": "task a"}, headers=subagent("sub-a")
-        )
-    assert response.status_code == 200, response.text
-    assert backend.programs[-1] == ("session/agent/sub-a", "session/main")
-    assert "session/agent/sub-a" in actor._programs["session"]
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/main"]
-
-
-@pytest.mark.asyncio
-async def test_a_release_given_up_is_retried_after_the_next_release_and_at_shutdown(make_actor):
-    actor, backend = make_actor()
-    actor._deferred_poll = 0
-    router_down = {"a"}
-
-    async def finalize(program_id):
-        if program_id in router_down:
-            raise RuntimeError("unreachable")
-
-    backend.finalize_program.side_effect = finalize
-    await create(actor, "a")
-    await generate(actor, "a")
-    await actor.finalize_session("a")  # 3 attempts at close + 6 in the background, then given up
-    await actor._deferred_flush
-    assert actor._unreleased == {"a"} and not actor._deferred
-    # a later program that is first paused, then released, gives "a" a fresh budget
-    router_down.clear()
-    await create(actor, "b")
-    await generate(actor, "b")
-    backend.finalize_program.side_effect = [GenerationPaused("b"), None, None]
-    await actor.finalize_session("b")
-    await actor._deferred_flush
-    assert not actor._unreleased and not actor._deferred
-    assert [call.args[0] for call in backend.finalize_program.await_args_list][-3:] == ["b", "b", "a"]
-    # shutdown tries the given-up programs once more
-    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * 9 + [None]
-    await create(actor, "c")
-    await generate(actor, "c")
-    await actor.finalize_session("c")
-    await actor._deferred_flush
-    assert actor._unreleased == {"c"}
-    await actor.shutdown()
-    assert not actor._unreleased
-
-
-async def session_with_two_subagents(actor, backend):
-    """A root turn and two subagent turns, all mid-chain (their last turn called a tool)."""
-    backend.stop_reason = "tool_calls"
-    await create(actor)
-    await post(actor, "session", ROOT)
-    await post(actor, "session", subagent("sub-a"), "task a")
-    await post(actor, "session", subagent("sub-b"), "task b")
-
-
-@pytest.mark.asyncio
-async def test_a_failed_release_at_close_still_releases_the_rest_of_the_tree(make_actor):
-    # An agent that exits mid-chain leaves the whole tree to the close path; one
-    # program the router cannot release must not strand its siblings and the root.
-    actor, backend = make_actor()
-    await session_with_two_subagents(actor, backend)
-
-    async def finalize(program):
-        if program == "session/agent/sub-b":
-            raise RuntimeError("unreachable")
-
-    backend.finalize_program.side_effect = finalize
-    actor._deferred_poll = 0.2  # the flusher's first retry lands after the close has finished
-    assert len(await actor.finalize_session("session")) == 3
-    # Children before the root, every program attempted, the retry budget not restarted.
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-b"] * 3 + ["session/agent/sub-a", "session/main"]
-    assert set(actor._deferred) == {"session/agent/sub-b"}
-    backend.finalize_program.side_effect = None
-    await actor._deferred_flush
-    assert not actor._deferred
-    assert [call.args[0] for call in backend.finalize_program.await_args_list][5:] == ["session/agent/sub-b"]
-
-
-@pytest.mark.asyncio
-async def test_a_failed_subagent_release_does_not_fail_the_dispatchers_turn(make_actor):
-    # The dispatcher's next turn releases its idle subagents first; one the router
-    # rejects stays in the tree for the close path instead of failing the turn.
-    actor, backend = make_actor()
-    await session_with_two_subagents(actor, backend)
-    unreachable = {"session/agent/sub-a"}
-
-    async def finalize(program):
-        if program in unreachable:
-            raise RuntimeError("unreachable")
-
-    backend.finalize_program.side_effect = finalize
-    assert (await post(actor, "session", ROOT)).status_code == 200
-    assert backend.ids == ["session"] * 4
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a"] * 3 + ["session/agent/sub-b"]
-
-    unreachable.clear()
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list][4:] == ["session/agent/sub-a", "session/main"]
-
-
-@pytest.mark.asyncio
-async def test_a_subagent_release_cancelled_by_abort_is_retried_at_close(make_actor):
-    # Aborting the session cancels the dispatcher's turn while it is still releasing
-    # a subagent; that subagent must go back to the tree, or nothing releases it.
-    actor, backend = make_actor()
-    await session_with_two_subagents(actor, backend)
-    stalled = asyncio.Event()
-
-    async def finalize(program):
-        if program == "session/agent/sub-a" and not stalled.is_set():
-            stalled.set()
-            await asyncio.Event().wait()  # the frontend has not answered yet
-
-    backend.finalize_program.side_effect = finalize
-    turn = asyncio.create_task(post(actor, "session", ROOT))
-    await stalled.wait()
-    await actor.abort_session("session")
-    await asyncio.gather(turn, return_exceptions=True)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-a", "session/agent/sub-b", "session/main"]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("sibling", ["resumed", "returned"])
-async def test_a_sibling_that_moves_on_during_a_release_is_left_to_its_own_path(make_actor, sibling):
-    # Idle subagents are released one at a time. While sub-a's release is pending,
-    # sub-b starts another turn (a background subagent) or returns and is released
-    # by its own path; the dispatcher must neither release a program mid-request
-    # nor fail on one that is already gone.
-    actor, backend = make_actor()
-    await session_with_two_subagents(actor, backend)
-    stalled, answer = asyncio.Event(), asyncio.Event()
-
-    async def finalize(program):
-        if program == "session/agent/sub-a":
-            stalled.set()
-            await answer.wait()
-
-    backend.finalize_program.side_effect = finalize
-    turn = asyncio.create_task(post(actor, "session", ROOT))
-    await stalled.wait()
-    if sibling == "resumed":
-        started, release = asyncio.Event(), asyncio.Event()
-        original = backend.generate
-
-        async def pending(*args, **kwargs):
-            if kwargs.get("program_id") == "session/agent/sub-b":
-                started.set()
-                await release.wait()
-            return await original(*args, **kwargs)
-
-        backend.generate = pending
-        background = asyncio.create_task(post(actor, "session", subagent("sub-b"), "task b, more"))
-        await started.wait()
-    else:
-        backend.stop_reason = "completed"
-        await post(actor, "session", subagent("sub-b"), "task b, done")
-        await settled(actor)
-    answer.set()
-    assert (await turn).status_code == 200
-    if sibling == "resumed":
-        assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a"]
-        release.set()
-        assert (await background).status_code == 200
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-b", "session/main"]
-
-
-def test_subagent_programs_must_be_a_known_mode(make_actor):
-    with pytest.raises(ValueError, match="subagent_programs"):
-        make_actor(subagent_programs="flat")
-
-
-@pytest.mark.asyncio
-async def test_subagent_programs_off_puts_every_agent_in_the_sessions_program(make_actor):
-    # The ablation baseline: identity headers are ignored, so the router sees one
-    # program per session and nothing is released before the session closes.
-    actor, backend = make_actor(subagent_programs="off")
-    await session_with_two_subagents(actor, backend)
-    assert backend.programs == [("session", None)] * 3
-    backend.stop_reason = "completed"
-    await post(actor, "session", subagent("sub-a"), "task a, done")
-    await settled(actor)
-    backend.finalize_program.assert_not_awaited()
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session"]
-
-
-@pytest.mark.asyncio
-async def test_subagent_programs_isolated_keeps_programs_and_releases_but_hides_the_parent(make_actor):
-    # Middle rung of the ablation: a program per agent, released on return as in tree
-    # mode, but the router is never told who dispatched it (no sibling co-location).
-    actor, backend = make_actor(subagent_programs="isolated")
-    await session_with_two_subagents(actor, backend)
-    assert backend.programs == [("session/main", None), ("session/agent/sub-a", None), ("session/agent/sub-b", None)]
-    backend.stop_reason = "completed"
-    await post(actor, "session", subagent("sub-a"), "task a, done")
-    await settled(actor)
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a"]
-    await actor.finalize_session("session")
-    assert [call.args[0] for call in backend.finalize_program.await_args_list] == ["session/agent/sub-a", "session/agent/sub-b", "session/main"]
-
-
-@pytest.mark.asyncio
-async def test_shutdown_attempts_all_sessions_even_if_one_cleanup_fails(make_actor):
-    actor, backend = make_actor()
-    for session in ["bad", "healthy"]:
-        await create(actor, session)
-
-    async def finalize(session):
-        if session == "bad":
-            raise RuntimeError("failed")
-
-    backend.finalize_program.side_effect = finalize
-    await actor.shutdown()
-    assert not actor._sessions
-    calls = [call.args[0] for call in backend.finalize_program.await_args_list]
-    assert calls.count("healthy") == 1 and calls.count("bad") == 3
 
 
 @pytest.mark.asyncio
@@ -777,7 +260,7 @@ async def test_anthropic_requests_share_the_lifecycle(make_actor):
 async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     from collections import OrderedDict
 
-    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient
+    from recipe.dynamo.dynamo_agent_loop import _REQUEST_PROGRAM, DynamoFullyAsyncLLMServerClient
 
     from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
@@ -786,37 +269,96 @@ async def test_new_verl_routing_fields_reach_parent_client(monkeypatch):
     monkeypatch.setattr(FullyAsyncLLMServerClient, "_acquire_server", acquire)
     client = object.__new__(DynamoFullyAsyncLLMServerClient)
     client._session_servers = OrderedDict()
-    client._inflight_routing_sessions = {"request": ["session"]}
-    server_id, acquired = await client._acquire_server("request", prompt_ids=[1, 2])
-    assert server_id == "worker" and acquired._handle is handle
+    token = _REQUEST_PROGRAM.set("session")
+    try:
+        server_id, wrapper = await client._acquire_server("request", prompt_ids=[1, 2])
+    finally:
+        _REQUEST_PROGRAM.reset(token)
+    assert (server_id, wrapper._handle) == ("worker", handle)
     acquire.assert_awaited_once_with("request", prompt_ids=[1, 2])
     assert client._session_servers["session"]["worker"] is handle
 
 
 @pytest.mark.asyncio
-async def test_cancelling_a_generate_awaiter_cancels_the_actor_task(monkeypatch):
-    from recipe.dynamo.dynamo_agent_loop import _CancellingHandle
+async def test_concurrent_siblings_record_their_own_frontends_under_one_routing_key(monkeypatch):
+    from collections import OrderedDict
 
-    ref = asyncio.get_running_loop().create_future()
-    cancelled = []
-    monkeypatch.setattr("recipe.dynamo.dynamo_agent_loop.ray.cancel", cancelled.append)
+    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient
 
-    class Method:
-        def remote(self, **kwargs):
-            return ref
+    from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient
 
-    class Handle:
-        generate = Method()
-        finalize_program = "forwarded"
+    handles = [object(), object()]
+    keys = []
 
-    handle = _CancellingHandle(Handle())
-    assert handle.finalize_program == "forwarded"
-    waiter = asyncio.create_task(handle.generate.remote(prompt_ids=[1]))
-    await asyncio.sleep(0)
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
-    assert cancelled == [ref]
+    async def acquire(self, request_id, **kwargs):
+        index = len(keys)
+        keys.append(request_id)
+        await asyncio.sleep(0)
+        return f"worker-{index}", handles[index]
+
+    async def generate(self, request_id, **kwargs):
+        await self._acquire_server(request_id)
+        await asyncio.sleep(0)
+        return TokenOutput(token_ids=[1])
+
+    monkeypatch.setattr(FullyAsyncLLMServerClient, "_acquire_server", acquire)
+    monkeypatch.setattr(FullyAsyncLLMServerClient, "generate", generate)
+    client = object.__new__(DynamoFullyAsyncLLMServerClient)
+    client._session_servers = OrderedDict()
+    client._session_routing_keys = OrderedDict()
+    client._auto_finalize = False
+    await asyncio.gather(
+        client.generate("rollout", thunderagent_session_id="rollout/agent/a"),
+        client.generate("rollout", thunderagent_session_id="rollout/agent/b"),
+    )
+    assert keys == ["rollout", "rollout"]
+    assert client._session_servers == {
+        "rollout/agent/a": {"worker-0": handles[0]},
+        "rollout/agent/b": {"worker-1": handles[1]},
+    }
+
+
+@pytest.mark.asyncio
+async def test_ray_generation_cancellation_is_acknowledged_before_cleanup():
+    import ray
+    from recipe.dynamo.dynamo_agent_loop import _await_or_cancel
+
+    @ray.remote
+    class Probe:
+        def __init__(self):
+            self.started = self.stopped = False
+
+        async def generate(self):
+            self.started = True
+            try:
+                await asyncio.Future()
+            finally:
+                await asyncio.sleep(0.02)
+                self.stopped = True
+
+        async def state(self):
+            return self.started, self.stopped
+
+    owns_ray = not ray.is_initialized()
+    if owns_ray:
+        ray.init(num_cpus=1, include_dashboard=False, log_to_driver=False)
+    probe = Probe.remote()
+    try:
+        task = asyncio.create_task(_await_or_cancel(probe.generate.remote()))
+        for _ in range(500):
+            if (await probe.state.remote())[0]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("Ray generation did not start")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+        assert await probe.state.remote() == (True, True)
+    finally:
+        ray.kill(probe)
+        if owns_ray:
+            ray.shutdown()
 
 
 def _adapter_config(enabled: bool, auto_finalize: bool, engine: str = "vllm"):
@@ -854,3 +396,127 @@ def test_adapter_rejects_an_unknown_engine() -> None:
 def test_adapter_requires_manual_finalize_with_thunderagent() -> None:
     with pytest.raises(ValueError, match="auto_finalize=false"):
         DynamoAgentFrameworkRolloutAdapter.create(config=_adapter_config(True, True), llm_client=object())
+
+
+@pytest.mark.asyncio
+async def test_framework_returns_completed_trajectory_when_cleanup_fails(make_actor):
+    from uni_agent.framework.framework import GatewayAgentFramework, _RunnerConfig
+    from uni_agent.tasks import TaskResult
+
+    actor, backend = make_actor()
+    actor._deferred_poll = 0.01
+    backend.finalize_program.side_effect = [RuntimeError("unreachable")] * 3 + [None]
+    framework = object.__new__(GatewayAgentFramework)
+    framework._log_dir = None
+    framework.gateway_manager = actor
+    framework._trajectory_postprocessor = None
+    framework.reward_loop_worker_handles = None
+
+    async def runner(*, session, **kwargs):
+        await generate(actor, session.session_id)
+        return TaskResult(reward=0.75, finished=True)
+
+    framework._inline_runners = {"probe": runner}
+    trajectories, _ = await framework._run_agent_episode(
+        sample_fields={"raw_prompt": [{"role": "user", "content": "question"}], "uid": "task"},
+        sample_index=0,
+        session_index=0,
+        global_steps=1,
+        runner_name="probe",
+        runner_config=_RunnerConfig("probe", {}, "inline_async", 0),
+        sampling_params={"logprobs": True},
+    )
+    assert len(trajectories) == 1 and sum(trajectories[0].response_mask) == 1
+    assert trajectories[0].reward_score == 0.75 and trajectories[0].finished
+    assert not actor._sessions and actor._deferred
+    await asyncio.wait_for(actor._deferred_flush, 1)
+    assert not actor._programs and not actor._deferred
+    assert backend.finalize_program.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_failed_cleanup_retains_samples_and_can_retry_after_budget_exhaustion(make_actor):
+    actor, backend = make_actor()
+    actor._deferred_poll = 0.01
+    actor._finalize_attempts = 1
+    await create(actor)
+    await generate(actor)
+    backend.finalize_program.side_effect = RuntimeError("unreachable")
+    trajectories = await actor.finalize_session("session")
+    await asyncio.wait_for(actor._deferred_flush, 1)
+    assert len(trajectories) == 1
+    assert list(actor._deferred.values()) == [(1, 0)]
+    assert backend.finalize_program.await_count == 1 + actor._deferred_attempts
+    assert await actor.get_cleanup_state() == {
+        "active_programs": 1,
+        "pending_cleanup": 1,
+        "exhausted_cleanup": 1,
+        "running_releases": 0,
+    }
+    backend.finalize_program.side_effect = None
+    assert await actor.finalize_session("session") is trajectories
+    assert not actor._deferred and not actor._programs
+    assert not any((await actor.get_cleanup_state()).values())
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_returns_samples_and_shutdown_reports_unconfirmed_programs(make_actor):
+    actor, backend = make_actor()
+    actor._finalize_timeout = 0.01
+    actor._deferred_poll = 60
+    await create(actor)
+    await generate(actor)
+
+    async def hang(_):
+        await asyncio.Future()
+
+    backend.finalize_program.side_effect = hang
+    trajectories = await asyncio.wait_for(actor.finalize_session("session"), 1)
+    assert len(trajectories) == 1 and actor._deferred
+    with pytest.raises(RuntimeError, match="unconfirmed"):
+        await actor.shutdown()
+    backend.finalize_program.side_effect = None
+    assert await actor.finalize_session("session") is trajectories
+    assert not actor._programs and not actor._deferred
+
+
+@pytest.mark.asyncio
+async def test_finalize_timeout_waits_for_rpc_cancellation_before_releasing_lock():
+    from types import SimpleNamespace
+
+    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient
+
+    cancelled, acknowledged = asyncio.Event(), asyncio.Event()
+
+    async def remote(**kwargs):
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+            await acknowledged.wait()
+
+    client = object.__new__(DynamoFullyAsyncLLMServerClient)
+    client._finalize_timeout_s = 0.01
+    handle = SimpleNamespace(finalize_program=SimpleNamespace(remote=remote))
+    finalize = asyncio.create_task(client._finalize_on_handle(handle, "program"))
+    await asyncio.wait_for(cancelled.wait(), 1)
+    assert not finalize.done()
+    acknowledged.set()
+    with pytest.raises(TimeoutError):
+        await finalize
+
+
+@pytest.mark.asyncio
+async def test_transport_error_is_not_hidden_by_another_frontends_pause():
+    from recipe.dynamo.dynamo_agent_loop import DynamoFullyAsyncLLMServerClient, GenerationPaused
+
+    client = object.__new__(DynamoFullyAsyncLLMServerClient)
+
+    async def finalize(handle, program_id):
+        if handle == "paused":
+            raise GenerationPaused(program_id)
+        raise ConnectionError("unreachable")
+
+    client._finalize_on_handle = finalize
+    with pytest.raises(ConnectionError, match="unreachable"):
+        await client._finalize_on_handles(["paused", "broken"], "program")
