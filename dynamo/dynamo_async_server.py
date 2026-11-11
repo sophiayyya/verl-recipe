@@ -2015,9 +2015,13 @@ class DynamoHttpServer:
             return await self._generate_direct(prompt_ids, sampling_params, request_id)
 
         try:
-            request_id = request_id or f"dynamo-{time.time_ns()}"
-            # request_id is the trajectory's affinity key, reused by every turn; the
-            # frontend needs a unique id per request (subagent turns run concurrently).
+            # verl's LLMServerManager.generate mints a fresh request_id for every
+            # turn and passes the trajectory's stable key as session_id; key
+            # session affinity (and the request-id prefix) on the latter, else
+            # every turn would carry a new x-dynamo-session-id and never stick.
+            session_id = kwargs.get("session_id")
+            request_id = str(session_id) if session_id else (request_id or f"dynamo-{time.time_ns()}")
+            # The frontend needs a unique id per request (subagent turns run concurrently).
             http_request_id = f"{request_id}-{uuid.uuid4().hex}"
             if self._use_native_generate():
                 return await self._generate_native(
